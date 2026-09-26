@@ -1079,7 +1079,11 @@ $script:Headers = @{
 $script:BrushConv = New-Object System.Windows.Media.BrushConverter
 function Brush([string]$Hex) { $script:BrushConv.ConvertFromString($Hex) }
 function Get-Header([string]$Name) { if ($script:Headers.ContainsKey($Name)) { $script:Headers[$Name] } else { $Name } }
-function Get-DisplayName([string]$Name) { if ($Name) { $Name.Split('.')[0].ToUpper() } else { '' } }
+function Get-DisplayName([string]$Name) {
+    if (-not $Name) { return '' }
+    if ($Name -match '^\d{1,3}(\.\d{1,3}){3}$' -or $Name.Contains(':')) { return $Name }   # adres IP: obcięcie do kropki dawało np. "10"
+    $Name.Split('.')[0].ToUpper()
+}
 function Get-SafeName([string]$Name) { $Name -replace '[\\/:*?"<>|]', '_' }
 function Get-ShortText([string]$s, [int]$n) { $s = "$s" -replace '\s+', ' '; if ($s.Length -gt $n) { $s.Substring(0, $n) + '…' } else { $s.Trim() } }
 function Join-Short($Items, [int]$Max) {
@@ -1123,9 +1127,17 @@ function Read-Snapshot([string]$Path) {
     try { ConvertFrom-ServerJson ([IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)) } catch { $null }
 }
 function Remove-OldSnapshots {
+    # Limit liczymy dla KAŻDEGO serwera osobno: skan pojedynczego serwera tworzy własny katalog, więc liczenie katalogów
+    # po kilkudziesięciu ponownych skanach jednego serwera kasowało jedyne wyniki pozostałych serwerów
     try {
-        Get-ChildItem -LiteralPath $Config.SnapshotDir -Directory | Sort-Object Name -Descending |
-            Select-Object -Skip $Config.SnapshotsToKeep | Remove-Item -Recurse -Force
+        $seen = @{}
+        foreach ($dir in @(Get-ChildItem -LiteralPath $Config.SnapshotDir -Directory | Sort-Object Name -Descending)) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dir.FullName -Filter '*.json' -File)) {
+                $seen[$f.Name] = 1 + [int]$seen[$f.Name]
+                if ($seen[$f.Name] -gt $Config.SnapshotsToKeep) { Remove-Item -LiteralPath $f.FullName -Force }
+            }
+            if (-not (Get-ChildItem -LiteralPath $dir.FullName -Force)) { Remove-Item -LiteralPath $dir.FullName -Force }
+        }
     } catch {}
 }
 #endregion
@@ -1154,7 +1166,7 @@ $script:SettingDefs = @(
     @{ Key = 'BugCheckCritCount';      Type = 'int';  Min = 1;   Max = 1000;   Label = 'BSOD: krytyczne od [liczba w okresie]' }
     @{ Key = 'ThrottleLimit';          Type = 'int';  Min = 1;   Max = 200;    Label = 'Ile serwerów skanować równolegle' }
     @{ Key = 'ScanTimeoutSec';         Type = 'int';  Min = 60;  Max = 86400;  Label = 'Limit czasu całego skanu [s]' }
-    @{ Key = 'SnapshotsToKeep';        Type = 'int';  Min = 1;   Max = 10000;  Label = 'Ile migawek (skanów) przechowywać' }
+    @{ Key = 'SnapshotsToKeep';        Type = 'int';  Min = 1;   Max = 10000;  Label = 'Ile migawek (skanów) każdego serwera przechowywać' }
     @{ Key = 'Folders';                Type = 'list';    Label = 'Foldery sprawdzane na serwerach (jeden na linię, zmienne środowiskowe dozwolone)' }
     @{ Key = 'IgnoredStoppedServices'; Type = 'list';    Label = 'Usługi automatyczne, których zatrzymanie jest OK (jedna na linię, wildcardy *)' }
     @{ Key = 'ExposedPorts';           Type = 'intlist'; Label = 'Porty wrażliwe dla sekcji Ekspozycja (jeden na linię)' }
@@ -1740,6 +1752,7 @@ function Invoke-ServerAnalysis {
             <Setter Property="Padding" Value="10,8"/>
             <Setter Property="BorderBrush" Value="#252C38"/>
             <Setter Property="BorderThickness" Value="0,0,1,1"/>
+            <Setter Property="ToolTip" Value="Kliknij, aby sortować: rosnąco → malejąco → bez sortowania. Shift+klik dodaje kolejną kolumnę."/>
           </Style>
         </Setter.Value>
       </Setter>
@@ -2103,8 +2116,8 @@ function New-ServerItem([string]$Name, [string]$OS) {
     }
 }
 function Add-ServerEntry([string]$Name, [string]$OS) {
-    $Name = "$Name".Trim()
-    if (-not $Name -or $Name -in 'Name', 'ComputerName', 'Server', 'Serwer') { return }
+    $Name = "$Name".Trim().Trim('"', "'")   # CSV z Export-Csv ma wartości w cudzysłowach (także nagłówek "Name")
+    if (-not $Name -or $Name -in 'Name', 'ComputerName', 'DNSHostName', 'HostName', 'Server', 'Serwer') { return }
     if (Get-ServerItem $Name) { return }
     $script:Servers.Add((New-ServerItem $Name $OS))
 }
@@ -2175,6 +2188,125 @@ function Import-LastSnapshots {
 }
 #endregion
 
+#region ── Sortowanie tabel ────────────────────────────────────────────────────
+# Kolumny generowane z obiektów PowerShell mają typ object, więc DataGrid wyłącza im sortowanie (CanUserSort = false),
+# a domyślne porównanie i tak rzuca wyjątek przy typach mieszanych z JSON (np. Int32 12 i Decimal 12.5 w jednej kolumnie).
+# Dlatego sortujemy sami: klik w nagłówek – rosnąco → malejąco → kolejność oryginalna, Shift+klik – kolejna kolumna.
+# Sortowanie jest pamiętane osobno dla każdej tabeli i sekcji, więc przetrwa odświeżenie w trakcie skanu i zmianę serwera.
+$script:GridSort = @{}   # klucz tabeli (np. 'detail:Disks') -> lista @{ Path = właściwość; Desc = $true/$false }
+# kolumny z poziomem ważności sortujemy wg wagi, a nie alfabetycznie (rosnąco = najpierw najpoważniejsze)
+$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Info' = 3; 'OK' = 4 }
+
+function Get-SortKeys($Rows, [string]$Path) {
+    # Klucze sortowania całej kolumny (jedno wywołanie na kolumnę – wywołanie funkcji na każdą komórkę było za wolne):
+    # E = 1 dla pustych (zawsze na końcu), C = 0 liczba / 1 tekst, N = wartość liczbowa,
+    # T = tekst z liczbami dopełnionymi zerami do 20 cyfr, żeby porównywały się jak liczby (10.0.2 < 10.0.10, 10.0.0.5 < 10.0.0.12)
+    $cnt = $Rows.Count
+    $k = @{ E = New-Object 'int[]' $cnt; C = New-Object 'int[]' $cnt; N = New-Object 'double[]' $cnt; T = New-Object 'string[]' $cnt }
+    $bySeverity = $Path -in 'Severity', 'Level', 'Status'
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    for ($i = 0; $i -lt $cnt; $i++) {
+        $v = $Rows[$i].$Path
+        $k.T[$i] = ''
+        if ($null -eq $v) { $k.E[$i] = 1; continue }
+        if ($bySeverity -and $script:SeverityOrder.ContainsKey("$v")) { $k.N[$i] = $script:SeverityOrder["$v"]; continue }
+        if ($v -is [datetime]) { $k.N[$i] = $v.Ticks; continue }
+        $tc = [int][Type]::GetTypeCode($v.GetType())
+        if ($tc -ge 5 -and $tc -le 15) { $k.N[$i] = [double]$v; continue }   # typy liczbowe: SByte … Decimal
+        $s = "$v".Trim()
+        if (-not $s) { $k.E[$i] = 1; continue }
+        if ($s -match '^-?\d+([.,]\d+)?$') { $k.N[$i] = [double]::Parse(($s -replace ',', '.'), $inv); continue }
+        $k.C[$i] = 1
+        $k.T[$i] = ($s -replace '\d+', '0000000000000000000$&') -replace '(?<!\d)0*(?=\d{20}(?!\d))', ''
+    }
+    $k
+}
+function Get-SortedRows($Rows, $Sort) {
+    # zawsze zwraca NOWĄ tablicę – Update-GridOrder przestawia potem jej elementy w miejscu
+    $Rows = [object[]]@($Rows)
+    $Sort = @($Sort | Where-Object { $_ -and $_.Path })
+    if ($Rows.Count -lt 2 -or -not $Sort.Count) { return , ([object[]]$Rows.Clone()) }
+    $keys  = @(foreach ($s in $Sort) { Get-SortKeys $Rows $s.Path })
+    $keyed = New-Object System.Collections.Generic.List[object]
+    for ($i = 0; $i -lt $Rows.Count; $i++) {
+        $h = [ordered]@{ Row = $Rows[$i]; I = $i }
+        for ($j = 0; $j -lt $keys.Count; $j++) {
+            $k = $keys[$j]
+            $h["E$j"] = $k.E[$i]; $h["C$j"] = $k.C[$i]; $h["N$j"] = $k.N[$i]; $h["T$j"] = $k.T[$i]
+        }
+        $keyed.Add([pscustomobject]$h)
+    }
+    $props = New-Object System.Collections.Generic.List[object]
+    for ($j = 0; $j -lt $Sort.Count; $j++) {
+        $desc = [bool]$Sort[$j].Desc
+        $props.Add(@{ Expression = "E$j"; Descending = $false })   # puste na końcu niezależnie od kierunku
+        foreach ($k in "C$j", "N$j", "T$j") { $props.Add(@{ Expression = $k; Descending = $desc }) }
+    }
+    $props.Add(@{ Expression = 'I'; Descending = $false })          # Sort-Object nie jest stabilny – remisy w kolejności oryginalnej
+    return , @($keyed | Sort-Object -Property $props.ToArray() | ForEach-Object { $_.Row })
+}
+function Get-GridSort($Grid) {
+    $st = $Grid.Tag
+    if ($st -is [hashtable]) { @($script:GridSort[$st.Key] | Where-Object { $_ }) } else { @() }
+}
+function Get-SortDirection($Sort, [string]$Path) {
+    $s = @($Sort | Where-Object { $_.Path -eq $Path })[0]
+    if (-not $Path -or -not $s) { $null }
+    elseif ($s.Desc) { [System.ComponentModel.ListSortDirection]::Descending }
+    else { [System.ComponentModel.ListSortDirection]::Ascending }
+}
+function Update-GridSortGlyphs($Grid) {
+    $sort = @(Get-GridSort $Grid)
+    foreach ($c in @($Grid.Columns)) { $c.SortDirection = Get-SortDirection $sort $c.SortMemberPath }
+}
+function Set-GridRows($Grid, [string]$SortKey, $Rows) {
+    # $Rows = kolejność oryginalna; do tabeli trafia jej kopia ułożona wg zapamiętanego sortowania
+    $orig  = [object[]]@($Rows)
+    $items = Get-SortedRows $orig @($script:GridSort[$SortKey] | Where-Object { $_ })
+    $Grid.Tag = @{ Key = $SortKey; Rows = $orig; Items = $items }   # przed ItemsSource – korzysta z niego AutoGeneratingColumn
+    $Grid.ItemsSource = $items
+    Update-GridSortGlyphs $Grid   # zmiana ItemsSource czyści strzałki kolumn zdefiniowanych w XAML
+}
+function Update-GridOrder($Grid) {
+    $st = $Grid.Tag
+    if (-not ($st -is [hashtable]) -or $null -eq $st.Items) { return }
+    $sorted = Get-SortedRows $st.Rows @(Get-GridSort $Grid)
+    # przestawiamy elementy w tej samej tablicy: tabela zachowuje kolumny (i ich szerokości), filtr oraz zaznaczenie
+    [Array]::Copy($sorted, $st.Items, $st.Items.Length)
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($st.Items)
+    if ($view) { $view.Refresh() }
+    Update-GridSortGlyphs $Grid
+}
+function Invoke-GridSort($Grid, $Column) {
+    $st   = $Grid.Tag
+    $path = "$($Column.SortMemberPath)"
+    if (-not ($st -is [hashtable]) -or -not $path) { return }
+    $cur  = @(Get-GridSort $Grid)
+    $old  = @($cur | Where-Object { $_.Path -eq $path })[0]
+    # kolejne kliknięcia: rosnąco → malejąco → bez sortowania (kolejność z kolektora / domyślna)
+    $step = if (-not $old) { @{ Path = $path; Desc = $false } } elseif (-not $old.Desc) { @{ Path = $path; Desc = $true } } else { $null }
+    if ([System.Windows.Input.Keyboard]::Modifiers.HasFlag([System.Windows.Input.ModifierKeys]::Shift)) {
+        # Shift+klik: zmienia tylko tę kolumnę, pozostałe kolumny sortowania zostają
+        $new = @(foreach ($s in $cur) { if ($s.Path -ne $path) { $s } elseif ($step) { $step } })
+        if (-not $old -and $step) { $new += $step }
+    } else {
+        $new = @(if ($step) { $step })
+    }
+    $script:GridSort[$st.Key] = $new
+    Update-GridOrder $Grid
+}
+function Get-ClickedRowItem($e) {
+    # element wiersza, w który kliknięto; dwuklik w nagłówek (np. szybka zmiana kierunku sortowania) lub pasek przewijania nie otwiera serwera
+    $o = $e.OriginalSource
+    while ($o) {
+        if ($o -is [System.Windows.Controls.DataGridRow]) { return $o.Item }
+        if ($o -is [System.Windows.Controls.Primitives.DataGridColumnHeader] -or $o -is [System.Windows.Controls.Primitives.ScrollBar] -or $o -is [System.Windows.Controls.DataGrid]) { return $null }
+        $o = if ($o -is [System.Windows.Media.Visual]) { [System.Windows.Media.VisualTreeHelper]::GetParent($o) } else { [System.Windows.LogicalTreeHelper]::GetParent($o) }
+    }
+    $null
+}
+#endregion
+
 #region ── Widok ogólny ─────────────────────────────────────────────────────────
 function Update-Overview {
     $all = New-Object System.Collections.Generic.List[object]
@@ -2204,10 +2336,10 @@ function Update-Overview {
         }
     }
     $script:AllIssues = @($all | Sort-Object Rank, Server)
-    $ui.gridIssues.ItemsSource = $script:AllIssues
+    Set-GridRows $ui.gridIssues 'issues' $script:AllIssues
     Update-IssueFilter
     $ui.gridServers.Columns.Clear()
-    $ui.gridServers.ItemsSource = @($sum | Sort-Object @{ e = 'Crit'; Descending = $true }, @{ e = 'Warn'; Descending = $true }, Server)
+    Set-GridRows $ui.gridServers 'servers' @($sum | Sort-Object @{ e = 'Crit'; Descending = $true }, @{ e = 'Warn'; Descending = $true }, Server)
     $ui.tTotal.Text   = "$($script:Servers.Count)"
     $ui.tOnline.Text  = "$online"
     $ui.tOffline.Text = "$offline"
@@ -2293,13 +2425,13 @@ function Show-ServerDetail([string]$Name) {
     $ui.dCpu.Text = '–'; $ui.dRam.Text = '–'; $ui.pCpu.Value = 0; $ui.pRam.Value = 0; $ui.dCrit.Text = '0'; $ui.dWarn.Text = '0'
     if (-not $item) {
         $ui.dName.Text = 'Wybierz serwer z listy po lewej'; $ui.dOS.Text = ''
-        $ui.lstSections.ItemsSource = $null; $ui.gridDetail.ItemsSource = $null; $ui.dSectionTitle.Text = ''; $ui.dSectionCount.Text = ''
+        $ui.lstSections.ItemsSource = $null; $ui.gridDetail.ItemsSource = $null; $ui.gridDetail.Tag = $null; $ui.dSectionTitle.Text = ''; $ui.dSectionCount.Text = ''
         return
     }
     $ui.dName.Text = $item.Display
     if (-not $d) {
         $ui.dOS.Text = "$Name – jeszcze nie skanowano. Użyj przycisku Skanuj ponownie."
-        $ui.lstSections.ItemsSource = $null; $ui.gridDetail.ItemsSource = $null; $ui.dSectionTitle.Text = ''; $ui.dSectionCount.Text = ''
+        $ui.lstSections.ItemsSource = $null; $ui.gridDetail.ItemsSource = $null; $ui.gridDetail.Tag = $null; $ui.dSectionTitle.Text = ''; $ui.dSectionCount.Text = ''
         return
     }
     $ui.dCrit.Text = "$($item.Crit)"; $ui.dWarn.Text = "$($item.Warn)"
@@ -2354,7 +2486,7 @@ function Show-Section {
     $ui.gridDetail.ItemsSource = $null
     $ui.gridDetail.Columns.Clear()
     $rows = @($sel.Rows)
-    $ui.gridDetail.ItemsSource = $rows
+    Set-GridRows $ui.gridDetail "detail:$($sel.Key)" $rows   # sortowanie zapamiętane dla tej sekcji (także po zmianie serwera)
     $ui.dEmpty.Visibility = if ($rows.Count) { 'Collapsed' } else { 'Visible' }
     Update-DetailFilter
 }
@@ -2485,15 +2617,16 @@ $script:Timer.Interval = [TimeSpan]::FromMilliseconds(400)
 $script:Timer.Add_Tick({
     $sync = $script:Sync
     if (-not $sync) { $script:Timer.Stop(); return }
-    $r = $null; $got = $false
-    while ($sync.Queue.TryDequeue([ref]$r)) { Receive-ServerResult $r; $got = $true }
+    $r = $null; $got = New-Object System.Collections.Generic.List[string]
+    while ($sync.Queue.TryDequeue([ref]$r)) { Receive-ServerResult $r; $got.Add("$($r.Name)") }
     if ($sync.Total) { $ui.prg.Value = [double]$sync.Done / $sync.Total * 100 }
     $el = [int]((Get-Date) - $script:ScanStart).TotalSeconds
     $ui.txtStatus.Text = if ($sync.Cancel) { 'Przerywanie skanu…' } else { "Skanowanie $($sync.Done) z $($sync.Total), $el s" }
-    if ($got) {
+    if ($got.Count) {
         Refresh-ServerList
         Update-Overview
-        if ($script:CurrentServer -and $ui.viewServer.Visibility -eq 'Visible') { Show-ServerDetail $script:CurrentServer }
+        # szczegóły przebudowujemy tylko po wyniku oglądanego serwera – wcześniej tabela skakała (przewinięcie, zaznaczenie) przy wyniku każdego innego
+        if ($script:CurrentServer -and $ui.viewServer.Visibility -eq 'Visible' -and $got -contains $script:CurrentServer) { Show-ServerDetail $script:CurrentServer }
     }
     if ($sync.Finished -and $sync.Queue.IsEmpty) { Complete-Scan }
 })
@@ -2825,6 +2958,9 @@ $onAutoColumn = {
     if ($e.PropertyName -in 'Flag', 'Key', 'Rows') { $e.Cancel = $true; return }
     $e.Column.Header = Get-Header $e.PropertyName
     $e.Column.MaxWidth = 900
+    # właściwości obiektów PowerShell mają typ object, dla którego DataGrid wyłącza sortowanie – sortuje Invoke-GridSort
+    $e.Column.CanUserSort = $true
+    $e.Column.SortDirection = Get-SortDirection @(Get-GridSort $sender) $e.Column.SortMemberPath
     if ($e.Column -is [System.Windows.Controls.DataGridTextColumn]) {
         $st = New-Object System.Windows.Style ([System.Windows.Controls.TextBlock])
         $st.Setters.Add((New-Object System.Windows.Setter -ArgumentList ([System.Windows.Controls.TextBlock]::TextTrimmingProperty), ([System.Windows.TextTrimming]::CharacterEllipsis)))
@@ -2834,6 +2970,12 @@ $onAutoColumn = {
 }
 $ui.gridDetail.Add_AutoGeneratingColumn($onAutoColumn)
 $ui.gridServers.Add_AutoGeneratingColumn($onAutoColumn)
+$onGridSorting = {
+    param($sender, $e)
+    $e.Handled = $true   # zawsze własne sortowanie – domyślne rzuca wyjątkiem przy mieszanych typach liczb
+    try { Invoke-GridSort $sender $e.Column } catch { $ui.txtStatus.Text = "Nie udało się posortować: $($_.Exception.Message)" }
+}
+foreach ($g in 'gridDetail', 'gridServers', 'gridIssues') { $ui[$g].Add_Sorting($onGridSorting) }
 
 $ui.rbOverview.Add_Checked({ $ui.viewOverview.Visibility = 'Visible'; $ui.viewServer.Visibility = 'Collapsed' })
 $ui.rbServer.Add_Checked({
@@ -2951,11 +3093,13 @@ $ui.btnExport.Add_Click({ Export-HtmlReport })
 $ui.btnSettings.Add_Click({ Show-SettingsDialog })
 
 $ui.gridIssues.Add_MouseDoubleClick({
-    $i = $ui.gridIssues.SelectedItem
+    param($s, $e)
+    $i = Get-ClickedRowItem $e
     if ($i) { Select-Server $i.ServerKey $i.Section }
 })
 $ui.gridServers.Add_MouseDoubleClick({
-    $r = $ui.gridServers.SelectedItem
+    param($s, $e)
+    $r = Get-ClickedRowItem $e
     if ($r) { Select-Server $r.Key 'Issues' }
 })
 
@@ -2964,7 +3108,7 @@ $ui.btnCsv.Add_Click({
     if (-not $sel -or -not $sel.Count) { return }
     $dlg = New-Object Microsoft.Win32.SaveFileDialog
     $dlg.Filter = 'CSV (*.csv)|*.csv'
-    $dlg.FileName = "$(Get-DisplayName $script:CurrentServer)_$($sel.Key)_$(Get-Date -Format yyyyMMdd).csv"
+    $dlg.FileName = "$(Get-SafeName (Get-DisplayName $script:CurrentServer))_$($sel.Key)_$(Get-Date -Format yyyyMMdd).csv"
     if ($dlg.ShowDialog($window) -eq $true) {
         $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridDetail.ItemsSource)
         @($view) | Select-Object * -ExcludeProperty Flag | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Delimiter ';' -Encoding UTF8
