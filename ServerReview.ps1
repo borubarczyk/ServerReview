@@ -23,6 +23,19 @@
       - WinRM na serwerach (domyślnie włączony na Windows Server 2012+), port 5985
       - konto z uprawnieniami administratora lokalnego na serwerach (odczyt dziennika Security)
     Plik musi być zapisany jako UTF-8 z BOM (polskie znaki w Windows PowerShell 5.1).
+
+    Copyright (C) 2026 Borys Kaleta
+    SPDX-License-Identifier: GPL-3.0-or-later
+
+    Ten program jest wolnym oprogramowaniem: możesz go rozpowszechniać i/lub modyfikować
+    na warunkach licencji GNU General Public License opublikowanej przez Free Software Foundation,
+    w wersji 3 tej licencji lub (według twojego wyboru) dowolnej późniejszej wersji.
+    Program jest rozpowszechniany BEZ JAKIEJKOLWIEK GWARANCJI, nawet domyślnej gwarancji
+    PRZYDATNOŚCI HANDLOWEJ albo PRZYDATNOŚCI DO OKREŚLONYCH ZASTOSOWAŃ. Pełny tekst licencji:
+    plik LICENSE albo <https://www.gnu.org/licenses/>.
+
+.LINK
+    https://github.com/borubarczyk/ServerReview
 #>
 [CmdletBinding()]
 param(
