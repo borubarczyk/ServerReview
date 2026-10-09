@@ -169,13 +169,19 @@ if ($isCore -or (-not $Scan -and -not $isSta)) {
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($ServerListFile) { $argList += @('-ServerListFile', "`"$ServerListFile`"") }   # nie gub parametrów przy ponownym uruchomieniu
-    if ($Scan) {
-        $argList += @('-Scan', '-ReportMode', $ReportMode)
-        if ($NoReport) { $argList += '-NoReport' }
-        $p = Start-Process -FilePath $exe -ArgumentList $argList -Wait -PassThru -NoNewWindow
-        exit $p.ExitCode
-    }
-    Start-Process -FilePath $exe -ArgumentList $argList
+    # Start-Process (inaczej niż zwykłe wywołanie) przekazuje ścieżki modułów PowerShell 7 do 5.1 – moduły systemowe z PS 7
+    # nie ładują się wtedy w 5.1 (np. Get-Credential); czyścimy je tylko na czas uruchomienia procesu potomnego
+    $pmp = $env:PSModulePath
+    if ($isCore) { $env:PSModulePath = $null }
+    $p = $null
+    try {
+        if ($Scan) {
+            $argList += @('-Scan', '-ReportMode', $ReportMode)
+            if ($NoReport) { $argList += '-NoReport' }
+            $p = Start-Process -FilePath $exe -ArgumentList $argList -Wait -PassThru -NoNewWindow
+        } else { Start-Process -FilePath $exe -ArgumentList $argList }
+    } finally { if ($isCore) { $env:PSModulePath = $pmp } }
+    if ($Scan) { exit $p.ExitCode }
     return
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -265,6 +271,7 @@ $Collector = {
         $sys.CpuLoad       = [int](($cpu | Measure-Object LoadPercentage -Average).Average)
         $sys.RamGB         = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
         $sys.RamUsedPct    = [int](100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
+        $sys.RamFreeGB     = [math]::Round($os.FreePhysicalMemory / 1MB, 2)   # FreePhysicalMemory w KB
         $sys.Domain        = $cs.Domain
         $sys.DomainRole    = $roles[[int]$cs.DomainRole]
         $sys.IsDC          = ([int]$cs.DomainRole -ge 4)
@@ -322,7 +329,13 @@ $Collector = {
     # ── Aktualizacje ──
     $hfAll = @(S '' 'Aktualizacje' {
         Get-HotFix | ForEach-Object {
-            $dt = $null; try { $dt = $_.InstalledOn } catch {}
+            # Surowa wartość WMI (M/d/yyyy albo FILETIME szesnastkowo) parsowana niezależnie od języka – w PS 4.0 właściwość
+            # InstalledOn parsuje datę w kulturze stacji przekazanej przez WinRM (pl-PL: dzień i miesiąc zamienione)
+            $dt = $null; $raw = ''
+            try { $raw = "$($_.psbase.Properties['InstalledOn'].Value)" } catch {}
+            if ($raw -match '^\d{1,2}/\d{1,2}/\d{4}$') { try { $dt = [datetime]::ParseExact($raw, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture) } catch {} }
+            elseif ($raw -match '^[0-9A-Fa-f]{16}$') { try { $dt = [datetime]::FromFileTime([Convert]::ToInt64($raw, 16)) } catch {} }
+            if (-not $dt) { try { $dt = $_.InstalledOn } catch {} }
             [pscustomobject]@{ HotFixID = $_.HotFixID; Description = $_.Description; InstalledOn = $(D $dt); InstalledBy = $_.InstalledBy; _dt = $dt }
         }
     })
@@ -341,7 +354,7 @@ $Collector = {
     $timings['Role i funkcje'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
     $sys.Roles = (@($features | Where-Object { $_.Installed -and $_.FeatureType -eq 'Role' } | ForEach-Object { $_.DisplayName }) -join ', ')
     $sys.IsHyperV  = [bool](Get-Service vmms -ErrorAction SilentlyContinue)
-    try { $sys.TimeZone = (Get-TimeZone).Id } catch { $sys.TimeZone = '' }
+    try { $sys.TimeZone = [TimeZoneInfo]::Local.Id } catch { $sys.TimeZone = '' }   # Get-TimeZone jest dopiero w PS 5.1
     $sys.PSVersion = $PSVersionTable.PSVersion.ToString()
 
     # ── Konfiguracja bezpieczeństwa ──
@@ -1148,7 +1161,7 @@ $Collector = {
         }
         # disk 7 (uszkodzony blok), 51 (błąd stronicowania), 153/157 (ponowienie/usunięcie I/O), Ntfs 55/98 (uszkodzenie systemu plików), 129 (reset urządzenia przez sterownik)
         $dEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7, 51, 55, 98, 129, 153, 157; StartTime = $since } -MaxEvents 1000 -ErrorAction SilentlyContinue |
-                 Where-Object { ($_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs)$' -or $_.Id -eq 129) -and -not ($_.Id -eq 98 -and $_.Level -ge 4) })
+                 Where-Object { ($_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs)$' -or ($_.Id -eq 129 -and $_.ProviderName -ne 'Microsoft-Windows-Time-Service')) -and -not ($_.Id -eq 98 -and $_.Level -ge 4) })
         $dEv | Group-Object ProviderName, Id | ForEach-Object {
             $g = @($_.Group | Sort-Object TimeCreated -Descending)
             [pscustomobject]@{
@@ -1341,6 +1354,7 @@ function Read-SnapshotText([string]$Path) {
 function Write-SnapshotText([string]$Path, [string]$Text) {
     # Zapis przez plik tymczasowy: wczytywanie migawek nigdy nie trafi na plik zapisany do połowy
     $bytes = (New-Object Text.UTF8Encoding $false).GetBytes($Text)
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))   # folder skanu mógł zniknąć (porządki innej instancji)
     $tmp = "$Path.tmp"
     $fs = [IO.File]::Create($tmp)
     try {
@@ -1404,10 +1418,6 @@ function Get-WinRmErrorInfo {
     elseif ($id -match '^CollectorFatal') {
         $r.Class = 'Remote'; $r.Cause = 'Kolektor przerwał pracę na serwerze'; $r.Remedy = 'Szczegóły błędu poniżej. Pozostałe serwery nie są tym dotknięte; zgłoś błąd z treścią komunikatu.'
     }
-    elseif ($id -match 'CannotUseIPAddress' -or $m -match 'TrustedHosts') {
-        $r.Class = 'TrustedHosts'; $r.Cause = 'Połączenie po adresie IP wymaga wpisu w TrustedHosts i jawnego konta (Kerberos nie działa z adresem IP)'
-        $r.Remedy = 'Dodaj serwer po nazwie DNS albo: Set-Item WSMan:\localhost\Client\TrustedHosts -Value <IP> -Concatenate i wybierz konto przyciskiem „Konto”.'
-    }
     elseif ($id -match '^LogonFailure' -or (& $has '0x8009030C', '0x8007052E', '0x0000052E') -or $m -match 'user name or password is incorrect|nazwa użytkownika lub hasło') {
         $r.Class = 'Auth'; $r.Cause = 'Błędne poświadczenia (login lub hasło)'; $r.Remedy = 'Sprawdź konto wybrane przyciskiem „Konto” (blokada konta, wygasłe hasło).'
     }
@@ -1430,6 +1440,11 @@ function Get-WinRmErrorInfo {
     elseif (& $has '0x8009030E', '0x80090303') {
         $r.Class = 'Kerberos'; $r.Cause = 'Kerberos: brak biletu dla serwera (nieznany serwer docelowy, inna domena bez zaufania albo konto lokalne stacji)'
         $r.Remedy = 'Uruchom program na koncie domenowym albo podaj konto przyciskiem „Konto”; dla serwera spoza domeny – TrustedHosts.'
+    }
+    # po kodach Kerberos/logowania: angielski komunikat błędu Kerberos też wspomina TrustedHosts
+    elseif ($id -match 'CannotUseIPAddress' -or $m -match 'TrustedHosts') {
+        $r.Class = 'TrustedHosts'; $r.Cause = 'Połączenie po adresie IP wymaga wpisu w TrustedHosts i jawnego konta (Kerberos nie działa z adresem IP)'
+        $r.Remedy = 'Dodaj serwer po nazwie DNS albo: Set-Item WSMan:\localhost\Client\TrustedHosts -Value <IP> -Concatenate i wybierz konto przyciskiem „Konto”.'
     }
     elseif ($id -match '^ComputerNotFound' -or $m -match 'cannot be resolved|could not be resolved|nie można rozpoznać|nie można rozwiązać|No such host is known|Ten host nie jest znany') {
         $r.Class = 'Dns'; $r.Cause = 'Nazwa serwera nie jest rozwiązywana w DNS'; $r.Remedy = 'Sprawdź pisownię i rekord A w DNS. Jeśli serwer wycofano – usuń go z listy.'
@@ -1955,7 +1970,7 @@ $script:Headers = @{
     Server = 'Serwer'; OS = 'System'; RAM = 'RAM [%]'; MinDiskPct = 'Min. wolne na dysku [%]'; Crit = 'Krytyczne'; Warn = 'Ostrzeżenia'; PatchDays = 'Dni od aktualizacji'
     ScanSec = 'Skan [s]'; Scanned = 'Skanowano'
     ComputerName = 'Nazwa komputera'; FQDN = 'FQDN'; Build = 'Kompilacja'; OSInstallDate = 'Instalacja systemu'; LastBoot = 'Ostatni start'
-    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'
+    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
     LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Host Hyper-V'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
@@ -2010,6 +2025,8 @@ function Join-Short($Items, [int]$Max) {
 }
 function Protect-CsvCell($Value) {
     # Wartości pochodzą z audytowanych serwerów (nazwy plików, akcje zadań) – bez tego Excel wykonałby formułę/DDE z komórki
+    # liczby w formacie stacji (12,5 w polskim Excelu, nie data 12 maja); liczby ujemne nie są formułą
+    if ($Value -is [double] -or $Value -is [single] -or $Value -is [decimal] -or $Value -is [int] -or $Value -is [long]) { return $Value.ToString([Globalization.CultureInfo]::CurrentCulture) }
     $s = "$Value"
     if ($s -match '^[=+\-@\t\r]') { "'" + $s } else { $s }
 }
@@ -2019,7 +2036,7 @@ function Export-RowsToCsv($Rows, [string]$Path) {
     $skip = 'Flag', 'Key', 'Rows', 'SevColor', 'SevBg', 'Rank', 'ServerKey', 'Section', 'IssueKey', '_Search', 'Ignored'
     $out = foreach ($r in $Rows) {
         $h = [ordered]@{}
-        foreach ($p in $r.PSObject.Properties) { if ($skip -notcontains $p.Name) { $h[(Get-Header $p.Name)] = Protect-CsvCell $p.Value } }
+        foreach ($p in $r.PSObject.Properties) { if ($skip -notcontains $p.Name -and $p.Name -notlike '_*') { $h[(Get-Header $p.Name)] = Protect-CsvCell $p.Value } }   # '_*' – pola wewnętrzne, niewidoczne w tabelach
         [pscustomobject]$h
     }
     @($out) | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding UTF8
@@ -2037,9 +2054,9 @@ function New-Issue($ServerKey, $Severity, $Category, $Message, $Section) {
 }
 function Get-IssueKey([string]$Category, [string]$Section, [string]$Message) {
     # Stały klucz problemu do wyciszania: wartości (wolne %, dni, liczniki, daty, adresy) zastąpione '#', żeby reguła działała
-    # przy kolejnych skanach. Cyfry będące częścią nazwy (SRV01, VMDC02, KB5034441, 0x80090322) i numery po „ID”, „port”, „kod”
+    # przy kolejnych skanach. Cyfry będące częścią nazwy (SRV01, APP-02, KB5034441, 0x80090322) i numery po „ID”, „port”, „kod”
     # zostają – wyciszenie jednej maszyny, zdarzenia albo portu nie może wyciszać innych.
-    $m = ("$Message" -replace '(?<![\p{L}\d_])(?<!(?:ID|Id|port|portu|kod|KB) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '\s+', ' ').Trim()
+    $m = ("$Message" -replace '(?<![\p{L}\d_])(?<!\p{L}-)(?<!(?:ID|Id|port|portu|kod|KB) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '\s+', ' ').Trim()
     "$Category|$Section|$m"
 }
 #endregion
@@ -2142,18 +2159,19 @@ function Get-AvailabilityHistory([string]$Name) {
 }
 $script:AvailStats = $null
 function Initialize-AvailabilityStats {
-    # Jedno przejście po dzienniku z 2 miesięcy; potem aktualizowane przy każdym wyniku (Add-AvailabilityRecord)
+    # Jedno przejście po dzienniku z 3 miesięcy; potem aktualizowane przy każdym wyniku (Add-AvailabilityRecord)
     $stats = @{}
     $cut = (Get-Date).AddDays(-30).ToString('yyyy-MM-dd HH:mm:ss')
-    foreach ($l in (Read-AvailabilityLines 2)) {
+    foreach ($l in (Read-AvailabilityLines 3)) {
         $c = $l.Split(';')
-        if ($c.Count -lt 8 -or [string]::CompareOrdinal($c[0], $cut) -lt 0) { continue }
+        if ($c.Count -lt 8) { continue }
         $k = $c[1].ToLowerInvariant()
         $st = $stats[$k]
         if (-not $st) { $st = @{ Seen = 0; Ok = 0; LastOk = ''; LastFail = ''; FailSince = '' }; $stats[$k] = $st }
-        $st.Seen++
+        # procent dostępności z 30 dni; „bez połączenia od” i „ostatni udany” z całego okresu dziennika (dłuższe awarie)
+        if ([string]::CompareOrdinal($c[0], $cut) -ge 0) { $st.Seen++; if ($c[2] -eq 'OK') { $st.Ok++ } }
         $t = $c[0].Substring(0, [Math]::Min(16, $c[0].Length))
-        if ($c[2] -eq 'OK') { $st.Ok++; $st.LastOk = $t; $st.FailSince = '' }
+        if ($c[2] -eq 'OK') { $st.LastOk = $t; $st.FailSince = '' }
         elseif ($c[2] -eq 'Brak połączenia') { $st.LastFail = $t; if (-not $st.FailSince) { $st.FailSince = $t } }
     }
     $script:AvailStats = $stats
@@ -2218,16 +2236,22 @@ function Remove-OldSnapshots {
     $removed = 0
     foreach ($k in @($script:SnapIndex.Keys)) {
         $list = $script:SnapIndex[$k]
-        while ($list.Count -gt $keep) {
-            $e = $list[$list.Count - 1]
+        # ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych (znaczniki niedostępności też się liczą do limitu)
+        $lastOn = $null; foreach ($x in $list) { if (-not $x.Offline) { $lastOn = $x; break } }
+        $i = $list.Count - 1
+        while ($list.Count -gt $keep -and $i -ge 0) {
+            $e = $list[$i]
+            if ([object]::ReferenceEquals($e, $lastOn)) { $i--; continue }
             try { if (Test-Path -LiteralPath $e.Path) { Remove-Item -LiteralPath $e.Path -Force }; $removed++ }
             catch { Write-Log "Nie usunięto starej migawki $($e.Path): $($_.Exception.Message)" 'WARN' 'Migawki' }
-            $list.RemoveAt($list.Count - 1)
+            $list.RemoveAt($i)
+            $i--
         }
     }
     if (Test-Path -LiteralPath $Config.SnapshotDir) {
         foreach ($dir in @([IO.Directory]::GetDirectories($Config.SnapshotDir))) {
-            try { if (-not [IO.Directory]::EnumerateFileSystemEntries($dir).GetEnumerator().MoveNext()) { [IO.Directory]::Delete($dir) } } catch { }
+            # tylko stare puste foldery – świeży może należeć do skanu, który jeszcze nic nie zapisał (np. drugiej instancji)
+            try { if (([DateTime]::Now - [IO.Directory]::GetCreationTime($dir)).TotalSeconds -gt [int]$Config.ScanTimeoutSec -and -not [IO.Directory]::EnumerateFileSystemEntries($dir).GetEnumerator().MoveNext()) { [IO.Directory]::Delete($dir) } } catch { }
         }
     }
     if ($removed) { Write-Log "Usunięto stare migawki: $removed (limit $keep na serwer)" 'INFO' 'Migawki' }
@@ -2437,7 +2461,7 @@ function Invoke-ServerAnalysis {
         $hostDown = $false
         if (-not $vm -and $cls -notin 'Timeout', 'Remote') {
             $hk = Find-ServerKey (Get-LastHvHost $D)
-            if ($hk -and $hk -ne $Name -and $script:Data[$hk] -and $script:Data[$hk].Offline) {
+            if ($hk -and $hk -ne $Name -and (Test-NetworkDown $script:Data[$hk])) {
                 $hostDown = $true; $sev = 'Ostrzeżenie'
                 $msg += " Host Hyper-V $(Get-DisplayName $hk), na którym ostatnio działała ta maszyna, też nie odpowiada – zacznij od hosta."
             }
@@ -2464,8 +2488,9 @@ function Invoke-ServerAnalysis {
         }
         # Host Hyper-V: pamięć przydzielona maszynom to „zajęty” RAM z założenia – liczy się zapas wolnej pamięci, nie procent
         if ($s.IsHyperV -and $s.PSObject.Properties['HvRamAssignedGB'] -and "$($s.HvRamAssignedGB)" -ne '' -and [double]$s.HvRamAssignedGB -gt 0) {
-            $freeGB = [math]::Round([double]$s.RamGB * (100 - [double]$s.RamUsedPct) / 100, 1)
-            $rootGB = [math]::Round([double]$s.RamGB * [double]$s.RamUsedPct / 100 - [double]$s.HvRamAssignedGB, 1)
+            # wolny RAM wprost z kolektora (procent jest zaokrąglony do 1% – na dużym hoście to kilka GB)
+            $freeGB = if ($s.PSObject.Properties['RamFreeGB'] -and "$($s.RamFreeGB)" -ne '') { [math]::Round([double]$s.RamFreeGB, 1) } else { [math]::Round([double]$s.RamGB * (100 - [double]$s.RamUsedPct) / 100, 1) }
+            $rootGB = [math]::Round([double]$s.RamGB - $freeGB - [double]$s.HvRamAssignedGB, 1)
             if ($freeGB -lt $C.HvHostMinFreeGB) { AddI 'Ostrzeżenie' 'Hyper-V' "Na hoście zostało $freeGB GB wolnej pamięci (maszyny: $($s.HvRamAssignedGB) GB, system hosta: ok. $rootGB GB z $($s.RamGB) GB) – kolejne maszyny i migracje się nie uruchomią" 'HvHost' }
         }
         elseif ($s.RamUsedPct -ge $C.RamWarnPct) { AddI 'Ostrzeżenie' 'Zasoby' "Wysokie użycie RAM: $($s.RamUsedPct)% z $($s.RamGB) GB" 'System' }
@@ -2920,7 +2945,9 @@ function Update-StationClock {
         if ($ti) { $all = @(@($ti) + $all | Sort-Object Rank) }
         $d | Add-Member -NotePropertyName _AllIssues -NotePropertyValue $all -Force
         Split-ServerIssues $k $d
+        Update-ServerItem $k
     }
+    $script:FullCache.Clear()   # szczegóły serwera przeliczą się z nową korektą zegara
 }
 function Get-StationClockIssue {
     if (-not $script:StationOffset) { return $null }
@@ -3022,7 +3049,9 @@ function Update-VmIndex {
     }
     foreach ($cn in @($clusters.Keys | Sort-Object)) {
         $nodes = @($clusters[$cn] | Sort-Object { $_.Key })
-        $rep = $nodes[0]
+        # węzeł reprezentujący: pierwszy alfabetycznie ze świeżymi danymi klastra (bez danych sprzed limitu czasu i bez błędu sekcji)
+        $good = @($nodes | Where-Object { -not ($_.D.PSObject.Properties['_ScanNote'] -and $_.D._ScanNote) -and @($_.D.PSObject.Properties['Failed'].Value) -notcontains 'Cluster' })
+        $rep = if ($good.Count) { $good[0] } else { $nodes[0] }
         $rows = @($rep.D.PSObject.Properties['Cluster'].Value | Where-Object { $_ })
         foreach ($r in $rows) {
             switch ("$($r.Type)") {
@@ -3065,13 +3094,14 @@ function Update-VmIndex {
         else { $byComp[$cnm] = $it.Name }
     }
     # Awarie zbiorcze: wiele niedostępnych serwerów z jednego hosta Hyper-V albo z jednej podsieci to zwykle jedna przyczyna
-    $down = @(foreach ($it in @($script:Servers)) { $d = $script:Data[$it.Name]; if ($d -and $d.Offline -and "$($d.PSObject.Properties['Diag'].Value.Class)" -notin 'Timeout', 'Remote') { $it } })
+    # tylko serwery, które faktycznie nie odpowiadają w sieci (błąd uprawnień, Kerberos czy zatrzymany WinRM to nie awaria sieci)
+    $down = @(foreach ($it in @($script:Servers)) { if (Test-NetworkDown $script:Data[$it.Name] -AllowFirewall) { $it } })
     if ($down.Count -ge 2) {
         $byHost = @{}
         foreach ($it in $down) {
             $d = $script:Data[$it.Name]
             $hk = Find-ServerKey (Get-LastHvHost $d)
-            if (-not $hk -or $hk -eq $it.Name -or -not $script:Data[$hk] -or -not $script:Data[$hk].Offline -or (Find-VmForServer $it.Name $d)) { continue }
+            if (-not $hk -or $hk -eq $it.Name -or -not (Test-NetworkDown $script:Data[$hk]) -or (Find-VmForServer $it.Name $d)) { continue }
             if (-not $byHost.ContainsKey($hk)) { $byHost[$hk] = New-Object System.Collections.Generic.List[string] }
             $byHost[$hk].Add($it.Display)
         }
@@ -3080,11 +3110,13 @@ function Update-VmIndex {
             if ($g.Count -ge 2) { & $addX $hk 'Krytyczny' "Host Hyper-V $(Get-DisplayName $hk) nie odpowiada, a razem z nim maszyny z listy, które ostatnio na nim działały ($($g.Count)): $(Join-Short $g 8) – zacznij od hosta (konsola iLO/iDRAC, zasilanie, sieć)" 'Diagnostics' '' 'Łączność' }
         }
         # podsieć /24: co najmniej 3 niedostępne i ≥ 80% znanych serwerów tej podsieci
-        $netAll = @{}; $netDown = @{}
+        $netAll = @{}; $netDown = @{}; $noAddr = 0
         foreach ($it in @($script:Servers)) {
             $d = $script:Data[$it.Name]
             if (-not $d -or ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported)) { continue }
-            foreach ($sn in @(Get-ServerSubnets $d)) { if (-not $netAll.ContainsKey($sn)) { $netAll[$sn] = 0 }; $netAll[$sn]++ }
+            $sns = @(Get-ServerSubnets $d)
+            if (-not $d.Offline -and -not $sns.Count) { $noAddr++ }   # np. pominięta sekcja Adresacja – nie wiadomo, ile serwerów podsieci działa
+            foreach ($sn in $sns) { if (-not $netAll.ContainsKey($sn)) { $netAll[$sn] = 0 }; $netAll[$sn]++ }
         }
         foreach ($it in $down) {
             foreach ($sn in @(Get-ServerSubnets $script:Data[$it.Name])) {
@@ -3093,6 +3125,7 @@ function Update-VmIndex {
             }
         }
         foreach ($sn in @($netDown.Keys | Sort-Object)) {
+            if ($noAddr) { break }
             $g = $netDown[$sn]; $tot = [int]$netAll[$sn]
             if ($g.Count -lt 3 -or $tot -lt 1 -or $g.Count / $tot -lt 0.8) { continue }
             $fw = @($g | Where-Object { "$($script:Data[$_.Name].Diag.Class)" -eq 'Firewall' }).Count
@@ -3133,10 +3166,19 @@ function Find-VmForServer([string]$Name, $D) {
     # repliki (Hyper-V Replica) mają ten sam identyfikator i nazwę co maszyna główna – nie reprezentują gościa
     $nonRep = @($cands | Where-Object { "$($_.Row.PSObject.Properties['ReplicationMode'].Value)" -notmatch 'Replica' })
     if ($nonRep.Count) { $cands = $nonRep }
+    else { $cands = @($cands | Where-Object { "$($_.Row.State)" -like 'Running*' }) }   # sama replika liczy się tylko po przełączeniu (gdy działa)
     if (-not $cands.Count) { return $null }
     $run = @($cands | Where-Object { "$($_.Row.State)" -like 'Running*' })
     if ($run.Count) { return $run[0] }
     @($cands | Sort-Object { "$($_.ScannedAt)" } -Descending)[0]
+}
+function Test-NetworkDown($D, [switch]$AllowFirewall) {
+    # Serwer niedostępny z przyczyn sieciowych (nie odpowiada, błąd sieci, nieznana przyczyna; z -AllowFirewall także zablokowany 5985)
+    if (-not $D -or -not $D.Offline) { return $false }
+    $cls = "$($D.PSObject.Properties['Diag'].Value.Class)"
+    $ok = @('', 'Offline', 'Network', 'Unknown')
+    if ($AllowFirewall) { $ok += 'Firewall' }
+    $ok -contains $cls
 }
 function Get-LastHvHost($D) {
     # Host Hyper-V z danych gościa (usługi integracji) – z bieżącego skanu albo z ostatnich udanych danych serwera niedostępnego
@@ -4538,7 +4580,9 @@ function Invoke-Dialog([System.Windows.Window]$Window) {
     if ($script:UnlockState.Emergency -and -not $Window.Tag['LockScreen']) { $Window.Tag['Result'] = $false; return $false }
     if (-not $Window.Tag['LockScreen']) { Register-IdleActivity -Window $Window }
     $Window.Tag['Result'] = $false
-    if ($window -and $window.IsVisible -and -not [object]::ReferenceEquals($window, $Window)) { $Window.Owner = $window }
+    # $window i $Window to w PowerShell ta sama zmienna (parametr) – okno główne bierzemy z zakresu skryptu
+    $main = $script:window
+    if ($main -and $main.IsVisible -and -not [object]::ReferenceEquals($main, $Window)) { $Window.Owner = $main }
     else { $Window.WindowStartupLocation = 'CenterScreen' }
     $Window.Add_SourceInitialized({ param($s, $e) Set-DarkTitleBar $s })
     $Window.Tag['Modal'] = $true
@@ -5055,7 +5099,7 @@ function Update-ServerItem([string]$Name) {
         if ($vm -and "$($vm.Row.State)" -ne 'Running') { $why = "VM $(Get-VmStateText "$($vm.Row.State)") na $($vm.HostDisplay)" }
         elseif (-not $vm -and $cls -notin 'Timeout', 'Remote') {
             $hk = Find-ServerKey (Get-LastHvHost $d)
-            if ($hk -and $hk -ne $Name -and $script:Data[$hk] -and $script:Data[$hk].Offline) { $why = "host $(Get-DisplayName $hk) nie odpowiada" }
+            if ($hk -and $hk -ne $Name -and (Test-NetworkDown $script:Data[$hk])) { $why = "host $(Get-DisplayName $hk) nie odpowiada" }
         }
         $it.Sub = $why + $(if ($os) { " · $os" })
     } else {
@@ -5325,8 +5369,9 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
     if (-not $showIgnored) {
         foreach ($i in @($script:ClusterIssues)) { if ($i) { $all.Add($i); if ($i.Rank -eq 0) { $crit++ } elseif ($i.Rank -eq 1) { $warn++ } } }
         $sc = Get-StationClockIssue
-        if ($sc) { $all.Add($sc); $warn++ }
-        if ($script:StationNetIssue) { $all.Add($script:StationNetIssue); $crit++ }
+        if ($sc -and -not (Test-IssueIgnored '(stacja)' $sc.IssueKey)) { $all.Add($sc); $warn++ }
+        $sn = $script:StationNetIssue
+        if ($sn -and -not (Test-IssueIgnored '(stacja)' $sn.IssueKey)) { $all.Add($sn); $crit++ }
     }
     $hosts = 0; $vmRun = 0; $vmAll = 0
     foreach ($d in $script:Data.Values) { if ($d -and -not $d.Offline -and $d.PSObject.Properties['System'] -and $d.System -and $d.System.IsHyperV) { $hosts++; $vmRun += [int]$d.System.HvVmRunning; $vmAll += [int]$d.System.HvVmTotal } }
@@ -5396,7 +5441,7 @@ function Get-VmData {
         $pct = if ($ram) { [math]::Round($as / $ram * 100) } else { $null }
         $cp = @($d.Checkpoints | Where-Object { $_ -and "$($_.Type)" -notlike '*Replica' -and [double]$_.AgeDays -gt $Config.CheckpointWarnDays }).Count   # jak w analizie
         $oldCp += $cp; $cpuSum += $vr; $ramSum += $as; $run += [int]$s.HvVmRunning; $tot += [int]$s.HvVmTotal
-        $flag = if (($ratio -and $ratio -gt $Config.VcpuRatioWarn) -or ($pct -and $pct -ge $Config.HostRamWarnPct)) { 'warn' } elseif ($d._Crit) { 'crit' } else { '' }
+        $flag = if ($d._Crit) { 'crit' } elseif (($ratio -and $ratio -gt $Config.VcpuRatioWarn) -or ($pct -and $pct -ge $Config.HostRamWarnPct)) { 'warn' } else { '' }
         $hosts.Add([pscustomobject]@{
             Key = $it.Name; Host = $it.Display; HvCluster = $(if ($s.PSObject.Properties['HvCluster']) { "$($s.HvCluster)" } else { '' })
             Vms = "$($s.HvVmRunning) / $($s.HvVmTotal)"; VCpuRatio = $(if ($ratio) { "$vr / $lp ($ratio : 1)" } else { '' }); RamPct = $pct
@@ -5524,8 +5569,8 @@ function Get-DiagnosticsRows([string]$Name, $D) {
     } elseif ($D.Offline -and ($lh = Get-LastHvHost $D)) {
         # maszyny nie ma w danych żadnego dostępnego hosta – pokaż host z ostatnich danych gościa i jego stan
         $hk = Find-ServerKey $lh
-        $hd = $hk -and $script:Data[$hk] -and $script:Data[$hk].Offline
-        $rows.Add([pscustomobject]@{ Check = 'Host Hyper-V (wg ostatnich danych)'; Value = "$(Get-DisplayName $lh)$(if ($hd) { ' – też nie odpowiada' } elseif (-not $hk) { ' – nie ma go na liście serwerów (dodaj go, żeby widzieć stan maszyny)' } else { ' – maszyny nie ma na tym hoście (przeniesiona albo usunięta?)' })"; Status = $(if ($hd) { 'Uwaga' } else { 'Info' }); Flag = $(if ($hd) { 'warn' } else { 'info' }) })
+        $hd = $hk -and (Test-NetworkDown $script:Data[$hk])
+        $rows.Add([pscustomobject]@{ Check = 'Host Hyper-V (wg ostatnich danych)'; Value = "$(Get-DisplayName $lh)$(if ($hd) { ' – też nie odpowiada' } elseif ($hk -and $script:Data[$hk] -and $script:Data[$hk].Offline) { ' – skan hosta też się nie udał (przyczyna w szczegółach hosta)' } elseif (-not $hk) { ' – nie ma go na liście serwerów (dodaj go, żeby widzieć stan maszyny)' } else { ' – maszyny nie ma na tym hoście (przeniesiona albo usunięta?)' })"; Status = $(if ($hd) { 'Uwaga' } else { 'Info' }); Flag = $(if ($hd) { 'warn' } else { 'info' }) })
     }
     if ($D.PSObject.Properties['_Last'] -and $D._Last) {
         $ls = $D._Last
@@ -5696,6 +5741,8 @@ function Select-Server([string]$Key, [string]$Section) {
     if (-not $item) { return }
     $ui.txtServerFilter.Text = ''
     if (-not $ui.sfAll.IsChecked) { $ui.sfAll.IsChecked = $true }
+    # filtr listy od razu, nie po opóźnieniu – inaczej serwera spoza starego filtra nie da się zaznaczyć
+    $script:FilterPending.Remove('servers'); Update-ServerFilter
     $script:PendingSection = $Section
     $script:Refreshing = $true   # bez obsługi SelectionChanged – szczegóły pokazujemy niżej raz
     try { $ui.lstServers.SelectedItems.Clear(); $ui.lstServers.SelectedItem = $item } finally { $script:Refreshing = $false }
@@ -5845,6 +5892,9 @@ function Update-Operations {
         Update-StatusBar
         if ($script:LastUiRefresh.ElapsedMilliseconds -ge 1500 -or $script:Ops.Count -eq 0) { Invoke-UiRefresh }
         # Okna z wynikami – dopiero po zwolnieniu taktu (okno modalne nie wstrzymuje odbioru wyników pozostałych serwerów)
+        # DispatcherTimer wznawia się dopiero po powrocie z Tick – bez ponownego uzbrojenia okno modalne (i blokada PIN-em
+        # czekająca na odblokowanie) zatrzymałoby odbiór wyników i limity czasu serwerów
+        if ($script:PendingDialogs.Count -and $script:EngineTimer -and $script:EngineTimer.IsEnabled) { $script:EngineTimer.Stop(); $script:EngineTimer.Start() }
         while ($script:PendingDialogs.Count) {
             $pd = $script:PendingDialogs[0]; $script:PendingDialogs.RemoveAt(0)
             Show-Message $pd.Text $pd.Title $pd.Tone
@@ -5882,7 +5932,7 @@ function Update-StatusBar {
     $parts = foreach ($op in $ops) {
         $total += $op.Total; $done += $op.Done
         $el = [int]((Get-Date) - $op.Started).TotalSeconds
-        $running = @($op.Sync.Started.Keys).Count - $op.Done
+        $running = $op.Sync.Started.Count - $op.Done   # Count bez wyliczania kluczy – wątki tła dopisują je w tym czasie
         $t = '{0}: {1} z {2}' -f $op.Name, $op.Done, $op.Total
         if ($op.Kind -eq 'Scan') { $t += ", w toku $([Math]::Max(0, $running))" }
         if ($op.Failed) { $t += ", bez danych: $($op.Failed)" }
@@ -6002,7 +6052,7 @@ function Receive-ScanResult($Op, $R) {
             Register-ServerData $name $d $null
         }
         Write-Log "[$(Get-DisplayName $name)] $($R.Error)" 'WARN' 'Skan'
-        Add-AvailabilityRecord $name 'Limit czasu' $R.DurationSec 0 0 'Timeout' $R.Error
+        if (-not $st.RetryOf) { Add-AvailabilityRecord $name 'Limit czasu' $R.DurationSec 0 0 'Timeout' $R.Error }   # porażka skanu już zapisana przez skan główny
     }
     else {
         $st.Offline++
@@ -6015,7 +6065,7 @@ function Receive-ScanResult($Op, $R) {
         $cls = if ($R.Diag) { "$($R.Diag.Class)" } else { '' }
         $cause = if ($R.Diag) { "$($R.Diag.Cause)" } else { Get-ShortText $R.Error 200 }
         Write-Log ("[{0}] Brak połączenia – {1}{2}{3}" -f (Get-DisplayName $name), $cause, $(if ($R.Diag -and $R.Diag.Ports) { " (porty: $($R.Diag.Ports))" }), $(if ($R.Diag -and $R.Diag.Notes) { "; $($R.Diag.Notes)" })) $(if ($cls -eq 'Remote') { 'WARN' } else { 'ERROR' }) 'Skan'
-        Add-AvailabilityRecord $name $(if ($cls -eq 'Remote') { 'Błąd zbierania danych' } else { 'Brak połączenia' }) $R.DurationSec 0 0 $cls $cause
+        if (-not $st.RetryOf) { Add-AvailabilityRecord $name $(if ($cls -eq 'Remote') { 'Błąd zbierania danych' } else { 'Brak połączenia' }) $R.DurationSec 0 0 $cls $cause }
         # Ochrona konta: kilka odmów logowania z rzędu bez żadnego sukcesu = złe hasło – przerwij, zanim konto zostanie zablokowane w domenie
         if ($cls -eq 'Auth' -and $script:Cred) {
             $st.AuthFails++
@@ -6072,7 +6122,13 @@ function Complete-Scan($Op) {
         Request-UiRefresh -All
     }
     if ($retry.Count) { Start-Scan $retry $st }
+    Invoke-PendingReanalysis
 }
+function Invoke-PendingReanalysis {
+    # ustawienia zmienione w trakcie skanu/wczytywania – ponowna analiza po zakończeniu operacji
+    if ($script:ReanalyzePending -and -not (Get-Operation 'Scan') -and -not (Get-Operation 'Load')) { $script:ReanalyzePending = $false; Start-SnapshotLoad -Reanalyze }
+}
+$script:ReanalyzePending = $false
 
 # ── Wczytywanie wyników z dysku (start programu, ponowna analiza po zmianie ustawień) ──
 function Start-SnapshotLoad([switch]$Reanalyze) {
@@ -6082,6 +6138,9 @@ function Start-SnapshotLoad([switch]$Reanalyze) {
         $files = @(Get-SnapshotEntries $it.Name | ForEach-Object { @{ Path = $_.Path; Offline = $_.Offline } })
         if (-not $files.Count) { continue }
         if ($files.Count -gt 6) { $files = $files[0..5] }
+        # serwer niedostępny od wielu skanów: dołącz ostatnią udaną migawkę (ostatnie znane dane, host Hyper-V gościa)
+        $on = Get-LastOnlineSnapshot $it.Name
+        if ($on -and @($files | ForEach-Object { $_.Path }) -notcontains $on) { $files += @{ Path = $on; Offline = $false } }
         @{ Target = $it.Name; Opt = @{ Files = $files; ArrayKeys = [string[]]$script:ArrayKeys } }
     }
     $items = @($items)
@@ -6118,6 +6177,7 @@ function Complete-Load($Op) {
         $ui.txtStatus.Text = "Wczytano wyniki $($Op.Done - $Op.State.Bad) serwerów"
         Request-UiRefresh -All
     }
+    Invoke-PendingReanalysis
 }
 
 # ── Diagnostyka połączenia na żądanie ──
@@ -6481,9 +6541,14 @@ function Show-SettingsDialog {
         Update-SettingsButton
         foreach ($k in 'Remote', 'Local') { if ($script:Pools[$k]) { [void](Get-EnginePool $k) } }   # nowy limit równoległości
         if ($script:SetDlg.Changed) {
-            Show-Toast 'Zapisano ustawienia – nowe progi zastosowano do wczytanych wyników.' 'ok' 5
-            # nowe progi i reguły: ponowna analiza zapisanych wyników (w tle, z migawek)
-            if (-not (Get-Operation 'Scan')) { Start-SnapshotLoad -Reanalyze }
+            # nowe progi i reguły: ponowna analiza zapisanych wyników (w tle, z migawek) – po trwającym skanie, jeśli trwa
+            if ((Get-Operation 'Scan') -or (Get-Operation 'Load')) {
+                $script:ReanalyzePending = $true
+                Show-Toast 'Zapisano ustawienia – nowe progi zostaną zastosowane po zakończeniu trwającej operacji.' 'ok' 5
+            } else {
+                Start-SnapshotLoad -Reanalyze
+                Show-Toast 'Zapisano ustawienia – nowe progi są stosowane do wczytanych wyników.' 'ok' 5
+            }
         } else { Show-Toast 'Zapisano ustawienia.' 'ok' }
     }
     $script:SetDlg = $null
@@ -6633,7 +6698,7 @@ function Update-CredLabel {
     if ($script:Cred) { $ui.txtCredUser.Text = $script:Cred.UserName; $ui.txtCredMode.Text = 'inne konto' }
     else { $ui.txtCredUser.Text = "$env:USERDOMAIN\$env:USERNAME"; $ui.txtCredMode.Text = 'bieżące konto' }
 }
-function Test-Credential($Cred) {
+function Test-Credential([pscredential]$Cred) {
     # $true / $false – wynik sprawdzenia w domenie; $null – nie da się sprawdzić (konto lokalne, brak domeny)
     try {
         Add-Type -AssemblyName System.DirectoryServices.AccountManagement
@@ -6858,7 +6923,8 @@ $ui.btnAD.Add_Click({
         $old = $window.Cursor; $window.Cursor = [System.Windows.Input.Cursors]::Wait
         try { $found = @(Get-ServersFromAD) } catch { Show-Message "Nie udało się odpytać AD: $($_.Exception.Message)" 'Pobierz z AD' 'crit'; return } finally { $window.Cursor = $old }
         if (-not $found.Count) { Show-Message "Nie znaleziono aktywnych kont serwerów Windows w AD$(if ($Config.AdSearchBase) { " (OU: $($Config.AdSearchBase))" })." 'Pobierz z AD' 'info'; return }
-        $new = @($found | Where-Object { -not (Get-ServerItem $_.Name) -and -not (@($script:Servers | Where-Object { $_.Display -eq (Get-DisplayName $_.Name) }).Count) })
+        # $dn przed wewnętrznym Where-Object – tam $_ to już pozycja listy, nie wynik z AD
+        $new = @($found | Where-Object { $dn = Get-DisplayName $_.Name; -not (Get-ServerItem $_.Name) -and -not @($script:Servers | Where-Object { $_.Display -eq $dn }).Count })
         if (-not $new.Count) { Show-Toast "W AD jest $($found.Count) aktywnych serwerów – wszystkie są już na liście." 'info'; return }
         if (Confirm-Action -Text "W AD jest $($found.Count) aktywnych serwerów Windows (logowanie w ostatnich $($Config.AdInactiveDays) dniach$(if ($Config.AdSearchBase) { ", OU: $($Config.AdSearchBase)" })), z czego $($new.Count) nie ma jeszcze na liście:`n$(Join-Short ($new | ForEach-Object { Get-DisplayName $_.Name }) 20)`n`nDodać brakujące?" -Title 'Pobierz z AD' -ConfirmText 'Dodaj' -Tone 'info') {
             foreach ($f in ($new | Sort-Object Name)) { [void](Add-ServerEntry $f.Name $f.OS) }
@@ -6938,7 +7004,7 @@ $ui.btnLogFile.Add_Click({ $f = Get-LogFile; if (Test-Path -LiteralPath $f) { St
 $ui.btnLogFolder.Add_Click({ New-Item -ItemType Directory -Force -Path $Config.LogDir | Out-Null; Start-Process explorer.exe -ArgumentList "`"$($Config.LogDir)`"" })
 $ui.btnLogCopy.Add_Click({
     $items = @($ui.logList.SelectedItems)
-    if ($items.Count -le 1) { $items = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($script:LogItems)) }
+    if ($items.Count -eq 0) { $items = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($script:LogItems)) }
     $text = (@($items | ForEach-Object { '{0} [{1}] [{2}] {3}' -f $_.Time, $_.Level, $_.Module, $_.Message }) -join [Environment]::NewLine)
     if ($text) { [System.Windows.Clipboard]::SetText($text); Show-Toast "Skopiowano wpisów: $($items.Count)" 'ok' }
 })
@@ -6977,7 +7043,8 @@ $window.Add_Closing({
     param($s, $e)
     try {
         if ($script:Ops.Count -and -not $script:UnlockState.Emergency) {
-            if (-not (Confirm-Action -Text 'Trwa skan lub wczytywanie wyników. Zamknięcie programu je przerwie. Zamknąć mimo to?' -Title 'Zamknięcie programu' -ConfirmText 'Zamknij' -Danger)) { $e.Cancel = $true; return }
+            # zamknięcie awaryjne z ekranu blokady w trakcie tego pytania też zamyka program
+            if (-not (Confirm-Action -Text 'Trwa skan lub wczytywanie wyników. Zamknięcie programu je przerwie. Zamknąć mimo to?' -Title 'Zamknięcie programu' -ConfirmText 'Zamknij' -Danger) -and -not $script:UnlockState.Emergency) { $e.Cancel = $true; return }
         }
         Stop-AllOperations 'Zamykanie programu'
         $script:UiState.WindowMaximized = ($s.WindowState -eq 'Maximized')

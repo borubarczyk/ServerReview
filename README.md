@@ -317,7 +317,7 @@ Bez ustawionego PIN-u blokada jest wyłączona, a przycisk z kłódką ukryty. S
 
 ## Ustawienia
 
-Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.json` obok skryptu i nadpisują wartości domyślne z bloku `$Config` na początku skryptu. Przycisk „Przywróć domyślne” wraca do tych wartości, a „Folder danych” otwiera folder programu. Po zapisaniu zmienionych progów wyniki są od razu analizowane ponownie, bez nowego skanu.
+Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.json` obok skryptu i nadpisują wartości domyślne z bloku `$Config` na początku skryptu. Przycisk „Przywróć domyślne” wraca do tych wartości, a „Folder danych” otwiera folder programu. Po zapisaniu zmienionych progów wyniki są analizowane ponownie, bez nowego skanu – od razu albo, jeśli trwa skan, zaraz po jego zakończeniu.
 
 **Zakres skanu.** Odznaczone sekcje nie są zbierane ani porównywane, co skraca skan. Liczba pomijanych sekcji wyświetla się przy zębatce. Sekcja **Czas zbierania sekcji** w szczegółach serwera pokazuje, które sekcje trwają najdłużej.
 
@@ -418,7 +418,7 @@ Logs\Availability_RRRRMM.csv                      dziennik dostępności
 
 Jeśli skrypt uruchomiono bez pliku (np. wklejony do konsoli), zamiast folderu skryptu używany jest `%USERPROFILE%\Documents\ServerReview`. Jeśli folder skryptu jest tylko do odczytu (np. udział sieciowy), dane trafiają do `%LOCALAPPDATA%\ServerReview`, a lista serwerów i ustawienia są tam kopiowane przy pierwszym uruchomieniu.
 
-Dla każdego serwera przechowywanych jest domyślnie 30 ostatnich migawek. Starsze są usuwane po skanie, a puste foldery skanów znikają. Migawki z poprzednich wersji programu (`.json`) są nadal odczytywane. Migawki i ustawienia zapisują się przez plik tymczasowy, więc przerwany zapis nie psuje danych.
+Dla każdego serwera przechowywanych jest domyślnie 30 ostatnich migawek (znaczniki nieudanych prób też się liczą). Starsze są usuwane po skanie, ale ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych. Puste foldery starych skanów znikają. Migawki z poprzednich wersji programu (`.json`) są nadal odczytywane. Migawki i ustawienia zapisują się przez plik tymczasowy, więc przerwany zapis nie psuje danych.
 
 ## Duże środowiska
 
