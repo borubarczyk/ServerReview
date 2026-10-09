@@ -133,6 +133,8 @@ $Config = [ordered]@{
     )
     # Porty uznawane za wrażliwe przy przeglądzie reguł zapory (sekcja Ekspozycja)
     ExposedPorts           = @(21, 22, 23, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 5985, 5986)
+    # Narzędzia zdalnego dostępu używane w firmie (RMM) – zgłaszane jako informacja zamiast ostrzeżenia (sekcja Podejrzane)
+    ApprovedRemoteTools    = @()
     # Subskrypcje WMI obecne w czystym systemie – nie są zgłaszane (sekcja Trwałość)
     IgnoredWmiConsumers    = @('SCM Event Log Filter', 'SCM Event Log Consumer', 'BVTFilter', 'BVTConsumer')
     # Wymagane podkategorie audytu. GUID jest niezależny od języka systemu. Need: 1 = sukces, 2 = niepowodzenie, 3 = oba
@@ -247,6 +249,10 @@ $Collector = {
         $s = [regex]::Replace($s, '(?i)((?:^|\s)[-/](?:p|pw|pwd|pass|passwd|password|secret|token|apikey)(?::|=|\s+))(?!\d)("[^"]*"|\S+)', '$1***')
         [regex]::Replace($s, '(?i)((?:password|passwd|pwd|secret|token|apikey)\s*=\s*)("[^"]*"|[^;\s"]+)', '$1***')
     }
+    # Wartość z rejestru albo $null (brak klucza lub wartości)
+    function RegV([string]$Path, [string]$Name) { try { $k = Get-Item -LiteralPath $Path -ErrorAction Stop; return $k.GetValue($Name) } catch { return $null } }
+    # Pola EventData zdarzenia jako tabela nazwa → wartość (niezależne od języka systemu)
+    function EvMap($e) { $h = @{}; try { $x = [xml]$e.ToXml(); foreach ($n in @($x.Event.EventData.Data)) { if ($n.Name) { $h["$($n.Name)"] = "$($n.'#text')" } } } catch { }; $h }
 
     # ── System ──
     $sys = [ordered]@{}
@@ -275,6 +281,7 @@ $Collector = {
         $sys.Domain        = $cs.Domain
         $sys.DomainRole    = $roles[[int]$cs.DomainRole]
         $sys.IsDC          = ([int]$cs.DomainRole -ge 4)
+        $sys.PartOfDomain  = [bool]$cs.PartOfDomain
         $sys.DomainRoleId  = [int]$cs.DomainRole
         $sys.BuildNumber   = [int]$os.BuildNumber
         # Pamięć wirtualna (commit): limit = RAM + pliki stronicowania
@@ -332,7 +339,7 @@ $Collector = {
             # Surowa wartość WMI (M/d/yyyy albo FILETIME szesnastkowo) parsowana niezależnie od języka – w PS 4.0 właściwość
             # InstalledOn parsuje datę w kulturze stacji przekazanej przez WinRM (pl-PL: dzień i miesiąc zamienione)
             $dt = $null; $raw = ''
-            try { $raw = "$($_.psbase.Properties['InstalledOn'].Value)" } catch {}
+            try { $raw = "$($_.psbase['InstalledOn'])" } catch {}
             if ($raw -match '^\d{1,2}/\d{1,2}/\d{4}$') { try { $dt = [datetime]::ParseExact($raw, 'M/d/yyyy', [Globalization.CultureInfo]::InvariantCulture) } catch {} }
             elseif ($raw -match '^[0-9A-Fa-f]{16}$') { try { $dt = [datetime]::FromFileTime([Convert]::ToInt64($raw, 16)) } catch {} }
             if (-not $dt) { try { $dt = $_.InstalledOn } catch {} }
@@ -357,6 +364,289 @@ $Collector = {
     try { $sys.TimeZone = [TimeZoneInfo]::Local.Id } catch { $sys.TimeZone = '' }   # Get-TimeZone jest dopiero w PS 5.1
     $sys.PSVersion = $PSVersionTable.PSVersion.ToString()
 
+    # ── Ochrona: antywirus i EDR (także innych producentów) oraz zapora ──
+    # Na Windows Server nie ma Centrum zabezpieczeń (root\SecurityCenter2), więc produkt rozpoznajemy po usługach, załadowanych
+    # minifiltrach (fltmc), sterownikach, wpisach Programów i rejestracjach zapory. Wyłączony Defender albo zapora Windows to stan
+    # prawidłowy, gdy ochronę przejął inny produkt – wtedy tylko informacja. Katalog: Svc/Core – usługi (Core = działa produkt),
+    # Path – ścieżka usługi, Uninst – wpis w Programach, Flt – minifiltry, Rtp – minifiltr ochrony plików w czasie rzeczywistym,
+    # AvSvc/AvFlt – dodatkowy warunek „to jest antywirus”, Fw – Replace (własna zapora) / Manage (zarządza zaporą Windows) / None,
+    # FwInd – usługa albo sterownik aktywnego modułu zapory, FwIf – moduł zapory zainstalowany (wpis w Programach).
+    $protection = New-Object System.Collections.Generic.List[object]
+    $secInventory = @()
+    $sys.AV = ''; $sys.AvActive = $false; $sys.AvThirdParty = ''; $sys.FirewallManagedBy = ''
+    $svcAll = @()
+    $t0 = $sw.Elapsed.TotalSeconds
+    if (Want 'Protection') {
+        function Add-Prot($comp, $prod, $state, $detail, $status) { $protection.Add([pscustomobject]@{ Component = $comp; Product = "$prod"; State = "$state"; Detail = (Short "$detail" 500); Status = $status }) }
+        $secCat = @(
+            @{ Id = 'MDAV';    Name = 'Microsoft Defender Antivirus';             Type = 'AV';        Svc = '^(WinDefend|WdNisSvc|MDCoreSvc)$'; Core = '^WinDefend$'; Flt = '^wdfilter$'; Rtp = '^wdfilter$' }
+            @{ Id = 'MDE';     Name = 'Microsoft Defender for Endpoint (Sense)';  Type = 'EDR';       Svc = '^Sense$'; Core = '^Sense$'; Flt = '^mssecflt$' }
+            @{ Id = 'SCEP';    Name = 'System Center Endpoint Protection / Microsoft Antimalware'; Type = 'AV'; Svc = '^MsMpSvc$'; Core = '^MsMpSvc$'; Path = @('*\Microsoft Security Client\*'); Uninst = '^(System Center (2012 )?Endpoint Protection|Microsoft Security Client|Microsoft Antimalware|Forefront Endpoint Protection)'; Flt = '^mpfilter$'; Rtp = '^mpfilter$' }
+            @{ Id = 'BDGZ';    Name = 'Bitdefender GravityZone (BEST)';           Type = 'EDR+AV';    Svc = '^(EPSecurityService|EPProtectedService|EPIntegrationService|EPUpdateService|EPRedline)$'; Core = '^(EPSecurityService|EPProtectedService)$'; Path = @('*\Bitdefender\Endpoint Security\*'); Uninst = '^Bitdefender Endpoint Security Tools'; Flt = '^(gzflt|bdsvm|trufos|avc3|avckf|atc|gemma|ignis|hbflt|vlflt|bddevflt|edrsensor|bdprivmon)$'; Fw = 'Replace'; FwInd = '^(bdfwfpf|bdfndisf6?)$' }
+            @{ Id = 'ESET';    Name = 'ESET (Server Security / Endpoint / PROTECT)'; Type = 'AV';     Svc = '^(ekrn|EraAgentSvc)$'; Core = '^ekrn$'; Path = @('*\ESET\ESET Security\*', '*\ESET\ESET File Security\*', '*\ESET\ESET Server Security\*', '*\ESET\ESET Endpoint*'); Uninst = '^ESET (Server Security|File Security|Endpoint Security|Endpoint Antivirus|Mail Security|Security|NOD32|Management Agent|Inspect Connector)'; Flt = '^(eamonm|ehdrv|edevmon|edevmonm)$'; Rtp = '^eamonm$'; Fw = 'Replace'; FwIf = '^ESET Endpoint Security'; FwInd = '^(epfwwfp)$' }
+            @{ Id = 'SOPHOS';  Name = 'Sophos (Intercept X / Server Protection)'; Type = 'EDR+AV';    Svc = '^(SAVService|SAVAdminService|SntpService|hmpalertsvc|swi_service|swi_filter|swi_update(_64)?|SEDService|sophossps|Sophos .+)$'; Core = '^(SAVService|SEDService|Sophos Endpoint Defense Service|Sophos File Scanner Service|hmpalertsvc)$'; Path = @('*\Sophos\Endpoint Defense\*', '*\Sophos\Sophos Anti-Virus\*', '*\Sophos\Sophos File Scanner\*', '*\Sophos\Management Communications System\*', '*\HitmanPro.Alert\*'); Uninst = '^Sophos (Endpoint Agent|Anti-Virus|Intercept X|Server Protection|Endpoint Defense)'; Flt = '^(sophosed|savonaccess|sld|soidriver)$'; Fw = 'Replace'; FwIf = '^Sophos Client Firewall'; FwInd = '^(Sophos Client Firewall.*|SCFService|SCFManager)$' }
+            @{ Id = 'KES';     Name = 'Kaspersky Endpoint Security';              Type = 'EDR+AV';    Svc = '^(AVP(\..+)?|avpsus)$'; Core = '^AVP'; Path = @('*\Kaspersky Lab\Kaspersky Endpoint Security*'); Uninst = '^Kaspersky Endpoint Security'; Flt = '^(klif|klam|klbg|kldback|kldlinf|kldtool|klboot|klfdefsf|klrsps|klsnsr|klifks|klifaa|klifsm)$'; Fw = 'Replace'; FwInd = '^klwfp$' }
+            @{ Id = 'KSWS';    Name = 'Kaspersky Security for Windows Server / Embedded Systems Security'; Type = 'AV'; Svc = '^(KAVFS|KAVFSGT|KAVFSSLP|KAVFSSCS)$'; Core = '^KAVFS$'; Path = @('*\Kaspersky Lab\Kaspersky Security*', '*\Kaspersky Lab\Kaspersky Embedded*'); Uninst = '^Kaspersky (Security .*Windows Server|Embedded Systems Security|Industrial CyberSecurity)'; Flt = '^(klif|klam|klbg|kldback|kldlinf|kldtool|klboot|klfdefsf|klrsps|klsnsr|klifks|klifaa|klifsm)$'; Fw = 'Manage' }
+            @{ Id = 'KSC';     Name = 'Kaspersky Security Center Network Agent';  Type = 'Agent';     Svc = '^klnagent$'; Core = '^klnagent$'; Uninst = '^Kaspersky Security Center .*Network Agent' }
+            @{ Id = 'SEP';     Name = 'Broadcom/Symantec Endpoint Protection';    Type = 'AV';        Svc = '^(SepMasterService|SepScanService|SmcService|SNAC|Smcinst)$'; Core = '^SepMasterService$'; Path = @('*\Symantec\Symantec Endpoint Protection\*', '*\Broadcom\Symantec Endpoint Protection\*'); Uninst = '^Symantec Endpoint (Protection|Security)'; Flt = '^(srtsp|srtsp64|eectrl|symefasi|symevnt|symevent|bhdrvx64)$'; Rtp = '^srtsp(64)?$'; Fw = 'Replace' }
+            @{ Id = 'TMAO';    Name = 'Trend Micro Apex One / OfficeScan / WFBS'; Type = 'AV';        Svc = '^(ntrtscan|tmlisten|TmCCSF|TMBMServer|TmPfw|TmProxy|PccNTUpd|TmWSCSvc)$'; Core = '^ntrtscan$'; Path = @('*\Trend Micro\Security Agent\*', '*\Trend Micro\OfficeScan Client\*', '*\Trend Micro\Client Server Security Agent\*'); Uninst = '^Trend Micro (Apex One Security Agent|OfficeScan|Worry-Free Business Security Agent|Security Agent)'; Flt = '^(tmevtmgr|tmeyes|tmesflt|fileflt|tmkmsnsr|tmpreflt|tmxpflt|hfileflt|acdriver|sakfile|sakmfile|tmums|tmumh|tmais)$'; Fw = 'Replace'; FwInd = '^(TmPfw)$' }
+            @{ Id = 'TMDSA';   Name = 'Trend Micro Deep Security / Cloud One / Vision One Server & Workload'; Type = 'EDR+AV'; Svc = '^(ds_agent|ds_monitor|ds_notifier|Amsp)$'; Core = '^ds_agent$'; AvSvc = '^Amsp$'; Path = @('*\Trend Micro\Deep Security Agent\*', '*\Trend Micro\AMSP\*'); Uninst = '^Trend Micro Deep Security Agent'; Flt = '^(tmevtmgr|tmeyes|tmesflt|tmkmsnsr|tmumh|tmums|tmais)$'; Fw = 'Replace'; FwInd = '^tbimdsa$' }
+            @{ Id = 'ENS';     Name = 'Trellix/McAfee Endpoint Security (ENS)';   Type = 'AV';        Svc = '^(mfemms|mfefire|mfevtp|mfewc|mfeesp|mfetp|mfeatp|masvc|macmnsvc|macompatsvc)$'; Core = '^mfemms$'; Path = @('*\McAfee\Endpoint Security\*', '*\Trellix\Endpoint Security\*'); Uninst = '^(McAfee|Trellix) Endpoint Security'; Flt = '^(mfehidk|mfencoas|epdrv|swin|mfesec|mfeaskm|mfencfilter)$'; Fw = 'Replace'; FwIf = '^(McAfee|Trellix) Endpoint Security Firewall'; FwInd = '^mfefire$' }
+            @{ Id = 'VSE';     Name = 'McAfee VirusScan Enterprise 8.x (EOL)';    Type = 'AV';        Svc = '^(McShield|McTaskManager|McAfeeFramework|McAfeeEngineService)$'; Core = '^McShield$'; Uninst = '^McAfee VirusScan Enterprise' }
+            @{ Id = 'HX';      Name = 'Trellix HX (FireEye Endpoint Agent)';      Type = 'EDR';       Svc = '^xagt$'; Core = '^xagt$'; Path = @('*\FireEye\xagt\*') }
+            @{ Id = 'CS';      Name = 'CrowdStrike Falcon';                       Type = 'EDR+AV';    Svc = '^CSFalconService$'; Core = '^CSFalconService$'; Path = @('*\CrowdStrike\*'); Uninst = '^CrowdStrike (Windows Sensor|Falcon)'; Flt = '^csagent$'; Fw = 'Manage' }
+            @{ Id = 'S1';      Name = 'SentinelOne';                              Type = 'EDR+AV';    Svc = '^(SentinelAgent|SentinelHelperService|SentinelStaticEngine|LogProcessorService)$'; Core = '^SentinelAgent$'; Path = @('*\SentinelOne\*'); Uninst = '^Sentinel Agent'; Flt = '^sentinelmonitor$'; Fw = 'Manage' }
+            @{ Id = 'CBC';     Name = 'VMware/Broadcom Carbon Black Cloud';       Type = 'EDR+AV';    Svc = '^(CbDefense|CbDefenseWSC)$'; Core = '^CbDefense$'; Path = @('*\Confer\*'); Uninst = '^(Carbon Black Cloud Sensor|CB Defense Sensor|VMware Carbon Black Cloud)' }
+            @{ Id = 'CBR';     Name = 'Carbon Black EDR (Response)';              Type = 'EDR';       Svc = '^CarbonBlack$'; Core = '^CarbonBlack$'; Path = @('*\CarbonBlack\*'); Flt = '^carbonblackk$' }
+            @{ Id = 'CBAC';    Name = 'Carbon Black App Control (Bit9)';          Type = 'AppControl'; Svc = '^Parity$'; Core = '^Parity$'; Path = @('*\Bit9\*'); Flt = '^(b9kernel|paritydriver)$' }
+            @{ Id = 'CYLANCE'; Name = 'Cylance PROTECT/OPTICS (BlackBerry / Arctic Wolf Aurora)'; Type = 'NGAV'; Svc = '^(CylanceSvc|CyOptics)$'; Core = '^CylanceSvc$'; Path = @('*\Cylance\*'); Uninst = '^(Cylance|BlackBerry Protect|Arctic Wolf Aurora)'; Flt = '^(cyprotectdrv64|cyprotectdrv32|cyoptics)$' }
+            @{ Id = 'CORTEX';  Name = 'Palo Alto Cortex XDR (Traps)';             Type = 'EDR+AV';    Svc = '^(cyserver|CyveraService|tlaservice|twdservice)$'; Core = '^(cyserver|CyveraService)$'; Path = @('*\Palo Alto Networks\Traps\*'); Uninst = '^(Cortex XDR|Traps)'; Flt = '^(cyvrfsfd|tedrdrv)$'; Fw = 'Manage' }
+            @{ Id = 'CYBR';    Name = 'Cybereason';                               Type = 'EDR+AV';    Svc = '^(CybereasonActiveProbe|CybereasonCRS|CybereasonBlocki)$'; Core = '^CybereasonActiveProbe$'; Path = @('*\Cybereason\*'); Flt = '^crexecprev$' }
+            @{ Id = 'MBAM';    Name = 'Malwarebytes / ThreatDown';                Type = 'EDR+AV';    Svc = '^(MBAMService|MBEndpointAgent|MBCloudEA)$'; Core = '^(MBAMService|MBEndpointAgent)$'; Path = @('*\Malwarebytes\*'); Uninst = '^(Malwarebytes|ThreatDown)'; Flt = '^(mbam|monitoring|flightrecorder|mbamshuriken|farwflt|mbamwatchdog)$' }
+            @{ Id = 'PANDA';   Name = 'WatchGuard EPDR / Panda Adaptive Defense'; Type = 'EDR+AV';    Svc = '^(PandaAetherAgent|PSUAService|NanoServiceMain)$'; Core = '^(PSUAService|NanoServiceMain)$'; Path = @('*\Panda Security\*'); Uninst = '^(Panda |WatchGuard (EPDR|EDR|EPP|Endpoint))'; Flt = '^(psinfile|psinproc|nanoavmf|shldflt)$'; Fw = 'Replace' }
+            @{ Id = 'WITH';    Name = 'WithSecure / F-Secure';                    Type = 'EDR+AV';    Svc = '^(fshoster|fsulprothoster|fsulhoster|FSMA|fsdevcon|FSAUA|fsorsp)'; Core = '^(fshoster|fsulprothoster|fsulhoster)'; Path = @('*\F-Secure\*', '*\WithSecure\*'); Uninst = '^(F-Secure|WithSecure)'; Flt = '^(fsgk|fshs|fsatp)$'; Fw = 'Manage' }
+            @{ Id = 'AVAST';   Name = 'Avast Business Antivirus';                 Type = 'AV';        Svc = '^(avast! Antivirus|aswBcc|Avast Business Console Client Antivirus Service|AvastWscReporter|aswbIDSAgent)$'; Core = '^avast! Antivirus$'; Path = @('*\AVAST Software\*'); Uninst = '^Avast (Business|Antivirus|Premium|Free)'; Flt = '^(aswmonflt|aswsp)$'; Fw = 'Unknown' }
+            @{ Id = 'AVG';     Name = 'AVG Business Antivirus';                   Type = 'AV';        Svc = '^(AVG Antivirus|avgbIDSAgent|AVGWscReporter)$'; Core = '^AVG Antivirus$'; Path = @('*\AVG\Antivirus\*'); Uninst = '^AVG (Business|AntiVirus|Internet Security)'; Flt = '^(avgmfx64|avgmfx86|avgmfi64)$'; Fw = 'Unknown' }
+            @{ Id = 'WEBROOT'; Name = 'Webroot SecureAnywhere';                   Type = 'AV';        Svc = '^(WRSVC|WRCoreService|WRSkyClient)$'; Core = '^(WRSVC|WRCoreService)$'; Path = @('*\Webroot\*'); Uninst = '^Webroot SecureAnywhere'; Flt = '^(wrkrn|wrcore(\.x64)?|wraekernel|arcore(\.x64)?|ssfmonm)$' }
+            @{ Id = 'GDATA';   Name = 'G DATA Security Client';                   Type = 'AV';        Svc = '^(AVKWCtl|AVKProxy|GDScan|GDFwSvc|AVKService|GDBackupSvc)$'; Core = '^(AVKWCtl|GDScan)$'; Path = @('*\G DATA\*'); Uninst = '^G DATA'; Flt = '^(miniicpt|hookcentre|pkticpt|gddcv)$'; Fw = 'Replace'; FwInd = '^GDFwSvc$' }
+            @{ Id = 'CISCO';   Name = 'Cisco Secure Endpoint (AMP)';              Type = 'EDR+AV';    Svc = '^(CiscoAMP|CiscoSecureEndpoint|immunetprotect|CiscoOrbital)'; Core = '^(CiscoAMP|CiscoSecureEndpoint|immunetprotect)'; Path = @('*\Cisco\AMP\*'); Uninst = '^(Cisco Secure Endpoint|Cisco AMP for Endpoints)'; Flt = '^(immunetprotect|immunetselfprotect|ciscoampheurdriver|ciscoampcefwdriver|ciscosam)$'; Fw = 'Unknown' }
+            @{ Id = 'FCT';     Name = 'FortiClient (EPP)';                        Type = 'AV';        Svc = '^(FA_Scheduler|FCT_SecSvr|FortiESNAC|FMAPOService)$'; Core = '^FA_Scheduler$'; AvFlt = '^(fortishield|fortimon2|fortirmon|fortiaptfilter)$'; Path = @('*\Fortinet\FortiClient\*'); Uninst = '^FortiClient'; Flt = '^(fortishield|fortimon2|fortirmon|fortiaptfilter)$' }
+            @{ Id = 'FEDR';    Name = 'FortiEDR';                                 Type = 'EDR+AV';    Svc = '^(FortiEDRCollectorService|FortiEDR Collector Service)$'; Core = '^FortiEDR'; Path = @('*\Fortinet\FortiEDR\*'); Uninst = '^FortiEDR' }
+            @{ Id = 'CPHE';    Name = 'Check Point Harmony Endpoint';             Type = 'EDR+AV';    Svc = '^(EPWD|CPDA|vsmon|EFRService|CPEPNMS)$'; Core = '^(EPWD|CPDA)$'; Path = @('*\CheckPoint\Endpoint Security\*'); Uninst = '^(Check Point Endpoint Security|Check Point Harmony Endpoint|Harmony Endpoint)'; Flt = '^(epregflt|epklib|cphsmon|cpepmon)$'; Fw = 'Replace'; FwInd = '^(vsdatant|vsmon)$' }
+            @{ Id = 'ELASTIC'; Name = 'Elastic Defend (Elastic Endpoint)';        Type = 'EDR';       Svc = '^(ElasticEndpoint|Elastic Agent)$'; Core = '^ElasticEndpoint$'; Path = @('*\Elastic\Endpoint\*', '*\Elastic\Agent\*'); Flt = '^elasticendpoint$' }
+            @{ Id = 'HUNT';    Name = 'Huntress (EDR; AV = Microsoft Defender)';  Type = 'EDR';       Svc = '^(HuntressAgent|HuntressUpdater|HuntressRio)$'; Core = '^HuntressAgent$'; Path = @('*\Huntress\*'); Uninst = '^Huntress'; Flt = '^huntmon$' }
+            @{ Id = 'ACRONIS'; Name = 'Acronis Cyber Protect (backup + anti-ransomware)'; Type = 'Backup'; Svc = '^(AcronisActiveProtectionService|aakore|MMS|AcrSch2Svc|AcronisAgent|CyberProtectService)$'; Core = '^(aakore|MMS)$'; Path = @('*\Acronis\*'); Uninst = '^Acronis (Cyber Protect|Agent|Cyber Backup)'; Flt = '^(file_protector|ngscan)$' }
+            @{ Id = 'EMSI';    Name = 'Emsisoft Anti-Malware';                    Type = 'AV';        Svc = '^(a2AntiMalware)$'; Core = '^a2AntiMalware$'; Path = @('*\Emsisoft*'); Uninst = '^Emsisoft'; Flt = '^(a2ertpx64|a2ertpx86|a2gffx64|a2gffx86|a2acc64|a2acc|eppfilebackup)$' }
+            @{ Id = 'COMODO';  Name = 'Xcitium / Comodo Client Security';         Type = 'EDR+AV';    Svc = '^(cmdAgent|ITSMService)$'; Core = '^cmdAgent$'; Path = @('*\COMODO\*', '*\Xcitium\*', '*\ITarian\*'); Uninst = '^(COMODO|Xcitium|Comodo Client)'; Flt = '^(cmdguard|cmdccav|cmdcwagt|cfrmd)$'; Fw = 'Replace'; FwInd = '^inspect$' }
+            @{ Id = 'AWN';     Name = 'Arctic Wolf Agent (MDR, nie AV)';          Type = 'Telemetry'; Svc = '^(ArcticWolfAgent|Arctic Wolf Agent|AWAgent)$'; Core = '^(ArcticWolfAgent|Arctic Wolf Agent|AWAgent)$'; Path = @('*\Arctic Wolf Networks\*'); Uninst = '^Arctic Wolf Agent' }
+            @{ Id = 'R7';      Name = 'Rapid7 Insight Agent (podatności/IDR, nie AV)'; Type = 'Telemetry'; Svc = '^ir_agent$'; Core = '^ir_agent$'; Path = @('*\Rapid7\Insight Agent\*'); Uninst = '^Rapid7 Insight Agent' }
+            @{ Id = 'SYSMON';  Name = 'Sysmon (telemetria)';                      Type = 'Telemetry'; Svc = '^Sysmon(64)?$'; Core = '^Sysmon(64)?$'; Flt = '^sysmondrv$' }
+            @{ Id = 'QUALYS';  Name = 'Qualys Cloud Agent (podatności)';          Type = 'Telemetry'; Svc = '^QualysAgent$'; Core = '^QualysAgent$'; Path = @('*\Qualys\*') }
+            @{ Id = 'TANIUM';  Name = 'Tanium Client';                            Type = 'Telemetry'; Svc = '^Tanium Client$'; Core = '^Tanium Client$'; Path = @('*\Tanium\*'); Flt = '^taniumrecorderdrv$' }
+            @{ Id = 'TLOCK';   Name = 'ThreatLocker (kontrola aplikacji)';        Type = 'AppControl'; Svc = '^ThreatLockerService$'; Core = '^ThreatLockerService$' }
+        )
+        $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName)
+
+        # Fakty: minifiltry (wiersze danych fltmc nie są tłumaczone), sterowniki, Programy, rejestracje zapory
+        $flt = @{}
+        try { foreach ($l in @(& "$env:SystemRoot\System32\fltmc.exe" filters 2>$null)) { if ("$l" -match '^\s*(\S+)\s+\d+\s+(\d{5,6}(?:\.\d+)?)\s') { $flt[$Matches[1].ToLower()] = [double]$Matches[2] } } } catch { }
+        $drv = @{}
+        try { foreach ($d in [System.ServiceProcess.ServiceController]::GetDevices()) { $drv[$d.ServiceName.ToLower()] = "$($d.Status)" } } catch { }
+        if (-not $drv.Count) { foreach ($d in @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue)) { $drv["$($d.Name)".ToLower()] = "$($d.State)" } }
+        $un = @()
+        foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+            foreach ($p in @(Get-ItemProperty $k -ErrorAction SilentlyContinue)) { if ($p.DisplayName) { $un += [pscustomobject]@{ Name = "$($p.DisplayName)".Trim(); Version = "$($p.DisplayVersion)" } } }
+        }
+        $fwReg = @()
+        try { $col = New-Object -ComObject HNetCfg.FwProducts -ErrorAction Stop; foreach ($x in $col) { $fwReg += [pscustomobject]@{ Name = "$($x.DisplayName)"; Categories = (@($x.RuleCategories) -join ',') } } } catch { }
+
+        # Dopasowanie katalogu
+        $agentRx = '(?i)^(masvc|macmnsvc|macompatsvc|McAfeeFramework|McTaskManager|EraAgentSvc|EPUpdateService|avpsus|klnagent|tmlisten|PccNTUpd|swi_update(_64)?|Sophos (MCS Agent|MCS Client|AutoUpdate Service|Health Service))$|agent$|update'
+        $prod = New-Object System.Collections.Generic.List[object]
+        $known = @{}
+        foreach ($c in $secCat) {
+            $svc = @()
+            foreach ($s in $svcAll) {
+                $hit = ("$($s.Name)" -match $c.Svc)
+                if (-not $hit -and $c.Path) { foreach ($pp in $c.Path) { if ("$($s.PathName)" -like $pp) { $hit = $true; break } } }
+                if ($hit) { $svc += $s }
+            }
+            $fl = @(); if ($c.Flt) { foreach ($n in @($flt.Keys)) { if ($n -match $c.Flt) { $fl += $n; $known[$n] = 1 } } }
+            $ins = @(); if ($c.Uninst) { foreach ($u in $un) { if ($u.Name -match $c.Uninst) { $ins += "$($u.Name) $($u.Version)".Trim() } } }
+            $ins = @($ins | Select-Object -Unique)
+            if (-not ($svc.Count -or $fl.Count -or $ins.Count)) { continue }
+            $core    = @($svc | Where-Object { "$($_.Name)" -match $c.Core })
+            $coreRun = @($core | Where-Object { $_.State -eq 'Running' })
+            # nazwa głównej usługi mogła się zmienić w nowej wersji produktu: gdy jej nie ma, a usługi produktu działają, nie alarmujemy
+            # (agenty zarządzania i aktualizacji nie świadczą o działającym silniku antywirusa)
+            $coreGuess = (-not $core.Count) -and [bool]@($svc | Where-Object { $_.State -eq 'Running' -and "$($_.Name)" -notmatch $agentRx }).Count
+            $state = if ($coreRun.Count -or $coreGuess) { 'Running' } elseif (@($core | Where-Object { $_.StartMode -eq 'Disabled' }).Count) { 'Disabled' } elseif ($core.Count) { 'Stopped' } elseif ($svc.Count) { 'NoCore' } elseif ($fl.Count) { 'FilterOnly' } else { 'UninstallOnly' }
+            $avRun = ($c.Type -match 'AV') -and $state -eq 'Running'
+            if ($avRun -and $c.AvSvc) { $avRun = [bool]@($svc | Where-Object { "$($_.Name)" -match $c.AvSvc -and $_.State -eq 'Running' }).Count }
+            if ($avRun -and $c.AvFlt -and $flt.Count) { $avRun = [bool]@($flt.Keys | Where-Object { $_ -match $c.AvFlt }).Count }
+            $rtpMissing = $false
+            if ($avRun -and $c.Rtp -and $flt.Count) { $rtpMissing = -not @($flt.Keys | Where-Object { $_ -match $c.Rtp }).Count }   # tylko gdy fltmc zadziałał
+            $fwMode = if ($c.Fw) { $c.Fw } else { 'None' }
+            if ($c.FwIf -and -not @($ins | Where-Object { $_ -match $c.FwIf }).Count -and $fwMode -eq 'Replace') { $fwMode = 'None' }
+            $fwOn = $false
+            if ($c.FwInd -and $fwMode -ne 'None') {
+                foreach ($s in $svc) { if ("$($s.Name)" -match $c.FwInd -and $s.State -eq 'Running') { $fwOn = $true } }
+                foreach ($k in @($drv.Keys)) { if ($k -match $c.FwInd -and $drv[$k] -eq 'Running') { $fwOn = $true } }
+            }
+            $dir = ''
+            foreach ($s in $svc) { $pn = "$($s.PathName)"; if ($pn -match '^\s*"([^"]+)\\[^\\"]+"' -or $pn -match '^\s*(\S+)\\[^\\\s]+\.exe') { $dir = $Matches[1]; break } }
+            $prod.Add([pscustomobject]@{
+                Id = $c.Id; Product = $c.Name; Type = $c.Type; State = $state; AvRunning = $avRun; RtpFilterMissing = $rtpMissing; Dir = $dir
+                Services = (@($svc | ForEach-Object { "$($_.Name) ($($_.State))" }) -join ', '); Filters = ($fl -join ', '); Installed = ($ins -join '; ')
+                FwMode = $fwMode; FwActive = $fwOn; CoreGuess = $coreGuess
+            })
+        }
+        $products = [object[]]$prod.ToArray()
+        $secInventory = @($products | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Product = $_.Product; Type = $_.Type; State = $_.State } })
+        # minifiltr z zakresu „FSFilter Anti-Virus” (320000–329999) spoza katalogu = antywirus, którego nie znamy z nazwy
+        $unk = @($flt.Keys | Where-Object { $flt[$_] -ge 320000 -and $flt[$_] -lt 330000 -and -not $known.ContainsKey($_) -and $_ -ne 'vsepflt' } | ForEach-Object { "$_ ($($flt[$_]))" })
+        $agentless = $flt.ContainsKey('vsepflt')   # VMware Guest Introspection – ochrona bezagentowa na poziomie hiperwizora
+
+        # Microsoft Defender: CIM (działa bez modułu Defender, także na 2012 R2 z agentem Defender for Endpoint)
+        $build = [Environment]::OSVersion.Version.Build
+        $wd = $svcAll | Where-Object { $_.Name -eq 'WinDefend' } | Select-Object -First 1
+        $dvMode = ''; $dvRtp = $false; $dvSig = $null; $dvTamper = $null; $dvPlat = ''; $dvSub = @(); $dvNote = ''; $dvQuick = $null
+        if ($wd) {
+            try {
+                $mp = Get-CimInstance -Namespace 'root/Microsoft/Windows/Defender' -ClassName MSFT_MpComputerStatus -ErrorAction Stop
+                $dvMode = if ("$($mp.AMRunningMode)") { "$($mp.AMRunningMode)" } elseif ($mp.AMServiceEnabled -and $mp.AntivirusEnabled) { 'Normal' } else { 'Not running' }
+                $dvRtp = [bool]$mp.RealTimeProtectionEnabled
+                # wiek jest UInt32; 4294967295 = nigdy (rzutowanie na [int] rzuciłoby wyjątek i Defender wyglądałby na wyłączony)
+                $sa = [int64]$mp.AntivirusSignatureAge; $dvSig = if ($sa -ge 65535) { 9999 } else { [int]$sa }
+                $dvPlat = "$($mp.AMProductVersion)"
+                if ($null -ne $mp.IsTamperProtected) { $dvTamper = [bool]$mp.IsTamperProtected }
+                if ($mp.OnAccessProtectionEnabled -eq $false) { $dvSub += 'ochrona przy dostępie do plików' }
+                if ($mp.BehaviorMonitorEnabled -eq $false) { $dvSub += 'monitorowanie zachowania' }
+                if ($mp.IoavProtectionEnabled -eq $false) { $dvSub += 'skanowanie pobranych plików' }
+                if ($mp.NISEnabled -eq $false) { $dvSub += 'inspekcja sieci' }
+                $qa = [int64]$mp.QuickScanAge; $dvQuick = if ($qa -ge 65535) { $null } else { [int]$qa }
+            } catch { $dvMode = 'Not running'; $dvNote = "stan niedostępny: $($_.Exception.Message)" }
+        }
+        elseif ($build -ge 14393) { $dvMode = 'Removed' }
+        else { $dvMode = 'NotInstalled' }   # 2012 R2 bez Defender for Endpoint / SCEP
+        $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+        $dvGpo = ("$(RegV $pol 'DisableAntiSpyware')" -eq '1') -or ("$(RegV $pol 'DisableAntiVirus')" -eq '1') -or ("$(RegV "$pol\Real-Time Protection" 'DisableRealtimeMonitoring')" -eq '1')
+        $dvForce = ("$(RegV 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection' 'ForceDefenderPassiveMode')" -eq '1') -or ("$(RegV 'HKLM:\SOFTWARE\Microsoft\Windows Advanced Threat Protection' 'ForceDefenderPassiveMode')" -eq '1')
+        $mdeOn = "$(RegV 'HKLM:\SOFTWARE\Microsoft\Windows Advanced Threat Protection\Status' 'OnboardingState')" -eq '1'
+        $sense = $svcAll | Where-Object { $_.Name -eq 'Sense' } | Select-Object -First 1
+        $scep = $svcAll | Where-Object { $_.Name -eq 'MsMpSvc' } | Select-Object -First 1
+        $scepOn = $scep -and $scep.State -eq 'Running' -and "$(RegV 'HKLM:\SOFTWARE\Microsoft\Microsoft Antimalware\Real-Time Protection' 'DisableRealtimeMonitoring')" -ne '1'
+
+        # Ocena: jeden wynik „czy serwer ma działający antywirus”, potem szczegóły
+        $third   = @($products | Where-Object { $_.Id -notin 'MDAV', 'MDE' })
+        $thirdAv = @($third | Where-Object { $_.AvRunning })
+        $thirdDn = @($third | Where-Object { $_.Type -match 'AV' -and ($_.State -in 'Stopped', 'Disabled' -or ($_.State -in 'NoCore', 'UninstallOnly' -and $_.Installed)) })
+        $defAct  = ($dvMode -match '^Normal') -and $dvRtp
+        $defPas  = ($dvMode -match 'Passive|EDR') -or $dvForce
+        $anyAv   = $defAct -or $thirdAv.Count -or $scepOn -or $unk.Count
+        $names   = (@($thirdAv | ForEach-Object { $_.Product }) -join ', ')
+        $dvTxt   = switch -regex ($dvMode) { '^Normal' { "aktywny, ochrona w czasie rzeczywistym $(if ($dvRtp) { 'włączona' } else { 'WYŁĄCZONA' })" } 'Passive|EDR' { "tryb pasywny ($dvMode)" } '^Removed' { 'usunięty z systemu' } '^NotInstalled' { 'niezainstalowany (2012 R2)' } default { "nie działa ($dvMode) $dvNote" } }
+        if ($dvGpo) { $dvTxt += ', wyłączony zasadami GPO' }
+        if ($dvForce) { $dvTxt += ', wymuszony tryb pasywny (ForceDefenderPassiveMode)' }
+
+        foreach ($x in $products) {
+            if ($x.Id -eq 'MDAV') { continue }
+            $what = switch -regex ($x.Type) { 'AV' { 'Antywirus / EDR'; break } '^EDR' { 'EDR (wykrywanie i reagowanie)'; break } 'AppControl' { 'Kontrola aplikacji'; break } 'Backup' { 'Kopie zapasowe / ochrona przed ransomware'; break } default { 'Agent monitorujący (nie antywirus)' } }
+            $stTxt = switch ($x.State) { 'Running' { 'działa' } 'Disabled' { 'WYŁĄCZONY' } 'Stopped' { 'ZATRZYMANY' } 'NoCore' { 'brak głównej usługi' } 'FilterOnly' { 'tylko sterownik' } default { 'tylko wpis w Programach' } }
+            Add-Prot $what $x.Product $stTxt ("usługi: $($x.Services)$(if ($x.Filters) { "; sterowniki: $($x.Filters)" })$(if ($x.Installed) { "; $($x.Installed)" })$(if ($x.CoreGuess) { '; główna usługa nierozpoznana – stan ustalony z pozostałych usług produktu' })") $(if ($x.State -eq 'Running') { 'OK' } else { 'Info' })
+        }
+        if ($unk.Count) { Add-Prot 'Antywirus (nierozpoznany)' 'sterownik antywirusowy spoza katalogu' 'załadowany' ($unk -join ', ') 'Info' }
+
+        if (-not $anyAv) {
+            if ($agentless) { Add-Prot 'Antywirus' '' 'brak agenta' 'załadowany VMware Guest Introspection (vsepflt) – ochrona bezagentowa (NSX / Deep Security / GravityZone SVA); sprawdź w konsoli, czy maszyna jest chroniona' 'Uwaga'; $sys.AV = 'ochrona bezagentowa (VMware)?' }
+            elseif ($thirdDn.Count) {
+                # tuż po starcie systemu usługa ochrony może jeszcze się uruchamiać
+                $fresh = $false; try { $fresh = ($now - $os.LastBootUpTime).TotalMinutes -lt 15 } catch { }
+                Add-Prot 'Antywirus' ((@($thirdDn | ForEach-Object { $_.Product })) -join ', ') 'zainstalowany, ale NIE DZIAŁA' ("$((@($thirdDn | ForEach-Object { "$($_.Product): $($_.Services)" })) -join '; ')$(if ($fresh) { ' – serwer działa krócej niż 15 minut, sprawdź ponownie' })") $(if ($fresh) { 'Uwaga' } else { 'Krytyczne' })
+                $sys.AV = "$((@($thirdDn | ForEach-Object { $_.Product })) -join ', ') – nie działa"
+            }
+            elseif ($defPas) { Add-Prot 'Antywirus' 'Microsoft Defender Antivirus' $dvMode "Defender: $dvTxt, a żaden inny antywirus nie działa" 'Krytyczne'; $sys.AV = "Defender ($dvMode) – brak innego antywirusa" }
+            else { Add-Prot 'Antywirus' 'Microsoft Defender Antivirus' 'BRAK OCHRONY' "Defender: $dvTxt; nie wykryto innego antywirusa" 'Krytyczne'; $sys.AV = 'brak aktywnego antywirusa' }
+        }
+        else {
+            $sys.AvActive = $true
+            if ($thirdAv.Count) {
+                $sys.AV = $names; $sys.AvThirdParty = $names
+                Add-Prot 'Microsoft Defender' 'Microsoft Defender Antivirus' $(if ($defAct) { 'aktywny' } else { 'nieaktywny' }) "Defender: $dvTxt; ochronę zapewnia $names" 'OK'
+                $classic = @($thirdAv | Where-Object { $_.Type -eq 'AV' })
+                if ($defAct -and $classic.Count) { Add-Prot 'Antywirus – dwa silniki' "Microsoft Defender + $((@($classic | ForEach-Object { $_.Product })) -join ', ')" 'oba aktywne' 'dwa silniki skanujące w czasie rzeczywistym spowalniają serwer i bywają niestabilne – przełącz Defender w tryb pasywny albo usuń go' 'Uwaga' }
+                elseif ($defAct) { Add-Prot 'Antywirus' 'Microsoft Defender Antivirus' 'aktywny obok EDR/NGAV' $names 'Info' }
+                foreach ($x in @($thirdAv | Where-Object { $_.RtpFilterMissing })) { Add-Prot 'Antywirus – ochrona plików' $x.Product 'sterownik nie załadowany' 'usługa działa, ale sterownik ochrony plików w czasie rzeczywistym nie jest załadowany – ochrona może być wyłączona' 'Uwaga' }
+            }
+            elseif ($defAct) { $sys.AV = 'Microsoft Defender'; Add-Prot 'Microsoft Defender' 'Microsoft Defender Antivirus' 'aktywny' "Defender: $dvTxt" 'OK' }
+            elseif ($scepOn) { $sys.AV = 'System Center Endpoint Protection'; Add-Prot 'Antywirus' 'System Center Endpoint Protection' 'działa' 'MsMpSvc' 'OK' }
+            else { $sys.AV = "antywirus nierozpoznany: $($unk -join ', ')"; Add-Prot 'Antywirus' 'nierozpoznany produkt' 'sterownik załadowany' "Defender: $dvTxt; załadowany sterownik antywirusowy spoza katalogu: $($unk -join ', ') – sprawdź, jaki to produkt" 'Info' }
+            foreach ($x in $thirdDn) { Add-Prot 'Antywirus' $x.Product 'zainstalowany, ale nie działa' "$($x.Services) – awaria albo pozostałość po migracji" 'Uwaga' }
+        }
+        # Defender jako główny antywirus – szczegóły
+        if ($defAct -and -not $thirdAv.Count) {
+            Add-Prot 'Microsoft Defender – sygnatury' 'Microsoft Defender Antivirus' "$dvSig dni" '' $(if ($dvSig -le 3) { 'OK' } elseif ($dvSig -le 7) { 'Uwaga' } else { 'Krytyczne' })
+            if ($dvSub.Count) { Add-Prot 'Microsoft Defender – składniki' 'Microsoft Defender Antivirus' 'część wyłączona' ($dvSub -join ', ') 'Uwaga' }
+            if ($null -ne $dvTamper) { Add-Prot 'Microsoft Defender – ochrona przed naruszeniami' 'Microsoft Defender Antivirus' $(if ($dvTamper) { 'włączona' } else { 'wyłączona' }) 'chroni ustawienia Defendera przed zmianą przez złośliwe oprogramowanie' $(if ($dvTamper) { 'OK' } else { 'Info' }) }
+            if ($null -ne $dvQuick) { Add-Prot 'Microsoft Defender – szybki skan' 'Microsoft Defender Antivirus' "$dvQuick dni temu" '' $(if ($dvQuick -le 14) { 'OK' } else { 'Info' }) }
+            if ($dvPlat -like '4.10.*') { Add-Prot 'Microsoft Defender – platforma' 'Microsoft Defender Antivirus' $dvPlat 'platforma nigdy nie była aktualizowana (KB4052623)' 'Uwaga' }
+            # Ustawienia wpływające na skuteczność: ochrona w chmurze (MAPS), niechciane aplikacje, ochrona sieci, reguły ASR (akcja 1 = blokuj, 2 = audyt, 6 = ostrzeż)
+            try {
+                $mpp  = Get-CimInstance -Namespace 'root/Microsoft/Windows/Defender' -ClassName MSFT_MpPreference -ErrorAction Stop
+                $maps = switch ("$($mpp.MAPSReporting)") { '0' { 'wyłączona' } '1' { 'podstawowa' } '2' { 'zaawansowana' } default { "$($mpp.MAPSReporting)" } }
+                $pua  = switch ("$($mpp.PUAProtection)") { '1' { 'blokowanie' } '2' { 'audyt' } default { 'wyłączona' } }
+                $np   = switch ("$($mpp.EnableNetworkProtection)") { '1' { 'blokowanie' } '2' { 'audyt' } default { 'wyłączona' } }
+                $asrA = @(@($mpp.AttackSurfaceReductionRules_Actions) | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
+                $asrB = @($asrA | Where-Object { $_ -eq 1 }).Count
+                Add-Prot 'Microsoft Defender – dodatkowe zabezpieczenia' 'Microsoft Defender Antivirus' "reguły ASR: $($asrA.Count) (blokujące: $asrB)" "ochrona w chmurze: $maps; niechciane aplikacje (PUA): $pua; ochrona sieci: $np" $(if ("$($mpp.MAPSReporting)" -eq '0' -or $asrB -eq 0) { 'Info' } else { 'OK' })
+            } catch { }
+        }
+        # Awarie usług ochrony w okresie skanu (Service Control Manager 7031/7034; param1 = nazwa wyświetlana usługi z tego serwera)
+        try {
+            $dn2svc = @{}; foreach ($s in $svcAll) { $dn2svc["$($s.DisplayName)".ToLowerInvariant()] = "$($s.Name)" }
+            $protSvc = @{}
+            foreach ($x in $products) { foreach ($nm in @("$($x.Services)" -split ', ')) { $nm = ($nm -replace '\s\([^)]*\)$', '').Trim(); if ($nm) { $protSvc[$nm.ToLowerInvariant()] = $x.Product } } }
+            $crash = @{}
+            foreach ($e in @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7031, 7034; StartTime = $since } -MaxEvents 300 -ErrorAction SilentlyContinue)) {
+                $sn = $dn2svc["$((EvMap $e)['param1'])".ToLowerInvariant()]
+                if (-not $sn -or -not $protSvc.ContainsKey($sn.ToLowerInvariant())) { continue }
+                if (-not $crash.ContainsKey($sn)) { $crash[$sn] = @{ N = 0; P = $protSvc[$sn.ToLowerInvariant()]; Last = $e.TimeCreated } }
+                $crash[$sn].N++
+            }
+            foreach ($sn in $crash.Keys) { $c = $crash[$sn]; Add-Prot 'Awaria usługi ochrony' $c.P "$($c.N)× w $Days dni" "usługa $sn kończyła działanie nieoczekiwanie (ostatnio $(D $c.Last)) – ochrona była przerywana; sprawdź dziennik producenta i sterowniki" $(if ($c.N -ge 2) { 'Uwaga' } else { 'Info' }) }
+        } catch { }
+        if ($mdeOn -and (-not $sense -or $sense.State -ne 'Running')) { Add-Prot 'EDR' 'Microsoft Defender for Endpoint' 'czujnik nie działa' "serwer wdrożony (OnboardingState=1), ale usługa Sense: $(if ($sense) { $sense.State } else { 'brak' })" 'Uwaga' }
+
+        # Zapora: profile w użyciu, GPO, domyślna akcja, usługi; wyłączony profil przy zaporze innego producenta = informacja
+        try {
+            $active = @{}
+            foreach ($p in @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)) { $active["$($p.Name)"] = $p }
+            $netCat = @(); try { $netCat = @(Get-NetConnectionProfile -ErrorAction Stop | ForEach-Object { "$($_.NetworkCategory)" }) } catch { }
+            $inUse = @($netCat | ForEach-Object { if ($_ -eq 'DomainAuthenticated') { 'Domain' } else { $_ } } | Select-Object -Unique)
+            $fwRegOn = @($fwReg | Where-Object { ",$($_.Categories)," -like '*,2,*' })
+            $fwProd = @($products | Where-Object { $_.State -eq 'Running' -and $_.FwMode -ne 'None' })
+            $last = $null
+            try {
+                $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall'; Id = 2003; StartTime = $now.AddDays(-30) } -MaxEvents 20 -ErrorAction Stop)
+                if ($ev.Count) { $m = EvMap $ev[0]; $last = [pscustomobject]@{ Time = (D $ev[0].TimeCreated); App = $m['ModifyingApplication']; User = $m['ModifyingUser'] } }
+            } catch { }
+            $off = New-Object System.Collections.Generic.List[string]; $offUsed = New-Object System.Collections.Generic.List[string]; $gpoOff = New-Object System.Collections.Generic.List[string]
+            foreach ($pn in 'Domain', 'Private', 'Public') {
+                $a = $active[$pn]
+                if (-not $a) { continue }
+                $gk = if ($pn -eq 'Private') { 'PrivateProfile' } else { "$($pn)Profile" }
+                if ("$(RegV "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\$gk" 'EnableFirewall')" -eq '0') { $gpoOff.Add($pn) }
+                if ("$($a.Enabled)" -ne 'True') { $off.Add($pn); if ($inUse -contains $pn) { $offUsed.Add($pn) } }
+                elseif ($inUse -contains $pn -and "$($a.DefaultInboundAction)" -eq 'Allow') { Add-Prot 'Zapora' 'Zapora Windows' "profil $($pn): włączona, ale PRZEPUSZCZA ruch przychodzący" 'domyślna akcja dla ruchu przychodzącego: Allow (DefaultInboundAction) – reguły blokujące nie mają znaczenia' 'Uwaga' }
+            }
+            $who = if ($last -and $last.App) { "; ostatnia zmiana ustawień zapory: $($last.Time) przez $($last.App)" } else { '' }
+            $gpoTxt = if ($gpoOff.Count) { "; wyłączona zasadami grupy (GPO): $($gpoOff -join ', ')" } else { '' }
+            if (-not $off.Count) { Add-Prot 'Zapora' 'Zapora Windows' 'włączona' $(if ($fwProd.Count) { "obok niej: $((@($fwProd | ForEach-Object { $_.Product })) -join ', ')" }) 'OK' }
+            else {
+                $owner = @($fwProd | Where-Object { $_.FwMode -eq 'Replace' -and $_.FwActive })
+                $repl  = @($fwProd | Where-Object { $_.FwMode -eq 'Replace' -and -not $_.FwActive })
+                $mgr   = @($fwProd | Where-Object { $_.FwMode -eq 'Manage' })
+                $byEv  = @(); if ($last -and $last.App) { $byEv = @($fwProd | Where-Object { $_.Dir -and "$($last.App)" -like "$($_.Dir)*" }) }
+                $state = "wyłączona: $($off -join ', ')"
+                if ($fwRegOn.Count) { $v = "filtrowanie ruchu przejął produkt zarejestrowany w zaporze Windows: $((@($fwRegOn | ForEach-Object { $_.Name })) -join ', ')"; $st = 'Info'; $sys.FirewallManagedBy = (@($fwRegOn | ForEach-Object { $_.Name }) -join ', ') }
+                elseif ($owner.Count) { $v = "ruch filtruje zapora produktu $((@($owner | ForEach-Object { $_.Product })) -join ', ') – sprawdź jej politykę w konsoli producenta"; $st = 'Info'; $sys.FirewallManagedBy = (@($owner | ForEach-Object { $_.Product }) -join ', ') }
+                elseif ($byEv.Count) { $v = "zaporę wyłączył $((@($byEv | ForEach-Object { $_.Product })) -join ', ') (zdarzenie 2003), który przejmuje filtrowanie"; $st = 'Info'; $sys.FirewallManagedBy = (@($byEv | ForEach-Object { $_.Product }) -join ', ') }
+                elseif ($repl.Count) { $v = "$((@($repl | ForEach-Object { $_.Product })) -join ', ') ma moduł zapory, ale nie potwierdzono, że jest włączony – sprawdź politykę produktu"; $st = 'Uwaga' }
+                elseif ($mgr.Count) { $v = "$((@($mgr | ForEach-Object { $_.Product })) -join ', ') zarządza regułami ZAPORY WINDOWS, która jest wyłączona – ruch nie jest filtrowany"; $st = 'Uwaga' }
+                else { $v = 'nie wykryto zapory innego producenta – serwer nie filtruje ruchu przychodzącego'; $st = 'Uwaga' }
+                if ($st -eq 'Uwaga' -and -not $offUsed.Count -and $inUse.Count) { $st = 'Info'; $v += ' (wyłączone profile nie są używane przez żadną kartę sieciową)' }
+                Add-Prot 'Zapora' 'Zapora Windows' $state "$v$gpoTxt$who" $st
+            }
+            $bfe = $svcAll | Where-Object { $_.Name -eq 'BFE' } | Select-Object -First 1
+            $mps = $svcAll | Where-Object { $_.Name -eq 'MpsSvc' } | Select-Object -First 1
+            if ($bfe -and $bfe.State -ne 'Running') { Add-Prot 'Zapora – Base Filtering Engine' 'Windows' $bfe.State 'bez BFE nie działa filtrowanie ruchu ani IPsec' 'Krytyczne' }
+            if ($mps -and $mps.State -ne 'Running') { Add-Prot 'Zapora – usługa MpsSvc' 'Zapora Windows' $mps.State $(if ($fwProd.Count) { "działa: $((@($fwProd | ForEach-Object { $_.Product })) -join ', ')" } else { 'zapora Windows nie działa' }) $(if ($fwProd.Count) { 'Uwaga' } else { 'Krytyczne' }) }
+            # serwer w domenie, a żadna karta nie rozpoznała sieci domenowej (NLA) – obowiązuje profil Publiczny/Prywatny (np. WinRM tylko z podsieci lokalnej)
+            if ($sys.PartOfDomain -and $netCat.Count -and -not ($netCat -contains 'DomainAuthenticated')) { Add-Prot 'Zapora – profil sieci' 'Windows' "brak profilu domenowego ($((@($netCat | Select-Object -Unique)) -join ', '))" 'serwer w domenie nie rozpoznał sieci domenowej – zapora stosuje reguły profilu Publicznego/Prywatnego; zwykle pomaga restart usługi NLA (Network Location Awareness) albo poprawa DNS' 'Uwaga' }
+        } catch { $errs.Add("Ochrona (zapora): $($_.Exception.Message)") }
+        $timings['Ochrona'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
+    }
+
     # ── Konfiguracja bezpieczeństwa ──
     $hard = New-Object System.Collections.Generic.List[object]
     function Add-Check($check, $value, $status) { $hard.Add([pscustomobject]@{ Check = $check; Value = "$value"; Status = $status }) }
@@ -364,44 +654,35 @@ $Collector = {
     if (Want 'Hardening') {
 
     try {
-        $mp = Get-MpComputerStatus
-        if (-not $mp.AMServiceEnabled -or "$($mp.AMRunningMode)" -match 'Passive|EDR') {
-            $sys.AV = "Defender (tryb: $($mp.AMRunningMode))"
-            Add-Check 'Defender' "tryb $($mp.AMRunningMode) – prawdopodobnie inny antywirus" 'Info'
-        } else {
-            $sys.AV = 'Microsoft Defender'
-            Add-Check 'Defender – ochrona w czasie rzeczywistym' $(if ($mp.RealTimeProtectionEnabled) { 'włączona' } else { 'WYŁĄCZONA' }) $(if ($mp.RealTimeProtectionEnabled) { 'OK' } else { 'Krytyczne' })
-            $age = [int]$mp.AntivirusSignatureAge
-            Add-Check 'Defender – wiek sygnatur [dni]' $age $(if ($age -le 3) { 'OK' } elseif ($age -le 7) { 'Uwaga' } else { 'Krytyczne' })
-            Add-Check 'Defender – dni od szybkiego skanu' $mp.QuickScanAge $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })
-            if ($mp.PSObject.Properties['IsTamperProtected']) { Add-Check 'Defender – ochrona przed naruszeniami' $(if ($mp.IsTamperProtected) { 'włączona' } else { 'wyłączona' }) $(if ($mp.IsTamperProtected) { 'OK' } else { 'Info' }) }
-        }
-    } catch { $sys.AV = 'brak danych z Defendera'; Add-Check 'Antywirus' 'Defender niedostępny (inny AV lub starszy system)' 'Info' }
-
-    try {
-        foreach ($p in (Get-NetFirewallProfile -PolicyStore ActiveStore)) {
-            $on = "$($p.Enabled)" -eq 'True'
-            Add-Check "Zapora – profil $($p.Name)" $(if ($on) { 'włączona' } else { 'wyłączona' }) $(if ($on) { 'OK' } else { 'Uwaga' })
-        }
-    } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
-    try {
         $smb = Get-SmbServerConfiguration
         Add-Check 'SMBv1 (serwer)' $(if ($smb.EnableSMB1Protocol) { 'włączony' } else { 'wyłączony' }) $(if ($smb.EnableSMB1Protocol) { 'Uwaga' } else { 'OK' })
-        Add-Check 'Wymagane podpisywanie SMB' $(if ($smb.RequireSecuritySignature) { 'tak' } else { 'nie' }) $(if ($smb.RequireSecuritySignature) { 'OK' } else { 'Info' })
+        Add-Check 'Wymagane podpisywanie SMB (serwer)' $(if ($smb.RequireSecuritySignature) { 'tak' } else { 'nie – możliwe przekazanie (relay) uwierzytelnienia NTLM do tego serwera' }) $(if ($smb.RequireSecuritySignature) { 'OK' } elseif ($sys.IsDC) { 'Uwaga' } else { 'Zalecenie' })
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $ts    = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
         $rdp   = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-        $rdpOn = ($ts.fDenyTSConnections -eq 0)
+        $tsP   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+        function TsV([string]$Name, $Local) { $v = RegV $tsP $Name; if ($null -ne $v) { $v } else { $Local } }   # zasady GPO mają pierwszeństwo
+        $rdpOn = ("$(TsV 'fDenyTSConnections' $ts.fDenyTSConnections)" -eq '0')
         Add-Check 'Pulpit zdalny (RDP)' $(if ($rdpOn) { "włączony, port $($rdp.PortNumber)" } else { 'wyłączony' }) 'Info'
-        if ($rdpOn) { Add-Check 'RDP – uwierzytelnianie NLA' $(if ($rdp.UserAuthentication -eq 1) { 'wymagane' } else { 'NIE wymagane' }) $(if ($rdp.UserAuthentication -eq 1) { 'OK' } else { 'Uwaga' }) }
+        if ($rdpOn) {
+            $nla = "$(TsV 'UserAuthentication' $rdp.UserAuthentication)" -eq '1'
+            Add-Check 'RDP – uwierzytelnianie NLA' $(if ($nla) { 'wymagane' } else { 'NIE wymagane' }) $(if ($nla) { 'OK' } else { 'Uwaga' })
+            if ("$(TsV 'SecurityLayer' $rdp.SecurityLayer)" -eq '0') { Add-Check 'RDP – warstwa zabezpieczeń' 'natywne szyfrowanie RDP bez TLS (SecurityLayer = 0) – klient nie weryfikuje tożsamości serwera' 'Uwaga' }
+            if ("$(TsV 'MinEncryptionLevel' $rdp.MinEncryptionLevel)" -eq '1') { Add-Check 'RDP – poziom szyfrowania' 'niski (MinEncryptionLevel = 1)' 'Uwaga' }
+        }
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $lsa = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
         $lm  = $lsa.LmCompatibilityLevel
-        if ($null -eq $lm) { Add-Check 'Poziom uwierzytelniania LAN Manager' 'domyślny (3 – tylko NTLMv2)' 'OK' }
-        else { Add-Check 'Poziom uwierzytelniania LAN Manager' $lm $(if ($lm -lt 3) { 'Uwaga' } else { 'OK' }) }
-        Add-Check 'Ochrona LSA (RunAsPPL)' $(if ($lsa.RunAsPPL -ge 1) { 'włączona' } else { 'wyłączona' }) $(if ($lsa.RunAsPPL -ge 1) { 'OK' } else { 'Info' })
+        # klient wysyła tylko NTLMv2 od poziomu 3; kontroler domeny odrzuca NTLMv1 i LM dopiero przy poziomie 5
+        $lmTxt = if ($null -eq $lm) { 'domyślny (3 – wysyła tylko NTLMv2)' } else { "$lm" }
+        $lmN = if ($null -eq $lm) { 3 } else { [int]$lm }
+        Add-Check 'Poziom uwierzytelniania LAN Manager' $(if ($sys.IsDC -and $lmN -ge 3 -and $lmN -lt 5) { "$lmTxt – kontroler przyjmuje logowania NTLMv1 (dopiero 5 je odrzuca)" } else { $lmTxt }) $(if ($lmN -lt 3) { 'Uwaga' } elseif ($sys.IsDC -and $lmN -lt 5) { 'Zalecenie' } else { 'OK' })
+        # stan faktyczny także bez wpisu w rejestrze (np. włączona w UEFI): Wininit zapisuje zdarzenie 12 przy starcie LSASS jako procesu chronionego
+        $ppl = $lsa.RunAsPPL -ge 1
+        if (-not $ppl) { try { $ppl = [bool]@(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Wininit'; Id = 12; StartTime = $os.LastBootUpTime.AddMinutes(-5) } -MaxEvents 1 -ErrorAction Stop).Count } catch { } }
+        Add-Check 'Ochrona LSA (RunAsPPL) – przed odczytem haseł z pamięci' $(if ($ppl) { 'włączona' } else { 'wyłączona' }) $(if ($ppl) { 'OK' } else { 'Zalecenie' })
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $wd = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -ErrorAction SilentlyContinue
@@ -418,7 +699,7 @@ $Collector = {
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $llmnr = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -ErrorAction SilentlyContinue
-        Add-Check 'LLMNR' $(if ($llmnr.EnableMulticast -eq 0) { 'wyłączony' } else { 'włączony' }) $(if ($llmnr.EnableMulticast -eq 0) { 'OK' } else { 'Info' })
+        Add-Check 'LLMNR' $(if ($llmnr.EnableMulticast -eq 0) { 'wyłączony' } else { 'włączony – możliwe podszywanie się i przechwytywanie skrótów NTLM' }) $(if ($llmnr.EnableMulticast -eq 0) { 'OK' } else { 'Zalecenie' })
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     if ($sys.IsDC) {
         try {
@@ -439,6 +720,209 @@ $Collector = {
             elseif ($pk -and $null -ne $pk.DisabledByDefault -and [int64]$pk.DisabledByDefault -eq 1) { Add-Check "Protokół $proto (serwer)" 'domyślnie wyłączony (DisabledByDefault)' 'OK' }
             else { Add-Check "Protokół $proto (serwer)" 'brak wpisu w rejestrze – domyślne ustawienie systemu' 'Info' }
         } catch { $errs.Add("Konfiguracja bezpieczeństwa: $proto – $($_.Exception.Message)") }
+    }
+    # ── Dalsze utwardzenie: tylko odczyt rejestru, usług i WMI. Status 'Zalecenie' = warto poprawić (w analizie jedna zbiorcza informacja
+    #    na serwer), 'Uwaga'/'Krytyczne' = realne ryzyko. Brak wpisu w rejestrze oceniamy według domyślnego zachowania danej wersji systemu.
+    $osB = [int]$sys.BuildNumber   # 9600 = 2012 R2, 14393 = 2016, 17763 = 2019, 20348 = 2022, 26100 = 2025
+    if (-not $svcAll) { $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName) }
+    function Svc([string]$Name) { $svcAll | Where-Object { $_.Name -eq $Name } | Select-Object -First 1 }
+    function HErr([string]$What, $E) { $errs.Add("Konfiguracja bezpieczeństwa ($What): $($E.Exception.Message) [linia $($E.InvocationInfo.ScriptLineNumber)]") }
+    function Is1($v) { "$v" -eq '1' }
+
+    # SMB – klient: bez wymaganego podpisu możliwe przekazanie (relay) uwierzytelnienia NTLM; sterownik SMBv1 klienta
+    try {
+        $smbCli = RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters' 'RequireSecuritySignature'
+        if (Is1 $smbCli) { Add-Check 'Wymagane podpisywanie SMB (klient)' 'tak' 'OK' }
+        elseif ($null -eq $smbCli -and $osB -ge 26100) { Add-Check 'Wymagane podpisywanie SMB (klient)' 'tak (domyślnie od Windows Server 2025)' 'OK' }
+        else { Add-Check 'Wymagane podpisywanie SMB (klient)' 'nie' 'Zalecenie' }
+        $m10 = RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\mrxsmb10' 'Start'
+        if ($null -ne $m10 -and "$m10" -ne '4') { Add-Check 'SMBv1 (klient, sterownik mrxsmb10)' 'włączony' 'Zalecenie' }
+    } catch { HErr 'SMB – klient' $_ }
+
+    # Bufor wydruku poza serwerami wydruku i hostami sesji RDS; Point and Print (PrintNightmare)
+    try {
+        $spl   = Svc 'Spooler'
+        $splOn = [bool]($spl -and $spl.State -eq 'Running')
+        if (-not $sys.IsDC -and $splOn) {
+            $isPrint = [bool]@($features | Where-Object { $_.Installed -and $_.Name -in 'Print-Services', 'Print-Server', 'RDS-RD-Server' }).Count
+            if (-not $isPrint) { try { $isPrint = [bool]@(Get-CimInstance Win32_Printer -Filter 'Shared=TRUE' -ErrorAction Stop).Count } catch { $isPrint = $true } }
+            if (-not $isPrint) { Add-Check 'Bufor wydruku (Spooler)' 'działa, choć serwer nie udostępnia drukarek – zbędna powierzchnia ataku' 'Zalecenie' }
+        }
+        $ppK = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint'
+        $ppR = RegV $ppK 'RestrictDriverInstallationToAdministrators'
+        $ppW = (Is1 (RegV $ppK 'NoWarningNoElevationOnInstall')) -or ("$(RegV $ppK 'UpdatePromptSettings')" -in '1', '2')
+        if ("$ppR" -eq '0' -and $ppW) { Add-Check 'Point and Print' 'zwykły użytkownik zainstaluje sterownik drukarki bez ostrzeżenia i bez uprawnień administratora (PrintNightmare, CVE-2021-34527)' $(if ($splOn) { 'Krytyczne' } else { 'Uwaga' }) }
+        elseif ("$ppR" -eq '0') { Add-Check 'Point and Print' 'instalacja sterowników drukarek dozwolona dla zwykłych użytkowników (RestrictDriverInstallationToAdministrators = 0)' 'Uwaga' }
+    } catch { HErr 'bufor wydruku' $_ }
+
+    # Aktualizacje: WSUS przez HTTP, wyłączona usługa Windows Update
+    try {
+        $wuK = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+        $wuS = "$(RegV $wuK 'WUServer')".Trim()
+        if ($wuS -and (Is1 (RegV "$wuK\AU" 'UseWUServer'))) {
+            if ($wuS -match '^http://') { Add-Check 'WSUS – połączenie' "$wuS – HTTP bez szyfrowania (możliwe podstawienie aktualizacji w sieci; zalecane HTTPS)" 'Zalecenie' }
+            else { Add-Check 'WSUS – połączenie' $wuS 'OK' }
+        }
+        $wua = Svc 'wuauserv'
+        if ($wua -and $wua.StartMode -eq 'Disabled') { Add-Check 'Usługa Windows Update' 'wyłączona – serwer nie zainstaluje poprawek' 'Uwaga' }
+    } catch { HErr 'aktualizacje' $_ }
+
+    # Urząd certyfikacji (AD CS): ESC6 (SAN z wniosku), ESC11 (wnioski RPC bez szyfrowania), ESC8 (rejestracja przez WWW)
+    try {
+        if (Svc 'CertSvc') {
+            foreach ($ca in @(Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration' -ErrorAction SilentlyContinue)) {
+                $caN = $ca.PSChildName
+                $ef  = RegV "$($ca.PSPath)\PolicyModules\CertificateAuthority_MicrosoftDefault.Policy" 'EditFlags'
+                $ifl = $ca.GetValue('InterfaceFlags')
+                if ($null -ne $ef) {
+                    if (([int64]$ef -band 0x40000) -ne 0) { Add-Check "Urząd certyfikacji $caN – nazwa alternatywna (SAN) z wniosku" 'DOZWOLONA (EDITF_ATTRIBUTESUBJECTALTNAME2) – wnioskujący może uzyskać certyfikat na dowolne konto, np. administratora domeny (ESC6)' 'Krytyczne' }
+                    else { Add-Check "Urząd certyfikacji $caN – nazwa alternatywna (SAN) z wniosku" 'niedozwolona' 'OK' }
+                }
+                if ($null -ne $ifl) {
+                    if (([int64]$ifl -band 0x200) -eq 0) { Add-Check "Urząd certyfikacji $caN – szyfrowanie wniosków RPC" 'nie wymagane (brak IF_ENFORCEENCRYPTICERTREQUEST) – możliwe przekazanie uwierzytelnienia NTLM do usługi certyfikatów (ESC11)' 'Uwaga' }
+                    else { Add-Check "Urząd certyfikacji $caN – szyfrowanie wniosków RPC" 'wymagane' 'OK' }
+                }
+            }
+            $web = @($features | Where-Object { $_.Installed -and $_.Name -in 'ADCS-Web-Enrollment', 'ADCS-Enroll-Web-Svc' } | ForEach-Object { $_.Name })
+            if ($web.Count) { Add-Check 'Urząd certyfikacji – rejestracja przez WWW' "$($web -join ', ') – bez wymuszonego HTTPS i rozszerzonej ochrony uwierzytelniania (EPA) podatna na przekazanie NTLM (ESC8)" 'Zalecenie' }
+        }
+    } catch { HErr 'urząd certyfikacji' $_ }
+
+    # Dostęp anonimowy, NTLM/LM, LDAP, bezpieczny kanał, konta lokalne w sieci
+    try {
+        $lsaK = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+        $srvK = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'
+        $nlK  = 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters'
+        if (Is1 (RegV $lsaK 'EveryoneIncludesAnonymous')) { Add-Check 'Dostęp anonimowy – grupa Wszyscy obejmuje anonimowych' 'tak (EveryoneIncludesAnonymous = 1)' 'Uwaga' }
+        if ("$(RegV $lsaK 'RestrictAnonymousSAM')" -eq '0') { Add-Check 'Dostęp anonimowy – wyliczanie kont SAM' 'dozwolone (RestrictAnonymousSAM = 0)' 'Uwaga' }
+        $ra = RegV $lsaK 'RestrictAnonymous'
+        Add-Check 'Dostęp anonimowy – wyliczanie kont i udziałów' $(if ($null -ne $ra -and [int64]$ra -ge 1) { "ograniczone (RestrictAnonymous = $ra)" } else { 'domyślne (RestrictAnonymous = 0)' }) 'Info'
+        if ("$(RegV $srvK 'RestrictNullSessAccess')" -eq '0') { Add-Check 'Sesje anonimowe (null session)' 'nieograniczone (RestrictNullSessAccess = 0)' 'Uwaga' }
+        $nss = @(RegV $srvK 'NullSessionShares' | Where-Object { "$_".Trim() })
+        if ($nss.Count) { Add-Check 'Udziały dostępne anonimowo (NullSessionShares)' ($nss -join ', ') 'Uwaga' }
+        if ("$(RegV $lsaK 'NoLMHash')" -eq '0') { Add-Check 'Skróty haseł LM' 'przechowywane (NoLMHash = 0) – łatwe do złamania' 'Uwaga' }
+        if ("$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\LDAP' 'LDAPClientIntegrity')" -eq '0') { Add-Check 'Podpisywanie LDAP (klient)' 'wyłączone (LDAPClientIntegrity = 0)' 'Uwaga' }
+        if (Is1 (RegV $nlK 'DisablePasswordChange')) { Add-Check 'Hasło konta komputera w domenie' 'automatyczna zmiana wyłączona (DisablePasswordChange = 1)' 'Uwaga' }
+        if ("$(RegV $nlK 'RequireSignOrSeal')" -eq '0') { Add-Check 'Bezpieczny kanał Netlogon' 'podpisywanie i szyfrowanie nie są wymagane (RequireSignOrSeal = 0)' 'Uwaga' }
+        if (-not $sys.IsDC -and (Is1 (RegV 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' 'LocalAccountTokenFilterPolicy'))) {
+            Add-Check 'Zdalne logowanie kontami lokalnymi' "pełne uprawnienia administratora przez sieć (LocalAccountTokenFilterPolicy = 1)$(if (-not $laps) { ' bez LAPS – to samo hasło na wielu serwerach ułatwia ruch boczny (pass-the-hash)' })" $(if ($laps) { 'Zalecenie' } else { 'Uwaga' })
+        }
+        $cl = "$(RegV 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'CachedLogonsCount')"
+        if ($cl -match '^\d+$' -and [int]$cl -gt 10) { Add-Check 'Zapamiętane logowania domenowe (CachedLogonsCount)' $cl 'Info' }
+    } catch { HErr 'dostęp anonimowy i NTLM' $_ }
+
+    # Podniesienie uprawnień: AlwaysInstallElevated, kolejność ładowania bibliotek, niecytowane ścieżki usług
+    try {
+        if (Is1 (RegV 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer' 'AlwaysInstallElevated')) { Add-Check 'Instalator Windows – AlwaysInstallElevated' 'włączone – pakiet MSI użytkownika instaluje się z uprawnieniami SYSTEM' 'Uwaga' }
+        if ("$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'SafeDllSearchMode')" -eq '0') { Add-Check 'Bezpieczne wyszukiwanie bibliotek DLL' 'wyłączone (SafeDllSearchMode = 0)' 'Uwaga' }
+        $uq = New-Object System.Collections.Generic.List[string]
+        foreach ($s in $svcAll) {
+            $p = "$($s.PathName)".Trim()
+            if (-not $p -or $p.StartsWith('"')) { continue }
+            if ($p -match '^(?i)([a-z]:\\.+?\.exe)' -and $Matches[1] -match '\s') { $uq.Add("$($s.Name)") }
+        }
+        if ($uq.Count) { Add-Check 'Niecytowane ścieżki usług ze spacją' "$(Short ($uq -join ', ') 300) – przy prawie zapisu do folderu nadrzędnego możliwe uruchomienie cudzego pliku jako usługa" 'Zalecenie' }
+    } catch { HErr 'podniesienie uprawnień' $_ }
+
+    # PowerShell: rejestrowanie bloków skryptów (stan faktyczny: przy włączonym rejestrowaniu sam ten skan zostawia w dzienniku
+    # zdarzenie 4104 na poziomie Verbose; bez niego zapisywane są tylko bloki uznane za podejrzane – poziom Warning), moduły, transkrypcja
+    try {
+        $psK = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'
+        $sbl = $false
+        if ($PSVersionTable.PSVersion.Major -ge 5) {
+            try { $sbl = [bool]@(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; Level = 5; StartTime = $now.AddHours(-6) } -MaxEvents 1 -ErrorAction Stop).Count } catch { }
+        }
+        $txt = if ($PSVersionTable.PSVersion.Major -lt 5) { 'niedostępne w PowerShell 4.0 (wymagany WMF 5.1)' } elseif ($sbl) { 'włączone' } else { 'wyłączone – zapisywane są tylko bloki uznane przez PowerShell za podejrzane' }
+        Add-Check 'PowerShell – rejestrowanie bloków skryptów' $txt $(if ($sbl) { 'OK' } else { 'Zalecenie' })
+        $oth = @(); if (Is1 (RegV "$psK\ModuleLogging" 'EnableModuleLogging')) { $oth += 'moduły' }; if (Is1 (RegV "$psK\Transcription" 'EnableTranscripting')) { $oth += 'transkrypcja' }
+        Add-Check 'PowerShell – rejestrowanie modułów i transkrypcja' $(if ($oth.Count) { $oth -join ', ' } else { 'wyłączone' }) 'Info'
+    } catch { HErr 'PowerShell' $_ }
+
+    # Credential Guard / integralność pamięci (VBS) – Windows Server 2016+, bez kontrolerów domeny (tam nieobsługiwany)
+    if ($osB -ge 14393 -and -not $sys.IsDC) {
+        try {
+            $dg = Get-CimInstance -Namespace 'root/Microsoft/Windows/DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
+            $vbsRun = @(@($dg.SecurityServicesRunning) | ForEach-Object { [int]$_ })
+            $cg = $vbsRun -contains 1
+            Add-Check 'Credential Guard (izolacja poświadczeń)' $(if ($cg) { 'działa' } elseif ([int]$dg.VirtualizationBasedSecurityStatus -eq 0) { 'nie działa (zabezpieczenia oparte na wirtualizacji wyłączone)' } else { 'nie działa' }) $(if ($cg) { 'OK' } else { 'Info' })
+            if ($vbsRun -contains 2) { Add-Check 'Integralność pamięci (HVCI)' 'działa' 'OK' }
+        } catch { }
+    }
+
+    # Rozpoznawanie nazw podatne na podszywanie: NetBIOS (NBT-NS), mDNS, WPAD
+    try {
+        $nb = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=TRUE' -ErrorAction Stop | Where-Object { [int]$_.TcpipNetbiosOptions -ne 2 } | ForEach-Object { "$($_.Description)" })
+        Add-Check 'NetBIOS przez TCP/IP (NBT-NS)' $(if ($nb.Count) { "włączony: $(Short ($nb -join ', ') 150) – możliwe podszywanie się i przechwytywanie skrótów NTLM" } else { 'wyłączony' }) $(if ($nb.Count) { 'Zalecenie' } else { 'OK' })
+    } catch { HErr 'NetBIOS' $_ }
+    if ($osB -ge 17763) {
+        try {
+            Add-Check 'mDNS' $(if ("$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'EnableMDNS')" -eq '0') { 'wyłączony' } else { 'włączony (domyślnie)' }) 'Info'
+            Add-Check 'Automatyczne wykrywanie proxy (WPAD) w WinHTTP' $(if (Is1 (RegV 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp' 'DisableWpad')) { 'wyłączone' } else { 'włączone (domyślnie)' }) 'Info'
+        } catch { HErr 'mDNS/WPAD' $_ }
+    }
+
+    # SChannel: słabe szyfry (nazwy kluczy zawierają „/”, dlatego podklucze otwieramy bezpośrednio), .NET 4 i silna kryptografia
+    try {
+        $weak = @(); $wOff = @()
+        try {
+            $ck = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Ciphers' -ErrorAction Stop
+            foreach ($c in $ck.GetSubKeyNames()) {
+                if ($c -notmatch '^(RC4|NULL|DES|Triple DES)') { continue }
+                $sk = $ck.OpenSubKey($c); $v = $null
+                if ($sk) { $v = $sk.GetValue('Enabled'); $sk.Close() }
+                if ($null -eq $v) { continue }
+                if ([int64]$v -eq 0) { $wOff += $c } else { $weak += $c }
+            }
+        } catch { }
+        if ($weak.Count) { Add-Check 'SChannel – słabe szyfry (RC4, 3DES, DES, NULL)' "włączone jawnie: $($weak -join ', ')" 'Uwaga' }
+        elseif ($wOff.Count) { Add-Check 'SChannel – słabe szyfry (RC4, 3DES, DES, NULL)' "wyłączone jawnie: $($wOff -join ', ')" 'OK' }
+        else { Add-Check 'SChannel – słabe szyfry (RC4, 3DES, DES, NULL)' 'brak wpisów – domyślne ustawienia systemu' 'Info' }
+        $sc = Is1 (RegV 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' 'SchUseStrongCrypto')
+        Add-Check '.NET 4 – silna kryptografia (SchUseStrongCrypto)' $(if ($sc) { 'włączona' } else { 'nie ustawiona – starsze aplikacje .NET mogą łączyć się przez TLS 1.0' }) $(if ($sc) { 'OK' } else { 'Info' })
+    } catch { HErr 'SChannel' $_ }
+
+    # WinRM: ruch nieszyfrowany, uwierzytelnianie Basic, TrustedHosts '*' (zasady GPO; konfigurację lokalną czytamy przez WSMan:, gdy dostępny)
+    try {
+        $wrP = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM'
+        function WsmV([string]$p) { try { "$((Get-Item -LiteralPath "WSMan:\localhost\$p" -ErrorAction Stop).Value)" } catch { '' } }
+        $unenc = (Is1 (RegV "$wrP\Service" 'AllowUnencryptedTraffic')) -or ((WsmV 'Service\AllowUnencrypted') -eq 'true')
+        $basic = (Is1 (RegV "$wrP\Service" 'AllowBasic')) -or ((WsmV 'Service\Auth\Basic') -eq 'true')
+        if ($unenc) { Add-Check 'WinRM (usługa) – ruch nieszyfrowany' 'dozwolony (AllowUnencrypted)' 'Uwaga' }
+        if ($basic) { Add-Check 'WinRM (usługa) – uwierzytelnianie Basic' 'włączone – hasło przesyłane w postaci jawnej przy HTTP' 'Uwaga' }
+        $th = if (Is1 (RegV "$wrP\Client" 'TrustedHosts')) { "$(RegV "$wrP\Client" 'TrustedHostsList')" } else { WsmV 'Client\TrustedHosts' }
+        if ("$th".Trim() -eq '*') { Add-Check 'WinRM (klient) – TrustedHosts' "'*' – poświadczenia NTLM mogą trafić do dowolnego, także podstawionego serwera" 'Uwaga' }
+    } catch { HErr 'WinRM' $_ }
+
+    # Secure Boot i certyfikaty Microsoft 2023 (certyfikaty 2011 wygasają w 2026 r.)
+    try {
+        $sbOn = "$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')"
+        if ($sbOn -eq '1') {
+            $sbK = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing'
+            $sbs = "$(RegV $sbK 'UEFICA2023Status')"
+            $sbe = RegV $sbK 'UEFICA2023Error'
+            if ($null -ne $sbe -and "$sbe" -ne '0') {
+                $sbeTxt = try { '0x{0:X8}' -f ([int64]$sbe -band 4294967295) } catch { "$sbe" }
+                Add-Check 'Secure Boot – certyfikaty 2023' "błąd aktualizacji $sbeTxt$(if ($sbs) { " (stan: $sbs)" }) – szczegóły w dzienniku System (zdarzenia Secure Boot)" 'Uwaga'
+            }
+            elseif ($sbs -eq 'Updated') { Add-Check 'Secure Boot – certyfikaty 2023' 'zaktualizowane' 'OK' }
+            elseif ($sbs) { Add-Check 'Secure Boot – certyfikaty 2023' "stan: $sbs – sprawdź, czy aktualizacja jest zaplanowana; bez certyfikatów 2023 menedżer rozruchu po wygaśnięciu certyfikatów 2011 nie dostanie poprawek bezpieczeństwa" 'Zalecenie' }
+            else { Add-Check 'Secure Boot – certyfikaty 2023' 'brak informacji o aktualizacji – zainstaluj bieżące aktualizacje' 'Info' }
+        }
+        elseif ($sbOn -eq '0') { Add-Check 'Secure Boot' 'wyłączony' 'Info' }
+    } catch { HErr 'Secure Boot' $_ }
+
+    # Łagodzenia Spectre/Meltdown wyłączone ręcznie (bity 0–1 FeatureSettingsOverride); na hoście Hyper-V to ryzyko dla wszystkich maszyn
+    try {
+        $fso = RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' 'FeatureSettingsOverride'
+        if ($null -ne $fso -and ([int64]$fso -band 3) -ne 0) { Add-Check 'Łagodzenia Spectre/Meltdown' "wyłączone (FeatureSettingsOverride = $fso)" $(if ($sys.IsHyperV) { 'Uwaga' } else { 'Info' }) }
+    } catch { HErr 'Spectre/Meltdown' $_ }
+
+    # BitLocker – tylko serwery fizyczne
+    if (-not $sys.IsVirtual) {
+        try {
+            $bv = @(Get-CimInstance -Namespace 'root/CIMV2/Security/MicrosoftVolumeEncryption' -ClassName Win32_EncryptableVolume -Filter "DriveLetter='$env:SystemDrive'" -ErrorAction Stop)
+            if ($bv.Count) { $bOn = [int]$bv[0].ProtectionStatus -eq 1; Add-Check 'BitLocker – dysk systemowy' $(if ($bOn) { 'włączony' } else { 'wyłączony' }) $(if ($bOn) { 'OK' } else { 'Info' }) }
+        } catch { Add-Check 'BitLocker – dysk systemowy' 'funkcja BitLocker niezainstalowana' 'Info' }
     }
     $ps2 = $features | Where-Object { $_.Name -eq 'PowerShell-V2' } | Select-Object -First 1
     if ($ps2) { Add-Check 'Silnik PowerShell 2.0 (obejście logowania skryptów)' $(if ($ps2.Installed) { 'zainstalowany' } else { 'niezainstalowany' }) $(if ($ps2.Installed) { 'Uwaga' } else { 'OK' }) }
@@ -805,11 +1289,20 @@ $Collector = {
                 $gname = (New-Object System.Security.Principal.SecurityIdentifier($sid)).Translate([System.Security.Principal.NTAccount]).Value.Split('\')[-1]
                 $grp = [ADSI]"WinNT://$env:COMPUTERNAME/$gname,group"
                 foreach ($m in @($grp.psbase.Invoke('Members'))) {
-                    $path  = $m.GetType().InvokeMember('ADsPath', 'GetProperty', $null, $m, $null)
-                    $cls   = $m.GetType().InvokeMember('Class', 'GetProperty', $null, $m, $null)
+                    # obiekt ADSI członka owinięty w DirectoryEntry (ścieżka i klasa bez odwołań przez refleksję)
+                    $de    = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList $m
+                    $path  = "$($de.Path)"
+                    $cls   = "$($de.SchemaClassName)"
                     $parts = ($path -replace '^WinNT://', '').Split('/')
                     $name  = if ($parts.Count -ge 3) { "$($parts[-2])\$($parts[-1])" } elseif ($parts.Count -eq 2) { "$($parts[0])\$($parts[1])" } else { $parts[0] }
-                    [pscustomobject]@{ Group = $gname; Member = $name; Type = $(if ($cls -eq 'Group') { 'Grupa' } elseif ($cls -eq 'User') { 'Użytkownik' } else { "$cls" }) }
+                    # SID członka: rozpoznanie grup „wszyscy”/„użytkownicy domeny” niezależnie od języka nazw
+                    $msid = ''
+                    if ($name -match '^S-1-\d') { $msid = $name }
+                    else {
+                        try { $msid = (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList ([byte[]]$de.InvokeGet('objectSid')), 0).Value } catch { }
+                        if (-not $msid) { try { $msid = (New-Object System.Security.Principal.NTAccount -ArgumentList $name).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { } }
+                    }
+                    [pscustomobject]@{ Group = $gname; Member = $name; Type = $(if ($cls -eq 'Group') { 'Grupa' } elseif ($cls -eq 'User') { 'Użytkownik' } else { "$cls" }); SID = $msid; GroupSID = $sid }
                 }
             } catch { $failedKeys.Add('Admins'); $errs.Add("Grupy ($sid): $($_.Exception.Message)") }
         }
@@ -828,8 +1321,10 @@ $Collector = {
                 }
             } else {
                 Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' | ForEach-Object {
+                    $pls = ''
+                    try { $pa = (New-Object System.DirectoryServices.DirectoryEntry -ArgumentList "WinNT://$env:COMPUTERNAME/$($_.Name),user").InvokeGet('PasswordAge'); if ($null -ne $pa) { $pls = D ($now.AddSeconds(-[double]$pa)) } } catch { }
                     [pscustomobject]@{
-                        Name = $_.Name; Enabled = $(if ($_.Disabled) { 'Nie' } else { 'Tak' }); LastLogon = ''; PasswordLastSet = ''
+                        Name = $_.Name; Enabled = $(if ($_.Disabled) { 'Nie' } else { 'Tak' }); LastLogon = ''; PasswordLastSet = $pls
                         PasswordNeverExpires = $(if (-not $_.PasswordExpires) { 'Tak' } else { '' }); Description = $_.Description; SID = $_.SID
                     }
                 }
@@ -854,13 +1349,12 @@ $Collector = {
 
     # ── Autostart ──
     $autostart = @(S 'Autostart' 'Autostart' {
-        $skip = 'PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider'
         foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
                        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce') {
             if (-not (Test-Path $k)) { continue }
-            $p = Get-ItemProperty $k
-            foreach ($prop in $p.PSObject.Properties) {
-                if ($skip -notcontains $prop.Name) { [pscustomobject]@{ Location = ($k -replace '^HKLM:\\', 'HKLM\'); Name = $prop.Name; Command = (Hide-Secret "$($prop.Value)") } }
+            $rk = Get-Item -LiteralPath $k
+            foreach ($vn in @($rk.GetValueNames())) {
+                if ($vn) { [pscustomobject]@{ Location = ($k -replace '^HKLM:\\', 'HKLM\'); Name = $vn; Command = (Hide-Secret "$($rk.GetValue($vn))") } }
             }
         }
         $sf = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
@@ -1004,7 +1498,7 @@ $Collector = {
                 if (Want 'Cluster') {
                     $t0c = $sw.Elapsed.TotalSeconds
                     try {
-                        foreach ($n in $cnodes) { $clusterRows += [pscustomobject]@{ Type = 'Węzeł'; Name = "$($n.Name)"; State = "$($n.State)"; Owner = ''; Detail = $(if ($n.PSObject.Properties['DrainStatus']) { "opróżnianie: $($n.DrainStatus)" } else { '' }) } }
+                        foreach ($n in $cnodes) { $clusterRows += [pscustomobject]@{ Type = 'Węzeł'; Name = "$($n.Name)"; State = "$($n.State)"; Owner = ''; Detail = $(if ("$($n.DrainStatus)") { "opróżnianie: $($n.DrainStatus)" } else { '' }) } }
                         foreach ($csv in @(Get-ClusterSharedVolume -ErrorAction Stop)) {
                             $vi = @($csv.SharedVolumeInfo)[0]; $pt = if ($vi) { $vi.Partition } else { $null }
                             $clusterRows += [pscustomobject]@{ Type = 'CSV'; Name = "$($csv.Name) $(if ($vi) { $vi.FriendlyVolumeName })".Trim(); State = "$($csv.State)"; Owner = "$($csv.OwnerNode.Name)"
@@ -1051,12 +1545,12 @@ $Collector = {
                     MemMaxGB = $(if ($vm.DynamicMemoryEnabled) { [math]::Round($vm.MemoryMaximum / 1GB, 1) } else { $null }); MemDemandGB = [math]::Round($vm.MemoryDemand / 1GB, 1)
                     DynamicMem = $(if ($vm.DynamicMemoryEnabled) { 'Tak' } else { 'Nie' }); Gen = $vm.Generation; Version = "$($vm.Version)"
                     Replication = "$($vm.ReplicationHealth)"; ReplicationMode = "$($vm.ReplicationMode)"
-                    Checkpoints = [int]$snByVm[$id]; CheckpointType = $(if ($vm.PSObject.Properties['CheckpointType']) { "$($vm.CheckpointType)" } else { '' })
+                    Checkpoints = [int]$snByVm[$id]; CheckpointType = "$($vm.CheckpointType)"
                     AutoStart = "$($vm.AutomaticStartAction)"; AutoStop = "$($vm.AutomaticStopAction)"; IntegrationServices = "$($vm.IntegrationServicesState)"
                     IntegrationVersion = $(if ($g['IntegrationServicesVersion']) { "$($g['IntegrationServicesVersion'])" } else { "$($vm.IntegrationServicesVersion)" })
                     GuestOS = ("$os $($g['OSVersion'])").Trim(); GuestFQDN = "$($g['FullyQualifiedDomainName'])"; GuestIP = ($ips -join ', ')
                     Linux = $(if ($os -and $os -notmatch 'Windows') { 'Tak' } else { '' })
-                    Clustered = $(if ($vm.PSObject.Properties['IsClustered'] -and $vm.IsClustered) { 'Tak' } else { '' })
+                    Clustered = $(if ($vm.IsClustered) { 'Tak' } else { '' })
                     Switch = (@($na | ForEach-Object { if ($_.SwitchName) { "$($_.SwitchName)" } else { '(odłączona)' } } | Sort-Object -Unique) -join ', ')
                     DisksGB = $(if ($known) { [math]::Round($size / 1GB, 1) } else { $null }); ChainDepth = $depth; Path = $vm.Path; Id = $id
                 }
@@ -1141,18 +1635,21 @@ $Collector = {
     })
 
     # ── Zdrowie dysków: dyski fizyczne (Storage) i zdarzenia błędów dyskowych ──
-    $hsMap = @{ 0 = 'OK'; 1 = 'Ostrzeżenie'; 2 = 'Awaria'; 5 = 'Nieznany' }
-    $opMap = @{ 2 = 'OK'; 3 = 'zdegradowany'; 5 = 'przewidywana awaria'; 6 = 'błąd'; 7 = 'błąd nienaprawialny'; 10 = 'zatrzymany'; 11 = 'w serwisie'; 13 = 'utrata komunikacji' }
+    # Moduł Storage zamienia kody na angielskie nazwy (niezależne od języka systemu); obsługujemy oba warianty
+    $hsMap = @{ '0' = 'OK'; 'Healthy' = 'OK'; '1' = 'Ostrzeżenie'; 'Warning' = 'Ostrzeżenie'; '2' = 'Awaria'; 'Unhealthy' = 'Awaria'; '5' = 'Nieznany'; 'Unknown' = 'Nieznany' }
+    $opMap = @{ '2' = 'OK'; 'OK' = 'OK'; '3' = 'zdegradowany'; 'Degraded' = 'zdegradowany'; '5' = 'przewidywana awaria'; 'Predictive Failure' = 'przewidywana awaria'
+                '6' = 'błąd'; 'Error' = 'błąd'; '7' = 'błąd nienaprawialny'; 'Non-Recoverable Error' = 'błąd nienaprawialny'; '10' = 'zatrzymany'; 'Stopped' = 'zatrzymany'
+                '11' = 'w serwisie'; 'In Service' = 'w serwisie'; '13' = 'utrata komunikacji'; 'Lost Communication' = 'utrata komunikacji' }
     $diskHealth = @(S 'DiskHealth' 'Zdrowie dysków' {
         if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
             foreach ($pd in @(Get-PhysicalDisk)) {
-                $hs  = $pd.CimInstanceProperties['HealthStatus'].Value
-                $ops = @($pd.CimInstanceProperties['OperationalStatus'].Value | ForEach-Object { if ($opMap.ContainsKey([int]$_)) { $opMap[[int]$_] } else { "kod $_" } })
+                $hs  = "$($pd.HealthStatus)"
+                $ops = @(@($pd.OperationalStatus) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } })
                 $rc  = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
                 $unc = if ($rc -and ($null -ne $rc.ReadErrorsUncorrected -or $null -ne $rc.WriteErrorsUncorrected)) { [int64]$rc.ReadErrorsUncorrected + [int64]$rc.WriteErrorsUncorrected } else { $null }
                 [pscustomobject]@{
                     Source = 'Dysk fizyczny'; Id = $null; Name = "$($pd.FriendlyName) ($($pd.MediaType), $($pd.BusType), $([math]::Round($pd.Size / 1GB)) GB)"
-                    Health = $(if ($null -ne $hs -and $hsMap.ContainsKey([int]$hs)) { $hsMap[[int]$hs] } else { "$hs" })
+                    Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs })
                     WearPct = $(if ($rc -and $rc.Wear) { [int]$rc.Wear } else { $null }); TempC = $(if ($rc -and $rc.Temperature) { [int]$rc.Temperature } else { $null })
                     UncorrectedErrors = $unc; PowerOnHours = $(if ($rc -and $rc.PowerOnHours) { [int64]$rc.PowerOnHours } else { $null })
                     Count = $null; Last = ''; Detail = "stan: $($ops -join ', ')"
@@ -1212,6 +1709,293 @@ $Collector = {
             $li = $ntds.LDAPServerIntegrity; $cb = $ntds.LdapEnforceChannelBinding
             & $ck 'LDAP – wymagane podpisywanie (LDAPServerIntegrity)' $(if ($null -eq $li) { 'brak wpisu – domyślne ustawienie systemu' } elseif ($li -ge 2) { "$li (wymagane)" } else { "$li (niewymagane)" }) $(if ($null -eq $li) { 'Info' } elseif ($li -ge 2) { 'OK' } else { 'Uwaga' })
             & $ck 'LDAP – channel binding (LdapEnforceChannelBinding)' $(if ($null -eq $cb) { 'brak wpisu – domyślne ustawienie systemu' } elseif ($cb -ge 2) { "$cb (zawsze)" } elseif ($cb -eq 1) { "$cb (gdy obsługiwane)" } else { "$cb (nigdy)" }) $(if ($null -eq $cb) { 'Info' } elseif ($cb -ge 1) { 'OK' } else { 'Uwaga' })
+
+            # Netlogon (Zerologon): od lutego 2021 bezpieczny kanał jest wymuszany; wyjątki z zasad grupy osłabiają ochronę
+            $nlv = RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' 'VulnerableChannelAllowList'
+            if ($nlv) { & $ck 'Netlogon – wyjątki od bezpiecznego kanału (Zerologon)' "VulnerableChannelAllowList: $(Short "$nlv" 200)" 'Uwaga' }
+            # Kerberos RC4 (CVE-2026-20833): zdarzenia KDCSVC 201–209 wskazują konta i usługi, które po wymuszeniu AES przestaną działać
+            $kdc = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 201, 202, 203, 204, 205, 206, 207, 208, 209; StartTime = $since } -MaxEvents 500 -ErrorAction SilentlyContinue | Where-Object { "$($_.ProviderName)" -match 'Kerberos-Key-Distribution|KDC' })
+            if ($kdc.Count) {
+                $blk = @($kdc | Where-Object { $_.Id -in 203, 204, 208, 209 }).Count
+                $ids = (@($kdc | Group-Object Id | Sort-Object Name | ForEach-Object { "$($_.Name) ×$($_.Count)" }) -join ', ')
+                & $ck 'Kerberos – konta i usługi wymagające RC4 (zdarzenia KDCSVC 201–209)' "$ids$(if ($blk) { ' – część uwierzytelnień jest już blokowana' } else { ' – przestaną działać po wymuszeniu AES' }); ostatnio: $(Short $kdc[0].Message 200)" $(if ($blk) { 'Krytyczne' } else { 'Uwaga' })
+            }
+        })
+    }
+
+    # ── Active Directory: bezpieczeństwo domeny (zbiera każdy kontroler domeny; stacja ocenia raz na domenę – PDC albo pierwszy DC) ──
+    # Tylko odczyt LDAP przez ADSI, bez modułu ActiveDirectory. Warunki są zapisane filtrami LDAP, a z wyników bierzemy samą ścieżkę
+    # obiektu (nazwę CN) – narzędzie nie odczytuje haseł ani atrybutów poufnych. Limit czasu całego bloku: 90 s.
+    $adSec = @()
+    if ($sys.IsDC) {
+        $adSec = @(S 'ADSecurity' 'Active Directory' {
+            $adT0 = $sw.Elapsed.TotalSeconds
+            $adState = @{ Cut = $false }
+            function AdRow($c, $v, $st) { [pscustomobject]@{ Check = $c; Value = "$v"; Status = $st } }
+            function LdapEsc([string]$s) { $s.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29') }
+            function CnOf([string]$Path) { if ($Path -match '^LDAP://(?:[^/=]+/)?CN=((?:\\.|[^,\\])+)') { $Matches[1] -replace '\\(.)', '$1' } else { $Path } }
+            function DnOf([string]$Path) { ($Path -replace '^LDAP://(?:[^/=]+/)?', '') -replace '\\/', '/' }
+            function FileTimeAgo([int]$DaysAgo) { $now.AddDays(-$DaysAgo).ToFileTimeUtc() }
+            # Wynik: tablica obiektów { Name, DN } (przypisuj bez @(), bo funkcja zwraca tablicę jako jeden obiekt)
+            function AdFind([string]$Filter, [string]$Base = $defNC, [string]$Scope = 'Subtree') {
+                if (($sw.Elapsed.TotalSeconds - $adT0) -gt 90) { $adState.Cut = $true; throw 'pominięto – przekroczony limit 90 s sprawdzeń AD' }
+                $root = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$Base"
+                $s = New-Object System.DirectoryServices.DirectorySearcher -ArgumentList $root, $Filter, ([string[]]@('cn'))
+                $s.PageSize = 500; $s.SearchScope = $Scope; $s.ClientTimeout = New-TimeSpan -Seconds 60
+                $out = New-Object System.Collections.Generic.List[object]
+                $res = $null
+                try { $res = $s.FindAll(); foreach ($r in $res) { $out.Add([pscustomobject]@{ Name = (CnOf $r.Path); DN = (DnOf $r.Path) }) } }
+                finally { if ($res) { $res.Dispose() }; $s.Dispose(); $root.Dispose() }
+                , ([object[]]$out.ToArray())
+            }
+            function Names($a, [int]$n = 8) { $t = (@($a | Select-Object -First $n | ForEach-Object { $_.Name }) -join ', '); if (@($a).Count -gt $n) { $t += " (+$(@($a).Count - $n))" }; $t }
+            # przecinek: wartość binarna (byte[]) i wielowartościowa wracają w całości, a nie rozwinięte na elementy
+            function AdGet([string]$Dn, [string]$Attr) { try { , (New-Object System.DirectoryServices.DirectoryEntry -ArgumentList ('LDAP://' + $Dn.Replace('/', '\/'))).InvokeGet($Attr) } catch { $null } }
+            function AdList([string]$Dn, [string]$Attr) { $v = AdGet $Dn $Attr; @(@($v) | Where-Object { $_ }) }   # atrybut wielowartościowy jako płaska tablica
+            function SidOf($b) { try { (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList ([byte[]]$b), 0).Value } catch { '' } }
+            function AccOf([string]$Sid) { try { (New-Object System.Security.Principal.SecurityIdentifier -ArgumentList $Sid).Translate([System.Security.Principal.NTAccount]).Value } catch { $Sid } }
+            function Try-Ad([string]$What, [scriptblock]$Block) { try { & $Block } catch { AdRow $What "nie udało się sprawdzić: $($_.Exception.Message)" 'Info' } }
+
+            $rootDse = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList 'LDAP://RootDSE'
+            $defNC  = "$($rootDse.InvokeGet('defaultNamingContext'))"
+            $cfgNC  = "$($rootDse.InvokeGet('configurationNamingContext'))"
+            $schNC  = "$($rootDse.InvokeGet('schemaNamingContext'))"
+            $rootNC = "$($rootDse.InvokeGet('rootDomainNamingContext'))"
+            $dom    = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$defNC"
+            $domSid = SidOf $dom.InvokeGet('objectSid')
+            $isRoot = ($rootNC -eq $defNC)
+            $rootSid = if ($isRoot) { $domSid } else { SidOf (AdGet $rootNC 'objectSid') }
+            if (-not $rootSid) {
+                try {
+                    foreach ($a in @((New-Object System.DirectoryServices.DirectoryEntry -ArgumentList "LDAP://$cfgNC").ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+                        if ("$($a.IdentityReference)" -match '^(S-1-5-21-\d+-\d+-\d+)-519$') { $rootSid = $Matches[1]; break }
+                    }
+                } catch { }
+            }
+            $dnsDom = (@($defNC -split ',' | ForEach-Object { $_ -replace '^DC=', '' }) -join '.')
+            $usr = '(objectCategory=person)(objectClass=user)'
+            $en  = '(!(userAccountControl:1.2.840.113556.1.4.803:=2))'
+            function Uac([int]$v) { "(userAccountControl:1.2.840.113556.1.4.803:=$v)" }
+            function InChain([string]$Dn) { "(memberOf:1.2.840.113556.1.4.1941:=$(LdapEsc $Dn))" }
+            function GroupDn([string]$Flt, [string]$Base = $defNC) { $g = AdFind $Flt $Base; if ($g.Count) { $g[0].DN } else { '' } }
+
+            # Grupy uprzywilejowane (po SID – niezależnie od języka nazw). Konta uprzywilejowane = członkowie (także zagnieżdżeni)
+            # Administratorów (obejmuje Administratorów domeny i przedsiębiorstwa), Administratorów schematu i grup operatorów.
+            $grpDef = @(
+                @{ F = '(objectSid=S-1-5-32-544)'; N = 'Administratorzy (wbudowana)'; Big = 15; Priv = $true }
+                @{ F = "(objectSid=$domSid-512)"; N = 'Administratorzy domeny'; Big = 10 }
+                @{ F = "(objectSid=$rootSid-519)"; N = 'Administratorzy przedsiębiorstwa'; Big = 5; Root = $true }
+                @{ F = "(objectSid=$rootSid-518)"; N = 'Administratorzy schematu'; Empty = $true; Root = $true; Priv = $true }
+                @{ F = '(objectSid=S-1-5-32-548)'; N = 'Operatorzy kont'; Empty = $true; Priv = $true }
+                @{ F = '(objectSid=S-1-5-32-549)'; N = 'Operatorzy serwerów'; Empty = $true; Priv = $true }
+                @{ F = '(objectSid=S-1-5-32-550)'; N = 'Operatorzy drukowania'; Empty = $true; Priv = $true }
+                @{ F = '(objectSid=S-1-5-32-551)'; N = 'Operatorzy kopii zapasowych'; Priv = $true }
+                @{ F = '(&(objectClass=group)(sAMAccountName=DnsAdmins))'; N = 'DnsAdmins'; Empty = $true }
+            )
+            $privDn = New-Object System.Collections.Generic.List[string]
+            $cut90 = FileTimeAgo 90
+            $created90 = $now.AddDays(-90).ToUniversalTime().ToString('yyyyMMddHHmmss') + '.0Z'
+            foreach ($g in $grpDef) {
+                if ($g.Root -and -not $isRoot) { continue }
+                Try-Ad "Grupa $($g.N)" {
+                    $gdn = GroupDn $g.F $(if ($g.Root) { $rootNC } else { $defNC })
+                    if (-not $gdn) { return }
+                    if ($g.Priv) { $privDn.Add($gdn) }
+                    $m    = AdFind "(&$usr$(InChain $gdn)$en)"
+                    $off  = AdFind "(&$usr$(InChain $gdn)$(Uac 2))"
+                    $idle = AdFind "(&$usr$(InChain $gdn)$en(!(objectSid=$domSid-500))(|(lastLogonTimestamp<=$cut90)(&(!(lastLogonTimestamp=*))(whenCreated<=$created90))))"
+                    $txt = "$($m.Count) aktywnych kont$(if ($m.Count) { ": $(Names $m 10)" })$(if ($off.Count) { "; wyłączone: $($off.Count)" })$(if ($idle.Count) { "; nieużywane od 90 dni: $(Names $idle 5)" })"
+                    $st = if (($g.Big -and $m.Count -gt $g.Big) -or $idle.Count) { 'Uwaga' } elseif ($g.Empty -and $m.Count) { 'Zalecenie' } else { 'Info' }
+                    if ($g.Empty -and $m.Count) { $txt += ' – grupa powinna być pusta (uprawnienia bliskie administratorowi domeny)' }
+                    if ($idle.Count) { $txt += ' – nieużywane konta uprzywilejowane wyłącz albo usuń z grupy' }
+                    AdRow "Grupa uprzywilejowana: $($g.N)" $txt $st
+                }
+            }
+            $privOr = if ($privDn.Count) { '(|' + (@($privDn | ForEach-Object { InChain $_ }) -join '') + ')' } else { '(objectSid=S-1-0-0)' }
+
+            Try-Ad 'Hasło konta krbtgt' {
+                $age = 'krócej niż 180 dni'; $st = 'OK'
+                foreach ($d in 1825, 730, 365, 180) { $x = AdFind "(&(objectSid=$domSid-502)(pwdLastSet<=$(FileTimeAgo $d)))"; if ($x.Count) { $age = "ponad $d dni"; $st = $(if ($d -ge 365) { 'Uwaga' } else { 'Zalecenie' }); break } }
+                AdRow 'Hasło konta krbtgt' "zmienione $age temu$(if ($st -ne 'OK') { ' – zmień je dwukrotnie (odstęp ≥ 10 h); stare hasło ułatwia trwałe „złote bilety” (golden ticket)' })" $st
+            }
+            Try-Ad 'Delegowanie nieograniczone' {
+                $c = AdFind "(&(objectCategory=computer)$(Uac 524288)(!$(Uac 8192))$en)"
+                $u = AdFind "(&$usr$(Uac 524288)$en)"
+                if ($c.Count -or $u.Count) { AdRow 'Delegowanie nieograniczone (poza kontrolerami domeny)' "$(if ($c.Count) { "komputery: $(Names $c)" })$(if ($c.Count -and $u.Count) { '; ' })$(if ($u.Count) { "konta użytkowników: $(Names $u)" }) – przejęcie takiego serwera daje bilety każdego, kto się z nim łączy (także kontrolerów domeny)" 'Krytyczne' }
+                else { AdRow 'Delegowanie nieograniczone (poza kontrolerami domeny)' 'brak' 'OK' }
+            }
+            Try-Ad 'Delegowanie do kontrolerów domeny' {
+                $dcs = AdFind "(&(objectCategory=computer)$(Uac 8192))"
+                $parts = New-Object System.Collections.Generic.List[string]
+                # klasa usługi w bilecie S4U2Proxy nie jest chroniona – delegowanie do DOWOLNEJ usługi kontrolera daje dostęp np. do cifs/ldap
+                foreach ($d in $dcs) { $n = LdapEsc $d.Name; foreach ($pat in "*/$n", "*/$($n).*", "*/$($n):*") { $parts.Add("(msDS-AllowedToDelegateTo=$pat)") } }
+                $parts.Add('(msDS-AllowedToDelegateTo=krbtgt/*)')
+                $toDc = if ($parts.Count) { AdFind "(&(|$($parts -join ''))(!$(Uac 8192)))" } else { @() }
+                $rbcd = AdFind "(&(|(&(objectCategory=computer)$(Uac 8192))(objectSid=$domSid-502))(msDS-AllowedToActOnBehalfOfOtherIdentity=*))"
+                $t2a  = AdFind "(&$(Uac 16777216)(!$(Uac 67108864))$en)"   # bez RODC (0x4000000) – mają przejście protokołu z definicji
+                if ($toDc.Count) { AdRow 'Delegowanie ograniczone do usług kontrolera domeny' "$(Names $toDc) – konto może podszyć się pod dowolnego użytkownika wobec kontrolera domeny" 'Krytyczne' }
+                if ($rbcd.Count) { AdRow 'Delegowanie oparte na zasobach (RBCD) na kontrolerze domeny lub krbtgt' "$(Names $rbcd) – ustawione msDS-AllowedToActOnBehalfOfOtherIdentity" 'Krytyczne' }
+                if ($t2a.Count) { AdRow 'Delegowanie z przejściem protokołu (dowolne uwierzytelnienie)' "$(Names $t2a) – sprawdź, do jakich usług delegują" 'Uwaga' }
+                if (-not ($toDc.Count -or $rbcd.Count -or $t2a.Count)) { AdRow 'Delegowanie do kontrolerów domeny i przejście protokołu' 'brak' 'OK' }
+                # RBCD na pozostałych obiektach: zwykle świadoma konfiguracja, ale także popularna technika przejęcia serwera (do przeglądu)
+                $rbAll = @((AdFind '(msDS-AllowedToActOnBehalfOfOtherIdentity=*)') | Where-Object { $d = $_.DN; -not @($rbcd | Where-Object { $_.DN -eq $d }).Count })
+                if ($rbAll.Count) { AdRow 'Delegowanie oparte na zasobach (RBCD) – obiekty do przeglądu' "$(Names $rbAll) – sprawdź, komu pozwolono działać w imieniu użytkowników wobec tych serwerów" 'Info' }
+            }
+            Try-Ad 'Prawa replikacji (DCSync) i kontrola nad domeną' {
+                $gca = [guid]'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
+                $okSid = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-9', "$domSid-512", "$domSid-516", "$domSid-498", "$domSid-521", "$rootSid-498", "$rootSid-519")
+                $bad = @{}; $sync = @{}
+                foreach ($ace in @($dom.ObjectSecurity.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+                    if ("$($ace.AccessControlType)" -ne 'Allow' -or ([int]$ace.PropagationFlags -band 2)) { continue }   # wpis tylko dla obiektów podrzędnych (InheritOnly)
+                    if (-not $rootSid -and "$($ace.IdentityReference)" -match '^S-1-5-21-\d+-\d+-\d+-(519|498)$' -and -not "$($ace.IdentityReference)".StartsWith("$domSid-")) { continue }   # SID lasu nieustalony
+                    $sidv = "$($ace.IdentityReference)"
+                    if ($okSid -contains $sidv) { continue }
+                    $rt = [int64]$ace.ActiveDirectoryRights
+                    $what = @()
+                    if (($rt -band 0xF01FF) -eq 0xF01FF) { $what += 'pełna kontrola' }
+                    elseif (($rt -band 0x100) -and ($ace.ObjectType -eq $gca -or $ace.ObjectType -eq [guid]::Empty)) { $what += 'replikacja haseł (DCSync)' }
+                    if ($rt -band 0x40000) { $what += 'zmiana uprawnień' }
+                    if ($rt -band 0x80000) { $what += 'przejęcie własności' }
+                    if (-not $what.Count) { continue }
+                    $acc = AccOf $sidv
+                    $txt = "$acc ($((@($what) | Select-Object -Unique) -join ', '))"
+                    if ($acc -match '\\(MSOL_|AAD_|Sync_|ADSyncMSA|provAgentgMSA)') { $sync[$acc] = $txt } else { $bad[$acc] = $txt }
+                }
+                if ($bad.Count) { AdRow 'Prawa replikacji (DCSync) i kontrola nad obiektem domeny' "$(@($bad.Values | Sort-Object) -join '; ') – podmiot spoza grup administracyjnych może pobrać skróty haseł wszystkich kont" 'Krytyczne' }
+                else { AdRow 'Prawa replikacji (DCSync) i kontrola nad obiektem domeny' 'tylko domyślne grupy administracyjne i kontrolery domeny' 'OK' }
+                if ($sync.Count) { AdRow 'Prawa replikacji – synchronizacja z Entra ID' "$(@($sync.Values | Sort-Object) -join '; ') – oczekiwane dla Entra Connect / Cloud Sync; chroń te serwery jak kontroler domeny" 'Info' }
+            }
+            Try-Ad 'Konta bez wstępnego uwierzytelniania Kerberos' {
+                $a = AdFind "(&$usr$(Uac 4194304)$en)"
+                $p = AdFind "(&$usr$(Uac 4194304)$en$privOr)"
+                if ($a.Count) { AdRow 'Konta bez wstępnego uwierzytelniania Kerberos (AS-REP roasting)' "$(Names $a)$(if ($p.Count) { "; uprzywilejowane: $(Names $p)" }) – skrót hasła można pobrać bez logowania i łamać offline" $(if ($p.Count) { 'Krytyczne' } else { 'Uwaga' }) }
+                else { AdRow 'Konta bez wstępnego uwierzytelniania Kerberos (AS-REP roasting)' 'brak' 'OK' }
+            }
+            Try-Ad 'Konta uprzywilejowane z SPN' {
+                $p = AdFind "(&$usr(servicePrincipalName=*)$en$privOr(!(objectSid=$domSid-502)))"
+                $a = AdFind "(&$usr(servicePrincipalName=*)$en(!(objectSid=$domSid-502)))"
+                if ($p.Count) { AdRow 'Konta uprzywilejowane z SPN (Kerberoasting)' "$(Names $p) – każdy użytkownik domeny pobierze bilet i złamie hasło offline; użyj gMSA albo wyjmij konto z grup uprzywilejowanych" 'Krytyczne' }
+                else { AdRow 'Konta uprzywilejowane z SPN (Kerberoasting)' 'brak' 'OK' }
+                if ($a.Count) { AdRow 'Konta użytkowników z SPN' "$($a.Count): $(Names $a) – wymagają długich, losowych haseł (lepiej gMSA)" 'Info' }
+            }
+            Try-Ad 'Słabe ustawienia haseł kont' {
+                $rev = AdFind "(&$usr$(Uac 128)$en)"
+                $nrq = AdFind "(&$usr$(Uac 32)(!$(Uac 2048))$en)"
+                $des = AdFind "(&$usr$(Uac 2097152)$en)"
+                $rc4 = AdFind "(&$usr$en(msDS-SupportedEncryptionTypes=*)(!(msDS-SupportedEncryptionTypes=0))(!(msDS-SupportedEncryptionTypes:1.2.840.113556.1.4.804:=24)))"
+                $pne = AdFind "(&$usr$(Uac 65536)$en$privOr)"
+                $dsc = AdFind "(&$usr$en(|(description=*hasło*)(description=*haslo*)(description=*password*)(description=*pass:*)(description=*pass=*)(description=*pwd*)(info=*hasło*)(info=*password*)))"
+                $upw = AdFind "(&$usr(|(userPassword=*)(unixUserPassword=*)))"
+                AdRow 'Hasła zapisane odwracalnie' $(if ($rev.Count) { "$(Names $rev) – hasło można odczytać jawnym tekstem" } else { 'brak kont' }) $(if ($rev.Count) { 'Uwaga' } else { 'OK' })
+                AdRow 'Konta, które mogą mieć puste hasło (PASSWD_NOTREQD)' $(if ($nrq.Count) { Names $nrq } else { 'brak kont' }) $(if ($nrq.Count) { 'Uwaga' } else { 'OK' })
+                if ($des.Count) { AdRow 'Konta tylko z szyfrowaniem DES' (Names $des) 'Uwaga' }
+                if ($rc4.Count) { AdRow 'Konta bez szyfrowania AES w Kerberos (tylko RC4/DES)' "$(Names $rc4) – po wymuszeniu AES (2026) przestaną działać, a RC4 ułatwia łamanie haseł" 'Uwaga' }
+                if ($pne.Count) { AdRow 'Konta uprzywilejowane z hasłem bez wygasania' (Names $pne 10) 'Zalecenie' }
+                if ($dsc.Count) { AdRow 'Słowo „hasło/password” w opisie konta' "$(Names $dsc) – sprawdź, czy opis nie zawiera hasła (opis może czytać każdy użytkownik domeny)" 'Uwaga' }
+                if ($upw.Count) { AdRow 'Wypełniony atrybut userPassword / unixUserPassword' "$(Names $upw) – atrybut bywa czytelny dla zwykłych użytkowników" 'Uwaga' }
+            }
+            Try-Ad 'Wbudowane konto Administrator domeny' {
+                $x = AdFind "(&(objectSid=$domSid-500)$en(pwdLastSet<=$(FileTimeAgo 365)))"
+                if ($x.Count) { AdRow 'Wbudowane konto Administrator domeny' "$($x[0].Name): włączone, hasło starsze niż rok – nadaj długie hasło przechowywane w sejfie (konto awaryjne)" 'Uwaga' }
+            }
+            Try-Ad 'Historia SID (sIDHistory)' {
+                $h = AdFind '(sIDHistory=*)'
+                if ($h.Count) {
+                    $hi = New-Object System.Collections.Generic.List[string]
+                    foreach ($o in @($h | Select-Object -First 50)) {
+                        $hv = AdGet $o.DN 'sIDHistory'
+                        $hl = @(); if ($hv -is [byte[]]) { $hl = @(, $hv) } elseif ($hv) { $hl = @($hv | Where-Object { $_ }) }   # jedna wartość = tablica bajtów, kilka = tablica tablic
+                        foreach ($b in $hl) {
+                            $sv = SidOf $b
+                            if ($sv -match '-(500|512|516|518|519)$' -or $sv -eq 'S-1-5-32-544' -or ($domSid -and $sv.StartsWith("$domSid-"))) { $hi.Add("$($o.Name) ($sv)") }
+                        }
+                    }
+                    AdRow 'Historia SID (sIDHistory)' $(if ($hi.Count) { "uprzywilejowany albo z tej samej domeny SID w historii: $(@($hi | Select-Object -First 8) -join ', ') – typowa technika utrwalenia dostępu" } else { "$($h.Count) obiektów (pozostałość po migracji): $(Names $h 5)" }) $(if ($hi.Count) { 'Krytyczne' } else { 'Info' })
+                }
+            }
+            Try-Ad 'Ustawienia domeny' {
+                $maq = AdGet $defNC 'ms-DS-MachineAccountQuota'
+                if ($null -ne $maq) { AdRow 'Dołączanie komputerów przez zwykłych użytkowników (MachineAccountQuota)' $maq $(if ([int]$maq -gt 0) { 'Zalecenie' } else { 'OK' }) }
+                $mpl = [int](AdGet $defNC 'minPwdLength'); $lot = [int](AdGet $defNC 'lockoutThreshold')
+                AdRow 'Minimalna długość hasła (zasady domeny)' $mpl $(if ($mpl -lt 8) { 'Uwaga' } elseif ($mpl -lt 12) { 'Zalecenie' } else { 'OK' })
+                AdRow 'Blokada konta po błędnych hasłach (zasady domeny)' $(if ($lot -gt 0) { "po $lot próbach" } else { 'wyłączona – możliwe zgadywanie haseł bez ograniczeń' }) $(if ($lot -gt 0) { 'OK' } else { 'Zalecenie' })
+                $dfl = AdGet $defNC 'msDS-Behavior-Version'
+                $lvl = @{ 0 = '2000'; 1 = '2003 interim'; 2 = '2003'; 3 = '2008'; 4 = '2008 R2'; 5 = '2012'; 6 = '2012 R2'; 7 = '2016'; 10 = '2025' }
+                if ($null -ne $dfl) { AdRow 'Poziom funkcjonalny domeny' "Windows Server $($lvl[[int]$dfl])" $(if ([int]$dfl -le 3) { 'Uwaga' } elseif ([int]$dfl -lt 6) { 'Zalecenie' } else { 'OK' }) }
+                $rb = (AdList "CN=Partitions,$cfgNC" 'msDS-EnabledFeature') -join ';'
+                AdRow 'Kosz Active Directory' $(if ($rb -match 'Recycle Bin Feature') { 'włączony' } else { 'wyłączony – usuniętych obiektów nie da się odtworzyć z atrybutami' }) $(if ($rb -match 'Recycle Bin Feature') { 'OK' } else { 'Zalecenie' })
+                $dsh = "$(AdGet "CN=Directory Service,CN=Windows NT,CN=Services,$cfgNC" 'dSHeuristics')"
+                if ($dsh.Length -ge 7 -and $dsh[6] -eq '2') { AdRow 'Anonimowe operacje LDAP (dSHeuristics)' "dozwolone ($dsh)" 'Uwaga' }
+                $pre = (AdList (GroupDn '(objectSid=S-1-5-32-554)') 'member') -join ';'
+                if ($pre -match 'CN=S-1-5-7,|CN=S-1-1-0,') { AdRow 'Grupa „Dostęp zgodny z systemami starszymi niż Windows 2000”' 'zawiera Logowanie anonimowe albo Wszystkich – anonimowy odczyt katalogu' 'Uwaga' }
+                $pu = AdList (GroupDn "(objectSid=$domSid-525)") 'member'
+                if ([int]$dfl -ge 6) { AdRow 'Grupa Użytkownicy chronieni' $(if ($pu.Count) { "$($pu.Count) członków" } else { 'pusta – konta administratorów nie korzystają z dodatkowej ochrony (bez NTLM, delegowania i zapamiętywania poświadczeń)' }) $(if ($pu.Count) { 'OK' } else { 'Zalecenie' }) }
+            }
+            Try-Ad 'Zaufania' {
+                foreach ($t in (AdFind '(objectClass=trustedDomain)' "CN=System,$defNC")) {
+                    $ta = [int](AdGet $t.DN 'trustAttributes'); $td = [int](AdGet $t.DN 'trustDirection'); $tp = "$(AdGet $t.DN 'trustPartner')"
+                    if ($ta -band 0x20) { continue }   # w obrębie lasu
+                    $dir = switch ($td) { 1 { 'przychodzące' } 2 { 'wychodzące' } 3 { 'dwukierunkowe' } default { "$td" } }
+                    $kind = if ($ta -band 0x8) { 'lasu' } else { 'zewnętrzne' }
+                    $risk = @()
+                    if (($td -band 2) -and -not ($ta -band 0x8) -and -not ($ta -band 0x4)) { $risk += 'filtrowanie SID wyłączone' }
+                    if (($td -band 2) -and ($ta -band 0x8) -and ($ta -band 0x40)) { $risk += 'historia SID dozwolona' }
+                    if ($ta -band 0x800) { $risk += 'delegowanie biletów TGT przez zaufanie' }
+                    AdRow "Zaufanie z $tp" "$kind, $dir$(if ($risk.Count) { " – $($risk -join ', ') (konta zaufanej domeny mogą podszyć się pod administratorów tej domeny)" })" $(if ($risk.Count) { 'Uwaga' } else { 'Info' })
+                }
+            }
+            Try-Ad 'LAPS' {
+                $sch = AdFind '(|(lDAPDisplayName=ms-Mcs-AdmPwdExpirationTime)(lDAPDisplayName=msLAPS-PasswordExpirationTime))' $schNC 'OneLevel'
+                $attrs = @(); foreach ($a in $sch) { if ($a.Name -match 'AdmPwd') { $attrs += 'ms-Mcs-AdmPwdExpirationTime' } else { $attrs += 'msLAPS-PasswordExpirationTime' } }
+                $srvF = "(objectCategory=computer)(operatingSystem=Windows*Server*)(!$(Uac 8192))(!$(Uac 67108864))(!(servicePrincipalName=MSClusterVirtualServer/*))$en"
+                if (-not $attrs.Count) { AdRow 'LAPS – hasła lokalnych administratorów serwerów' 'schemat bez atrybutów LAPS – LAPS niewdrożony; to samo hasło administratora na wielu serwerach ułatwia ruch boczny' 'Zalecenie' }
+                else {
+                    $all  = AdFind "(&$srvF)"
+                    $has  = AdFind "(&$srvF(|$(@($attrs | ForEach-Object { "($_=*)" }) -join '')))"
+                    # po migracji ze starego LAPS na Windows LAPS stary atrybut zostaje z dawną datą – „nie rotuje” tylko, gdy żaden nie jest aktualny
+                    $old7 = FileTimeAgo 7
+                    $stale = AdFind "(&$srvF(lastLogonTimestamp>=$(FileTimeAgo 14))(|$(@($attrs | ForEach-Object { "($_=*)" }) -join ''))$(@($attrs | ForEach-Object { "(!($_>=$old7))" }) -join ''))"
+                    $hasN = @{}; foreach ($h in $has) { $hasN[$h.DN] = 1 }
+                    $miss = @($all | Where-Object { -not $hasN.ContainsKey($_.DN) })
+                    $pct = if ($all.Count) { [math]::Round(100 * $has.Count / $all.Count) } else { 100 }
+                    AdRow 'LAPS – pokrycie serwerów' "$($has.Count) z $($all.Count) serwerów ($pct%)$(if ($miss.Count) { "; bez LAPS: $(Names $miss 8)" })" $(if ($pct -lt 80) { 'Uwaga' } elseif ($miss.Count) { 'Zalecenie' } else { 'OK' })
+                    if ($stale.Count) { AdRow 'LAPS – hasło nie jest zmieniane' "$(Names $stale 8) – działające serwery z hasłem po terminie ważności (agent LAPS nie działa albo nie ma uprawnień)" 'Uwaga' }
+                }
+            }
+            Try-Ad 'Nieaktywne konta komputerów' {
+                $st = AdFind "(&(objectCategory=computer)$en(lastLogonTimestamp<=$cut90)(!$(Uac 8192)))"
+                if ($st.Count) { AdRow 'Nieaktywne konta komputerów (90 dni)' "$($st.Count): $(Names $st 6) – wyłącz albo usuń" 'Info' }
+            }
+
+            # SYSVOL (pliki lokalne kontrolera): hasła w preferencjach zasad grupy (cpassword – klucz jest publiczny) i w skryptach
+            Try-Ad 'SYSVOL' {
+                $svRoot = "$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' 'SysVol')"
+                if (-not $svRoot) { $svRoot = Join-Path $env:SystemRoot 'SYSVOL\sysvol' }
+                $base = Join-Path $svRoot $dnsDom
+                if (-not (Test-Path -LiteralPath $base)) { AdRow 'SYSVOL – hasła w plikach' "nie znaleziono folderu $base" 'Info'; return }
+                $files = @(Get-ChildItem -LiteralPath $base -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and $_.Length -lt 2MB -and $_.Extension -match '^\.(xml|bat|cmd|vbs|ps1|kix|ini|inf)$' } | Select-Object -First 5000)
+                $gpp = New-Object System.Collections.Generic.List[string]; $scr = New-Object System.Collections.Generic.List[string]
+                foreach ($f in $files) {
+                    $t = ''; try { $t = [IO.File]::ReadAllText($f.FullName) } catch { continue }
+                    $rel = $f.FullName.Substring($base.Length).TrimStart('\')
+                    if ($f.Extension -eq '.xml') { if ($t -match 'cpassword="[^"]+"') { $gpp.Add($rel) } }
+                    elseif ($f.Extension -match '^\.(bat|cmd|vbs|ps1|kix)$' -and $t -match '(?im)(\bnet\s+use\b[^\r\n]*\s/user:\S+|\bpassword\s*[=:]\s*(?!(Read-Host|Get-|Import-|ConvertTo-|ConvertFrom-|New-Object|InputBox)\b)["'']?[^\s"''%$(]{4,}|-AsPlainText\b)') { $scr.Add($rel) }
+                }
+                AdRow 'SYSVOL – hasła w preferencjach zasad grupy (cpassword)' $(if ($gpp.Count) { "$($gpp.Count) plików: $(@($gpp | Select-Object -First 5) -join ', ') – hasło odszyfruje każdy użytkownik domeny; usuń preferencję i zmień hasło" } else { "brak (sprawdzono $($files.Count) plików)" }) $(if ($gpp.Count) { 'Krytyczne' } else { 'OK' })
+                if ($scr.Count) { AdRow 'SYSVOL – możliwe hasła w skryptach' "$(@($scr | Select-Object -First 6) -join ', ')$(if ($scr.Count -gt 6) { " (+$($scr.Count - 6))" }) – skrypty czyta każdy użytkownik domeny" 'Uwaga' }
+                # Zasady haseł (szyfrowanie odwracalne, złożoność): obowiązujące na kontrolerze = zasady domeny z wygrywającego GPO
+                # (secedit /export do pliku tymczasowego, usuwanego od razu); gdy się nie uda – Default Domain Policy z SYSVOL
+                $tx = ''; $src = 'zasady domeny'
+                $tmp = Join-Path $env:TEMP ("sr_sec_{0}.inf" -f [guid]::NewGuid().ToString('N'))
+                try { & "$env:SystemRoot\System32\secedit.exe" /export /cfg $tmp /areas SECURITYPOLICY /quiet 2>$null | Out-Null; if (Test-Path -LiteralPath $tmp) { $tx = [IO.File]::ReadAllText($tmp) } } catch { } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+                if ($tx -notmatch '(?im)^\s*PasswordComplexity\s*=') {
+                    $inf = Join-Path $base 'Policies\{31B2F340-016D-11D2-945F-00C04FB984F9}\MACHINE\Microsoft\Windows NT\SecEdit\GptTmpl.inf'
+                    if (Test-Path -LiteralPath $inf) { $tx = [IO.File]::ReadAllText($inf); $src = 'Default Domain Policy' }
+                }
+                if ($tx -match '(?im)^\s*ClearTextPassword\s*=\s*1') { AdRow 'Zasady domeny – hasła zapisywane odwracalnie' "włączone ($src, ClearTextPassword = 1)" 'Krytyczne' }
+                if ($tx -match '(?im)^\s*PasswordComplexity\s*=\s*0') { AdRow 'Zasady domeny – złożoność haseł' "wyłączona ($src)" 'Uwaga' }
+            }
+            if ($adState.Cut) { AdRow 'Active Directory – limit czasu' 'część sprawdzeń pominięto (limit 90 s – bardzo duża domena albo wolny katalog)' 'Info' }
         })
     }
 
@@ -1262,11 +2046,337 @@ $Collector = {
         if (Get-Command Get-MpPreference -ErrorAction SilentlyContinue) {
             $mpp = $null; try { $mpp = Get-MpPreference -ErrorAction Stop } catch {}
             if ($mpp) {
-                foreach ($pair in @(@('ExclusionPath', 'ścieżka'), @('ExclusionProcess', 'proces'), @('ExclusionExtension', 'rozszerzenie'), @('ExclusionIpAddress', 'adres IP'))) {
-                    foreach ($x in @($mpp.($pair[0]))) { if ($x -and "$x" -notlike 'N/A*') { [pscustomobject]@{ Type = "Defender – wykluczenie ($($pair[1]))"; Name = "$x"; Detail = '' } } }
+                $exl = @(@{ V = $mpp.ExclusionPath; T = 'ścieżka' }, @{ V = $mpp.ExclusionProcess; T = 'proces' }, @{ V = $mpp.ExclusionExtension; T = 'rozszerzenie' }, @{ V = $mpp.ExclusionIpAddress; T = 'adres IP' })
+                foreach ($pair in $exl) {
+                    foreach ($x in @($pair.V)) { if ($x -and "$x" -notlike 'N/A*') { [pscustomobject]@{ Type = "Defender – wykluczenie ($($pair.T))"; Name = "$x"; Detail = '' } } }
                 }
             }
         }
+    })
+
+    # ── Podejrzane: wskaźniki naruszenia i nietypowe mechanizmy trwałości (tylko odczyt, lekkie sprawdzenia) ──
+    # Level: Krytyczne / Uwaga / Info – wstępna ocena; stacja może ją zmienić (zatwierdzone narzędzia, ochrona innego producenta).
+    # Uwaga przy edycji: ten kod jest wykonywany na serwerach – nie używaj słów, które PowerShell 5.1 uznaje za podejrzane
+    # (zdarzenie 4104 i alerty SIEM), np. odwołań przez refleksję, dynamicznych nazw właściwości (test: t_suspicious_kw.ps1).
+    $suspicious = @(S 'Suspicious' 'Podejrzane' {
+        $sus = New-Object System.Collections.Generic.List[object]
+        function Add-Sus($type, $name, $detail, $level, [int]$Max = 400) { $sus.Add([pscustomobject]@{ Type = $type; Name = "$name"; Detail = (Short (Hide-Secret "$detail") $Max); Level = $level }) }
+        $sys32 = Join-Path $env:SystemRoot 'System32'
+        $wow64 = Join-Path $env:SystemRoot 'SysWOW64'
+        $userDirs = '(?i)\\(Users\\Public|AppData|Temp|ProgramData\\[^\\]+\.(exe|dll)|\$Recycle\.Bin|PerfLogs)\\?'
+        $canSig = $PSVersionTable.PSVersion.Major -ge 5   # PS 4.0 nie sprawdza podpisów katalogowych – plik systemowy wyglądałby na niepodpisany
+        function Resolve-ModulePath([string]$n) {
+            $p = [Environment]::ExpandEnvironmentVariables("$n".Trim().Trim('"'))
+            if (-not $p) { return '' }
+            if (-not [IO.Path]::IsPathRooted($p)) {
+                $c = Join-Path $sys32 $p
+                if (-not (Test-Path -LiteralPath $c) -and -not $c.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase)) { $c += '.dll' }
+                $p = $c
+            }
+            $p
+        }
+        function Get-SignInfo([string]$path) {
+            # @{ Exists; InSystem; Signer ('' gdy brak podpisu albo nie sprawdzano); Valid }
+            $r = @{ Exists = $false; InSystem = $false; Signer = ''; Valid = $null }
+            if (-not $path) { return $r }
+            $r.Exists = Test-Path -LiteralPath $path
+            $r.InSystem = $path.StartsWith($sys32 + '\', [StringComparison]::OrdinalIgnoreCase) -or $path.StartsWith($wow64 + '\', [StringComparison]::OrdinalIgnoreCase)
+            if ($r.Exists -and $canSig) {
+                try {
+                    $sg = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop
+                    $r.Valid = ("$($sg.Status)" -eq 'Valid')
+                    if ($sg.SignerCertificate) { $r.Signer = (("$($sg.SignerCertificate.Subject)" -split ',')[0] -replace '^CN=', '') }
+                } catch { }
+            }
+            $r
+        }
+        function Get-ModuleLevel($si, [string]$path) {
+            # DLL ładowany przez system: spoza System32 albo niepodpisany = podejrzany; w katalogach użytkownika/tymczasowych = krytyczny
+            if (-not $si.Exists) { return 'Info' }
+            if ($path -match $userDirs) { return 'Krytyczne' }
+            if ($si.Valid -eq $false) { return 'Krytyczne' }
+            if (-not $si.InSystem) { return 'Uwaga' }
+            if ($si.Valid -and $si.Signer -notmatch 'Microsoft') { return 'Uwaga' }
+            ''
+        }
+
+        # 1) Przekierowanie uruchamiania (IFEO Debugger, SilentProcessExit) – m.in. backdoor „sticky keys” na ekranie logowania
+        $acc = 'sethc.exe', 'utilman.exe', 'osk.exe', 'magnify.exe', 'narrator.exe', 'displayswitch.exe', 'atbroker.exe'
+        foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options') {
+            foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+                $exe = "$($k.PSChildName)".ToLowerInvariant()
+                $dbg = "$($k.GetValue('Debugger'))".Trim()
+                if ($dbg) {
+                    $lvl = if ($acc -contains $exe) { 'Krytyczne' } elseif ($exe -eq 'taskmgr.exe' -and $dbg -match '(?i)procexp') { 'Info' } else { 'Uwaga' }
+                    Add-Sus 'Przekierowanie uruchamiania (IFEO Debugger)' $k.PSChildName $dbg $lvl
+                }
+                $gf = $k.GetValue('GlobalFlag')
+                if ($null -ne $gf) { try { if (([int64]"$gf") -band 0x200) { Add-Sus 'Monitorowanie zakończenia procesu (IFEO GlobalFlag 0x200)' $k.PSChildName "GlobalFlag=$gf" 'Info' } } catch { } }
+            }
+        }
+        foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit' -ErrorAction SilentlyContinue)) {
+            $mon = "$($k.GetValue('MonitorProcess'))".Trim()
+            if ($mon) { Add-Sus 'Uruchamianie po zakończeniu procesu (SilentProcessExit)' $k.PSChildName $mon $(if ($acc -contains "$($k.PSChildName)".ToLowerInvariant()) { 'Krytyczne' } else { 'Uwaga' }) }
+        }
+        foreach ($b in $acc) {
+            $f = Join-Path $sys32 $b
+            if (-not (Test-Path -LiteralPath $f)) { continue }
+            $o = ''; try { $o = "$((Get-Item -LiteralPath $f).VersionInfo.OriginalFilename)" } catch { }
+            if ($o -match '(?i)^(cmd|powershell|pwsh|conhost|explorer|taskmgr)\.') { Add-Sus 'Podmienione narzędzie ułatwień dostępu' $b "plik jest kopią $o (dostęp do konsoli z ekranu logowania bez hasła)" 'Krytyczne' }
+        }
+
+        # 2) Pakiety LSA ładowane do procesu lsass (podsłuch haseł: własne SSP, filtry haseł)
+        $lsaKey = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
+        $okPkg = @{
+            'Security Packages'       = @('kerberos', 'msv1_0', 'schannel', 'wdigest', 'tspkg', 'pku2u', 'cloudap', 'negoexts', 'livessp', 'credssp', 'negotiate')
+            'Authentication Packages' = @('msv1_0')
+            'Notification Packages'   = @('scecli', 'rassfm')
+        }
+        $lsaKeys = @($lsaKey) + @(Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig' -ErrorAction SilentlyContinue) | Where-Object { $_ }
+        $seenPkg = @{}
+        foreach ($lk in $lsaKeys) {
+            foreach ($vn in $okPkg.Keys) {
+                foreach ($v in @($lk.GetValue($vn))) {
+                    $n = ("$v".Trim().Trim('"') -replace '\.dll$', '').ToLowerInvariant()
+                    if (-not $n -or $okPkg[$vn] -contains $n -or $seenPkg.ContainsKey("$vn|$n")) { continue }
+                    $seenPkg["$vn|$n"] = 1
+                    $path = Resolve-ModulePath $n
+                    $si = Get-SignInfo $path
+                    $lvl = if (-not $si.Exists) { 'Uwaga' } elseif ($si.Valid -eq $false) { 'Krytyczne' } elseif ($si.Signer -match 'Microsoft') { 'Info' } else { 'Uwaga' }
+                    Add-Sus "Pakiet LSA ($vn)" $n "$path$(if (-not $si.Exists) { ' – plik nie istnieje' } elseif ($si.Signer) { " – podpis: $($si.Signer)" } elseif ($si.Valid -eq $false) { ' – brak ważnego podpisu' })" $lvl
+                }
+            }
+        }
+
+        # 3) AppInit_DLLs – DLL wstrzykiwany do każdego procesu z user32
+        foreach ($wk in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
+            $w = Get-Item -LiteralPath $wk -ErrorAction SilentlyContinue
+            if (-not $w) { continue }
+            $dl = "$($w.GetValue('AppInit_DLLs'))".Trim()
+            if (-not $dl) { continue }
+            $load = "$($w.GetValue('LoadAppInit_DLLs'))"; $req = "$($w.GetValue('RequireSignedAppInit_DLLs'))"
+            $lvl = if ($load -ne '1') { 'Info' } elseif ($req -ne '1') { 'Krytyczne' } else { 'Uwaga' }
+            Add-Sus 'AppInit_DLLs (DLL ładowany do każdego procesu)' $dl "LoadAppInit_DLLs=$load; RequireSignedAppInit_DLLs=$req ($wk)" $lvl
+        }
+
+        # 4) Punkty rozszerzeń ładujące DLL: pomocnicy netsh, monitory wydruku, dostawcy czasu – oceniane po lokalizacji i podpisie
+        $nk = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\NetSh' -ErrorAction SilentlyContinue
+        $mods = New-Object System.Collections.Generic.List[object]
+        if ($nk) { foreach ($vn in @($nk.GetValueNames())) { if ($vn) { $mods.Add(@{ T = 'Pomocnik netsh'; N = $vn; D = "$($nk.GetValue($vn))" }) } } }
+        foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors' -ErrorAction SilentlyContinue)) { $d = "$($k.GetValue('Driver'))"; if ($d) { $mods.Add(@{ T = 'Monitor wydruku'; N = $k.PSChildName; D = $d }) } }
+        foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders' -ErrorAction SilentlyContinue)) { $d = "$($k.GetValue('DllName'))"; if ($d) { $mods.Add(@{ T = 'Dostawca czasu'; N = $k.PSChildName; D = $d }) } }
+        foreach ($x in $mods) {
+            $path = Resolve-ModulePath $x.D
+            $si = Get-SignInfo $path
+            $lvl = Get-ModuleLevel $si $path
+            if ($lvl) { Add-Sus $x.T $x.N "$path$(if (-not $si.Exists) { ' – plik nie istnieje' } elseif ($si.Valid -eq $false) { ' – brak ważnego podpisu' } elseif ($si.Signer) { " – podpis: $($si.Signer)" })" $lvl }
+        }
+
+        # 5) Rzadkie wpisy Winlogon (Userinit/Shell są w sekcji Autostart)
+        $wl = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
+        if ($wl) {
+            foreach ($vn in 'Taskman', 'AppSetup') { $v = "$($wl.GetValue($vn))".Trim(); if ($v) { Add-Sus "Winlogon – $vn" $vn $v 'Uwaga' } }
+            $gina = "$($wl.GetValue('GinaDLL'))".Trim(); if ($gina) { Add-Sus 'Winlogon – GinaDLL (nieużywany od Windows Vista)' 'GinaDLL' $gina 'Krytyczne' }
+            foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify' -ErrorAction SilentlyContinue)) {
+                $d = "$($k.GetValue('DLLName'))"; if ($d) { Add-Sus 'Winlogon – Notify (nieużywany od Windows Vista)' $k.PSChildName $d 'Uwaga' }
+            }
+        }
+
+        # 6) Ukryte konta lokalne (nazwa z „$” – nie widać ich w „net user”); na kontrolerze domeny nie ma kont lokalnych
+        if (-not $sys.IsDC) {
+            $admNames = @($admins | Where-Object { $_.Group -and $_.Member } | ForEach-Object { ("$($_.Member)" -split '\\')[-1] })
+            foreach ($u in @(Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction SilentlyContinue)) {
+                if ("$($u.Name)".EndsWith('$')) {
+                    Add-Sus 'Ukryte konto lokalne (nazwa kończy się na $)' $u.Name "włączone: $(if ($u.Disabled) { 'nie' } else { 'tak' }); SID $($u.SID)$(if ($admNames -contains $u.Name) { '; w grupie uprzywilejowanej' })" $(if ($admNames -contains $u.Name -and -not $u.Disabled) { 'Krytyczne' } else { 'Uwaga' })
+                }
+            }
+        }
+
+        # 7) Narzędzia zdalnego dostępu i narzędzia ofensywne (usługi, procesy, wybrane foldery)
+        $allSvc = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)
+        $procs  = @($procNames.Values | Sort-Object -Unique)
+        $rat = @(
+            @{ N = 'AnyDesk'; R = '^anydesk' }, @{ N = 'TeamViewer'; R = '^teamviewer' }, @{ N = 'ScreenConnect / ConnectWise Control'; R = '^screenconnect' }
+            @{ N = 'RustDesk'; R = '^rustdesk' }, @{ N = 'Splashtop'; R = '^(splashtop|srservice|srmanager)' }, @{ N = 'Atera'; R = '^atera' }
+            @{ N = 'NinjaOne'; R = '^ninjarmm' }, @{ N = 'Kaseya'; R = '^(kaseya|agentmon)' }, @{ N = 'LogMeIn'; R = '^(logmein|lmiguardian|lmi_)' }
+            @{ N = 'GoTo / GoToAssist'; R = '^(gotoassist|g2a)' }, @{ N = 'Chrome Remote Desktop'; R = '^(chromoting|remoting_host)' }, @{ N = 'ngrok'; R = '^ngrok' }
+            @{ N = 'Tailscale'; R = '^tailscale' }, @{ N = 'ZeroTier'; R = '^zerotier' }, @{ N = 'Radmin'; R = '^(rserver3|radmin)' }
+            @{ N = 'VNC'; R = '^(tvnserver|uvnc_service|winvnc|vncserver)' }, @{ N = 'MeshCentral'; R = '^(mesh ?agent|meshagent)' }, @{ N = 'SimpleHelp'; R = '^(simplehelp|simple-help)' }
+            @{ N = 'Action1'; R = '^action1' }, @{ N = 'Level'; R = '^level-?(remote|agent)' }, @{ N = 'Supremo'; R = '^supremo' }, @{ N = 'DWService'; R = '^dwagent' }
+        )
+        foreach ($t in $rat) {
+            $sv = @($allSvc | Where-Object { "$($_.Name)" -match $t.R -or "$($_.DisplayName)" -match $t.R })
+            $pr = @($procs | Where-Object { "$_" -match $t.R })
+            if ($sv.Count -or $pr.Count) {
+                Add-Sus 'Narzędzie zdalnego dostępu' $t.N ((@($sv | ForEach-Object { "usługa $($_.Name) ($($_.State))" }) + @($pr | ForEach-Object { "proces $_" })) -join '; ') 'Uwaga'
+            }
+        }
+        $offRx = '^(mimikatz|mimilib|rubeus|seatbelt|sharphound|bloodhound|lazagne|nanodump|pwdump|gsecdump|secretsdump|wce|winpeas|kerbrute|certify|whisker|sharpup|sharpview|powerview|adfind|procdump(64)?|psexec(64)?|paexec|rclone|megasync|megacmd|nc|nc64|ncat|socat|plink|chisel|ligolo|frpc|frps|ngrok|netscan|advanced_ip_scanner|nmap|masscan)$'
+        $hardTools = '^(mimikatz|mimilib|rubeus|lazagne|nanodump|pwdump|gsecdump|secretsdump|wce|kerbrute|certify|whisker)$'
+        foreach ($p in $procs) { if ("$p" -match $offRx) { Add-Sus 'Uruchomione narzędzie ofensywne / podwójnego zastosowania' $p 'proces działa w chwili skanu' $(if ("$p" -match $hardTools) { 'Krytyczne' } else { 'Uwaga' }) } }
+        foreach ($s in @($allSvc | Where-Object { "$($_.Name)" -match '^(PSEXESVC|PAExec.*|csexecsvc|RemComSvc|BTOBTO)$' })) {
+            Add-Sus 'Usługa zdalnego wykonywania poleceń (PsExec i podobne)' $s.Name "$($s.State); $($s.PathName)" 'Uwaga'
+        }
+        $dumpDirs = @((Join-Path $env:SystemRoot 'Temp'), 'C:\Users\Public', 'C:\PerfLogs', $env:ProgramData, 'C:\', $env:TEMP) | Where-Object { $_ } | Select-Object -Unique
+        foreach ($dd in $dumpDirs) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $dd -File -Force -ErrorAction SilentlyContinue | Select-Object -First 3000)) {
+                $bn = [IO.Path]::GetFileNameWithoutExtension($f.Name).ToLowerInvariant()
+                if ($f.Extension -eq '.dmp' -and $bn -match 'lsass') { Add-Sus 'Zrzut pamięci procesu lsass (hasła i bilety Kerberos)' $f.FullName "$([math]::Round($f.Length / 1MB)) MB, $(D $f.LastWriteTime)" 'Krytyczne' }
+                elseif ($f.Extension -eq '.dmp' -and $f.Length -gt 20MB) { Add-Sus 'Duży zrzut pamięci w katalogu ogólnym' $f.FullName "$([math]::Round($f.Length / 1MB)) MB, $(D $f.LastWriteTime)" 'Uwaga' }
+                elseif ($f.Extension -match '^\.(exe|ps1|dll)$' -and $bn -match $offRx) { Add-Sus 'Plik narzędzia ofensywnego / podwójnego zastosowania' $f.FullName "$([math]::Round($f.Length / 1KB)) KB, $(D $f.LastWriteTime)" $(if ($bn -match $hardTools) { 'Krytyczne' } else { 'Uwaga' }) }
+            }
+        }
+
+        # 8) Microsoft Defender: wykrycia, wyłączenie ochrony, dodane wykluczenia (pola zdarzeń – niezależne od języka)
+        $dEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1006, 1007, 1015, 1116, 1117, 5001, 5007, 5010, 5012; StartTime = $since } -MaxEvents 500 -ErrorAction SilentlyContinue)
+        $det = @{}; $off = @{}
+        foreach ($e in $dEv) {
+            $d = EvData $e
+            if ($e.Id -in 1006, 1007, 1015, 1116, 1117) {
+                $tn = "$($d['Threat Name'])"; if (-not $tn) { $tn = "zdarzenie $($e.Id)" }
+                if (-not $det.ContainsKey($tn)) { $det[$tn] = @{ N = 0; Last = $e.TimeCreated; Sev = "$($d['Severity Name'])"; Path = "$($d['Path'])"; Act = ''; Ids = @() } }
+                $x = $det[$tn]; $x.N++; $x.Ids += $e.Id
+                if ($e.Id -in 1007, 1117) { $x.Act = "$($d['Action Name'])" }
+            }
+            elseif ($e.Id -eq 5007) {
+                $nv = "$($d['New Value'])"
+                $byPol = $nv -match '(?i)\\Policies\\'   # zmiana z zasad grupy / Intune – zamierzona konfiguracja
+                if ($nv -match '(?i)\\Exclusions\\(Paths|Processes|Extensions|IpAddresses)\\(.+?)( = |$)') { Add-Sus 'Defender: dodano wykluczenie' $Matches[2] "$(D $e.TimeCreated) – $($Matches[1])$(if ($byPol) { ' (zasady grupy)' })" $(if ($byPol) { 'Info' } else { 'Uwaga' }) }
+                elseif ($nv -match '(?i)\\(DisableRealtimeMonitoring|DisableAntiSpyware|DisableAntiVirus|DisableBehaviorMonitoring|DisableIOAVProtection|DisableOnAccessProtection|DisableScriptScanning|ForceDefenderPassiveMode) = 0x1\b|\\(TamperProtection) = 0x[04]\b') {
+                    $what = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+                    # TamperProtection 0x0/0x4 zapisuje też instalacja platformy – liczy się tylko zmiana z włączonej (0x1/0x5)
+                    if ($what -eq 'TamperProtection' -and "$($d['Old Value'])" -notmatch '(?i)\\TamperProtection = 0x[15]\b') { continue }
+                    Add-Sus 'Defender: wyłączono ochronę w konfiguracji' $what "$(D $e.TimeCreated)$(if ($byPol) { ' (zasady grupy)' })" $(if ($byPol) { 'Info' } else { 'Uwaga' })
+                }
+            }
+            else { if (-not $off.ContainsKey($e.Id)) { $off[$e.Id] = @{ N = 0; Last = $e.TimeCreated } }; $off[$e.Id].N++ }
+        }
+        foreach ($id in $off.Keys) { Add-Sus 'Defender: ochrona lub skanowanie wyłączone' "zdarzenie $id" "$($off[$id].N)×, ostatnio $(D $off[$id].Last)" 'Uwaga' }
+        foreach ($tn in $det.Keys) {
+            $x = $det[$tn]
+            $lvl = if ($x.Sev -match '(?i)severe|high') { 'Krytyczne' } elseif ($x.Sev -match '(?i)low') { 'Info' } else { 'Uwaga' }
+            Add-Sus 'Defender: wykryte zagrożenie' $tn "$($x.N)×, ostatnio $(D $x.Last), waga: $($x.Sev)$(if ($x.Act) { ", działanie: $($x.Act)" })$(if ($x.Path) { ", $($x.Path)" })" $lvl
+        }
+
+        # 9) PowerShell sam oznacza skrypty z podejrzaną treścią (4104, poziom Ostrzeżenie) – także bez włączonego logowania skryptów
+        $psEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; Level = 3; StartTime = $since } -MaxEvents 1000 -ErrorAction SilentlyContinue)
+        $blocks = @{}
+        foreach ($e in $psEv) {
+            $d = EvData $e
+            $id = "$($d['ScriptBlockId'])"; $txt = "$($d['ScriptBlockText'])"
+            if (-not $blocks.ContainsKey($id)) { $blocks[$id] = @{ T = $e.TimeCreated; Text = ''; Own = $false; Path = "$($d['Path'])" } }
+            if ($txt -match 'param\(\[int\]\$Days, \[string\[\]\]\$Folders') { $blocks[$id].Own = $true }   # kolektor tego programu (starsze wersje)
+            if (-not $blocks[$id].Text -or "$($d['MessageNumber'])" -eq '1') { $blocks[$id].Text = $txt }   # długi skrypt = kilka zdarzeń; część 1 to jego początek
+        }
+        $own = @($blocks.Values | Where-Object { $_.Own }).Count
+        $foreign = @($blocks.Values | Where-Object { -not $_.Own } | Group-Object { $_.Text } | ForEach-Object { @($_.Group | Sort-Object { $_.T } -Descending)[0] } | Sort-Object { $_.T } -Descending)
+        # Wbudowana lista słów PowerShella łapie też zwykłe narzędzia administracyjne – tu tylko informacja; stacja podnosi poziom,
+        # gdy treść skryptu pasuje do wzorców ataku (pobieranie i wykonywanie kodu, zaciemnianie, obejście AMSI)
+        foreach ($f0 in @($foreign | Select-Object -First 25)) { Add-Sus 'PowerShell: skrypt oznaczony jako podejrzany (4104)' "$(D $f0.T)$(if ($f0.Path) { " $($f0.Path)" })" $f0.Text 'Info' 1500 }
+        if ($foreign.Count -gt 25) { Add-Sus 'PowerShell: skrypty oznaczone jako podejrzane (4104)' "$($foreign.Count) różnych skryptów" 'pokazano 25 najnowszych' 'Info' }
+        if ($own) { Add-Sus 'PowerShell: oznaczone skrypty poprzedniej wersji ServerReview' "$own" 'starsza wersja kolektora wywoływała ostrzeżenia 4104 – ta wersja już nie' 'Info' }
+
+        # 10) Udane logowania RDP z adresów publicznych (nieudane są w sekcji zdarzeń bezpieczeństwa)
+        $ms = [int64]($now - $since).TotalMilliseconds
+        $xp = "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $ms]]] and *[EventData[Data[@Name='LogonType']='10']]"
+        $rdp = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 2000 -ErrorAction SilentlyContinue)
+        $pub = @{}
+        foreach ($e in $rdp) {
+            $d = EvData $e
+            $ip = ("$($d['IpAddress'])" -replace '^::ffff:', '').Trim()
+            if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or $ip -match '^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)') { continue }
+            $k = "$($d['TargetDomainName'])\$($d['TargetUserName']) z $ip"
+            if (-not $pub.ContainsKey($k)) { $pub[$k] = @{ N = 0; Last = $e.TimeCreated } }
+            $pub[$k].N++
+        }
+        foreach ($k in $pub.Keys) { Add-Sus 'Udane logowanie RDP z adresu publicznego' $k "$($pub[$k].N)×, ostatnio $(D $pub[$k].Last)" 'Krytyczne' }
+
+        # 11) Serwer plików bez kopii w tle (ochrona przed skutkami ransomware) – tylko informacja
+        if (@($shares | Where-Object { $_ -and "$($_.Name)" -notmatch '^(SYSVOL|NETLOGON|CertEnroll|REMINST|WsusContent|UpdateServicesPackages|WSUSTemp)$' -and -not "$($_.Name)".EndsWith('$') }).Count) {
+            $sc = @(Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue).Count
+            $vss = $allSvc | Where-Object { $_.Name -eq 'VSS' } | Select-Object -First 1
+            if (-not $sc) { Add-Sus 'Brak kopii w tle na serwerze z udziałami' 'Kopie w tle' "usługa VSS: $($vss.StartMode)$(if ($vss -and $vss.StartMode -eq 'Disabled') { ' – wyłączona' })" 'Info' }
+        }
+
+        # 12) ServiceDll usług uruchamianych w svchost: ścieżka usługi pokazuje tylko svchost.exe, a właściwy kod (SYSTEM) jest w DLL
+        try {
+            $svcRoot = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction Stop
+            foreach ($n in $svcRoot.GetSubKeyNames()) {
+                $k = $svcRoot.OpenSubKey($n); if (-not $k) { continue }
+                $dll = $null
+                try {
+                    $pk = $k.OpenSubKey('Parameters'); if ($pk) { $dll = $pk.GetValue('ServiceDll'); $pk.Close() }
+                    if (-not $dll) { $dll = $k.GetValue('ServiceDll') }
+                } finally { $k.Close() }
+                if (-not $dll) { continue }
+                $p = [Environment]::ExpandEnvironmentVariables("$dll".Trim().Trim('"')) -replace '^\\\?\?\\', ''
+                if ($p.StartsWith($sys32 + '\', [StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($wow64 + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+                $si = Get-SignInfo $p
+                $lvl = Get-ModuleLevel $si $p; if (-not $lvl) { $lvl = 'Uwaga' }
+                Add-Sus 'Biblioteka usługi (ServiceDll) poza katalogiem systemowym' $n "$p$(if (-not $si.Exists) { ' – plik nie istnieje' } elseif ($si.Signer) { " – podpis: $($si.Signer)" } elseif ($si.Valid -eq $false) { ' – brak ważnego podpisu' })" $lvl
+            }
+        } catch { }
+
+        # 13) Ukryte zadania harmonogramu: wpis w TaskCache\Tree bez deskryptora zabezpieczeń (SD) działa, ale nie widać go
+        #     w schtasks ani w konsoli (technika „Tarrask”)
+        try {
+            $treeRoot = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree' -ErrorAction Stop
+            $stack = New-Object 'System.Collections.Generic.Stack[object]'
+            $stack.Push(@{ K = $treeRoot; P = ''; Own = $false })
+            $hidden = New-Object System.Collections.Generic.List[string]; $nk = 0
+            while ($stack.Count -and $nk -lt 5000) {
+                $it = $stack.Pop(); $nk++
+                try {
+                    foreach ($sn in $it.K.GetSubKeyNames()) {
+                        $sk = $it.K.OpenSubKey($sn); if (-not $sk) { continue }
+                        $tp = "$($it.P)\$sn"
+                        if ($null -ne $sk.GetValue('Id')) { if ($null -eq $sk.GetValue('SD')) { $hidden.Add($tp) }; $sk.Close() }
+                        else { $stack.Push(@{ K = $sk; P = $tp; Own = $true }) }
+                    }
+                } finally { if ($it.Own) { $it.K.Close() } }
+            }
+            foreach ($h in $hidden) { Add-Sus 'Ukryte zadanie harmonogramu (brak deskryptora SD)' $h 'zadanie działa, ale nie widać go w schtasks ani w konsoli – sposób ukrywania trwałości' 'Krytyczne' }
+        } catch { }
+
+        # 14) Plik hosts: domeny aktualizacji i producentów ochrony skierowane gdzie indziej (blokada aktualizacji, odcięcie agenta)
+        try {
+            $hf = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+            $hLines = @(); if (Test-Path -LiteralPath $hf) { $hLines = @([IO.File]::ReadAllLines($hf)) }
+            $avDom = '(?i)(windowsupdate|update\.microsoft|download\.microsoft|delivery\.mp\.microsoft|wdcp\.microsoft|wdcpalt|smartscreen|definitionupdates|securitycenter\.windows|endpoint\.security\.microsoft|sophos|\.eset\.|eset\.com|kaspersky|bitdefender|gravityzone|mcafee|trellix|symantec|broadcom|crowdstrike|sentinelone|trendmicro|avast|avg\.com|fortinet|forticlient|malwarebytes|webroot|cylance|paloaltonetworks|withsecure|f-secure)'
+            $ent = 0; $sink = New-Object System.Collections.Generic.List[string]; $redir = New-Object System.Collections.Generic.List[string]
+            foreach ($l in $hLines) {
+                $t = ($l -replace '#.*$', '').Trim(); if (-not $t) { continue }
+                $parts = @($t -split '\s+'); if ($parts.Count -lt 2) { continue }
+                $ent++
+                $ip = $parts[0]
+                foreach ($hn in $parts[1..($parts.Count - 1)]) {
+                    if ($hn -notmatch $avDom) { continue }
+                    if ($ip -match '^(0\.0\.0\.0|127\.|::1?$|::$)') { $sink.Add("$hn → $ip") } else { $redir.Add("$hn → $ip") }
+                }
+            }
+            if ($sink.Count) { Add-Sus 'Plik hosts: zablokowane domeny aktualizacji lub ochrony' (@($sink | Select-Object -First 5) -join ', ') "$($sink.Count) wpisów kieruje na adres lokalny – serwer nie pobierze aktualizacji albo agent ochrony nie połączy się z konsolą" 'Krytyczne' }
+            if ($redir.Count) { Add-Sus 'Plik hosts: przekierowane domeny aktualizacji lub ochrony' (@($redir | Select-Object -First 5) -join ', ') 'sprawdź, czy przekierowanie jest zamierzone (np. lokalny serwer pośredniczący)' 'Uwaga' }
+            if (-not ($sink.Count -or $redir.Count) -and $ent -gt 20) { Add-Sus 'Plik hosts: dużo wpisów' "$ent" 'wpisy w hosts omijają DNS – sprawdź, czy są potrzebne' 'Info' }
+        } catch { }
+
+        # 15) Zaufane główne urzędy certyfikacji: certyfikat narzędzia przechwytującego TLS albo z kluczem prywatnym (poza serwerem CA)
+        try {
+            $isCa = [bool](Get-Service CertSvc -ErrorAction SilentlyContinue)
+            foreach ($c in @(Get-ChildItem -LiteralPath 'Cert:\LocalMachine\Root' -ErrorAction Stop)) {
+                $sub = "$($c.Subject)"
+                if ($sub -match '(?i)fiddler|do_not_trust|burp|portswigger|mitmproxy|charles proxy|proxyman|http toolkit') { Add-Sus 'Zaufany certyfikat narzędzia przechwytującego ruch TLS' $sub "odcisk $($c.Thumbprint), ważny od $(D $c.NotBefore)" 'Krytyczne' }
+                elseif ($c.HasPrivateKey -and -not $isCa) { Add-Sus 'Zaufany główny certyfikat z kluczem prywatnym' $sub "odcisk $($c.Thumbprint) – kto ma ten klucz, wystawi certyfikat zaufany przez ten serwer" 'Uwaga' }
+            }
+        } catch { }
+
+        # 16) Wtyczka serwera DNS (ServerLevelPluginDll): DLL ładowany do dns.exe jako SYSTEM – znana droga od DnsAdmins do kontrolera domeny
+        $dnsPlug = "$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\DNS\Parameters' 'ServerLevelPluginDll')".Trim()
+        if ($dnsPlug) {
+            $p = Resolve-ModulePath $dnsPlug; $si = Get-SignInfo $p
+            $lvl = Get-ModuleLevel $si $p; if (-not $lvl -or $lvl -eq 'Info') { $lvl = 'Uwaga' }
+            Add-Sus 'Wtyczka serwera DNS (ServerLevelPluginDll)' $p "$(if (-not $si.Exists) { 'plik nie istnieje' } elseif ($si.Signer) { "podpis: $($si.Signer)" } else { 'bez podpisu' }) – DLL ładowany przez usługę DNS z uprawnieniami SYSTEM" $lvl
+        }
+        [object[]]$sus.ToArray()
     })
 
     # ── Sesje użytkowników ──
@@ -1286,6 +2396,8 @@ $Collector = {
     [pscustomobject]@{
         System         = [pscustomobject]$sys
         Hardening      = $hardening
+        Protection     = [object[]]$protection.ToArray()
+        SecInventory   = [object[]]@($secInventory)
         Disks          = $disks
         Network        = $network
         Listening      = $listening
@@ -1311,8 +2423,10 @@ $Collector = {
         Crashes        = $crashes
         DiskHealth     = $diskHealth
         DomainController = $dcRows
+        ADSecurity     = $adSec
         Exposure       = $exposure
         Persistence    = $persistence
+        Suspicious     = $suspicious
         VMStorage      = $vmStorage
         Downtime       = $downtime
         Cluster        = [object[]]@($clusterRows)
@@ -1382,6 +2496,42 @@ function ConvertFrom-ServerJson([string]$Json, [string[]]$ArrayKeys) {
     }
     $d | Add-Member -NotePropertyName _Present -NotePropertyValue $present -Force
     $d
+}
+
+function Merge-PrevSections {
+    <#
+        Porównanie po sekcji pominiętej albo niezebranej: jeśli w poprzedniej migawce danej sekcji nie ma (odznaczona w ustawieniach,
+        błąd zbierania, starsza wersja), a w bieżącym skanie jest – bierzemy ją z najnowszej starszej migawki, w której była zebrana.
+        Dzięki temu zmiany z okresu, gdy sekcja była pominięta, nie giną. $Older: udane migawki starsze niż poprzednia (od najnowszej).
+    #>
+    param($Cur, $Prev, [string[]]$Older, [string[]]$Keys, [string[]]$ArrayKeys)
+    if (-not $Cur -or -not $Prev -or -not @($Older).Count) { return $Prev }
+    $has = { param($o, $k) (@($o.PSObject.Properties['Skipped'].Value) -notcontains $k) -and (@($o.PSObject.Properties['Failed'].Value) -notcontains $k) -and (@($o.PSObject.Properties['_Present'].Value) -contains $k) }
+    $need = New-Object System.Collections.Generic.List[string]
+    foreach ($k in $Keys) { if ((& $has $Cur $k) -and -not (& $has $Prev $k)) { $need.Add($k) } }
+    if (-not $need.Count) { return $Prev }
+    $verC = "$($Cur.PSObject.Properties['CollectorVersion'].Value)"
+    if ("$($Prev.PSObject.Properties['CollectorVersion'].Value)" -ne $verC) { return $Prev }   # i tak nie porównujemy
+    $from = @{}
+    foreach ($f in @($Older)) {
+        if (-not $need.Count) { break }
+        $o = $null
+        try { $o = ConvertFrom-ServerJson (Read-SnapshotText $f) $ArrayKeys } catch { continue }
+        if ($o.PSObject.Properties['Offline'] -and $o.Offline) { continue }
+        if ("$($o.PSObject.Properties['CollectorVersion'].Value)" -ne $verC) { break }   # starsze migawki mają inny format wierszy
+        $date = ([IO.File]::GetLastWriteTime($f)).ToString('yyyy-MM-dd HH:mm')
+        foreach ($k in @($need.ToArray())) {
+            if (& $has $o $k) { $Prev | Add-Member -NotePropertyName $k -NotePropertyValue @($o.$k) -Force; $from[$k] = $date; [void]$need.Remove($k) }
+        }
+    }
+    if ($from.Count) {
+        # sekcje dołożone ze starszej migawki nie są już „pominięte” ani „niezebrane”
+        $Prev | Add-Member -NotePropertyName Skipped -NotePropertyValue ([string[]]@(@($Prev.PSObject.Properties['Skipped'].Value) | Where-Object { $_ -and -not $from.ContainsKey("$_") })) -Force
+        $Prev | Add-Member -NotePropertyName Failed -NotePropertyValue ([string[]]@(@($Prev.PSObject.Properties['Failed'].Value) | Where-Object { $_ -and -not $from.ContainsKey("$_") })) -Force
+        $Prev | Add-Member -NotePropertyName _Present -NotePropertyValue ([string[]]@(@($Prev._Present) + @($from.Keys) | Select-Object -Unique)) -Force
+        $Prev | Add-Member -NotePropertyName _PrevFrom -NotePropertyValue $from -Force
+    }
+    $Prev
 }
 
 function Get-SnapshotSummary([string]$Path) {
@@ -1823,6 +2973,7 @@ try {
                 $res.Ok = $true
                 $res.PrevFile = "$($Opt.PrevFile)"
                 if ($Opt.PrevFile) { try { $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $Opt.PrevFile) $Opt.ArrayKeys } catch {} }
+                if ($res.Prev) { try { $res.Prev = Merge-PrevSections $d $res.Prev $Opt.OlderFiles $Opt.DiffKeys $Opt.ArrayKeys } catch {} }
             }
         }
         if (-not $res.Ok -and $res.ErrorId -in 'CollectorFatal', 'ParseError', 'NoData') {
@@ -1864,7 +3015,11 @@ try {
                 if ($files[$j].Offline) { continue }
                 try {
                     if ($isOff) { $res.Last = Get-SnapshotSummary $files[$j].Path }
-                    else { $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $files[$j].Path) $Opt.ArrayKeys; $res.PrevFile = $files[$j].Path }
+                    else {
+                        $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $files[$j].Path) $Opt.ArrayKeys; $res.PrevFile = $files[$j].Path
+                        $on = @($Opt.OnlineFiles); $ix = [array]::IndexOf([string[]]$on, [string]$res.PrevFile)
+                        if ($ix -ge 0 -and $ix + 1 -lt $on.Count) { try { $res.Prev = Merge-PrevSections $res.Data $res.Prev ([string[]]$on[($ix + 1)..($on.Count - 1)]) $Opt.DiffKeys $Opt.ArrayKeys } catch {} }
+                    }
                     break
                 } catch { }
             }
@@ -1877,7 +3032,7 @@ try {
 $res.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 [pscustomobject]$res
 '@
-$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics'
+$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics'
 # Pełna definicja funkcji z drzewa składni (razem z deklaracją parametrów)
 $script:WorkerScript = $script:WorkerParams + "`n" + ((@($script:WorkerFunctionNames | ForEach-Object { (Get-Item "function:$_").ScriptBlock.Ast.Extent.Text })) -join "`n`n") + "`n" + $script:WorkerBody
 #endregion
@@ -1889,6 +3044,7 @@ $script:Sections = @(
     @{ Key = 'History';        Header = 'Historia skanów i dostępność'; Computed = $true }
     @{ Key = 'Changes';        Header = 'Zmiany od poprzedniego skanu' }
     @{ Key = 'System';         Header = 'System' }
+    @{ Key = 'Protection';     Header = 'Ochrona: antywirus, EDR, zapora' }
     @{ Key = 'Hardening';      Header = 'Konfiguracja bezpieczeństwa' }
     @{ Key = 'EventLogs';      Header = 'Dzienniki zdarzeń' }
     @{ Key = 'AuditPolicy';    Header = 'Polityka audytu' }
@@ -1913,9 +3069,11 @@ $script:Sections = @(
     @{ Key = 'Shares';         Header = 'Udziały' }
     @{ Key = 'Autostart';      Header = 'Autostart' }
     @{ Key = 'Persistence';    Header = 'Trwałość (WMI, wykluczenia AV)' }
+    @{ Key = 'Suspicious';     Header = 'Podejrzane (wskaźniki naruszenia)' }
     @{ Key = 'Certificates';   Header = 'Certyfikaty' }
     @{ Key = 'Folders';        Header = 'Foldery' }
     @{ Key = 'DomainController'; Header = 'Kontroler domeny' }
+    @{ Key = 'ADSecurity';     Header = 'Active Directory: bezpieczeństwo domeny' }
     @{ Key = 'HvHost';         Header = 'Hyper-V: host i pojemność'; Computed = $true }
     @{ Key = 'Cluster';        Header = 'Klaster Hyper-V' }
     @{ Key = 'HyperV';         Header = 'Hyper-V: maszyny' }
@@ -1996,7 +3154,8 @@ $script:Headers = @{
     Owner = 'Właściciel'; Parent = 'Checkpoint nadrzędny'; StateSince = 'W tym stanie od'; MemMaxGB = 'RAM maks. [GB]'; MemDemandGB = 'RAM zapotrzebowanie [GB]'
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
-    Truncated = 'Limit zdarzeń osiągnięty'
+    Truncated = 'Limit zdarzeń osiągnięty'; Component = 'Składnik'; Product = 'Produkt'; AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'
+    FirewallManagedBy = 'Zapora zarządzana przez'; GroupSID = 'SID grupy'
 }
 #endregion
 
@@ -2223,6 +3382,16 @@ function Get-SnapshotEntries([string]$Name) {
     $l = $script:SnapIndex[(Get-SnapshotKey $Name)]
     if ($l) { @($l) } else { @() }
 }
+function Get-OlderOnlineSnapshots([string]$Name, [string]$AfterPath, [int]$Max = 8) {
+    # Udane migawki starsze niż $AfterPath (od najnowszej) – źródło sekcji pominiętych w poprzednim skanie (Merge-PrevSections)
+    $out = New-Object System.Collections.Generic.List[string]
+    $seen = -not $AfterPath
+    foreach ($e in (Get-SnapshotEntries $Name)) {
+        if (-not $seen) { if ($e.Path -eq $AfterPath) { $seen = $true }; continue }
+        if (-not $e.Offline) { $out.Add($e.Path); if ($out.Count -ge $Max) { break } }
+    }
+    [string[]]$out.ToArray()
+}
 function Get-LastOnlineSnapshot([string]$Name, [string]$ExcludeDir = '') {
     foreach ($e in (Get-SnapshotEntries $Name)) { if (-not $e.Offline -and $e.Dir -ne $ExcludeDir -and (Test-Path -LiteralPath $e.Path)) { return $e.Path } }
     ''
@@ -2311,12 +3480,13 @@ $script:SettingDefs = @(
     @{ Group = 'Listy'; Key = 'IgnoredStoppedServices'; Type = 'list';    Label = 'Usługi automatyczne, których zatrzymanie jest OK (jedna na linię, wildcardy *)' }
     @{ Group = 'Listy'; Key = 'ExposedPorts';           Type = 'intlist'; Label = 'Porty wrażliwe dla sekcji Ekspozycja (jeden na linię)' }
     @{ Group = 'Listy'; Key = 'IgnoredWmiConsumers';    Type = 'list';    Label = 'Subskrypcje WMI traktowane jako systemowe (jedna na linię)' }
+    @{ Group = 'Listy'; Key = 'ApprovedRemoteTools';    Type = 'list';    Label = 'Zatwierdzone narzędzia zdalnego dostępu – tylko informacja, nie ostrzeżenie (jedno na linię, np. TeamViewer, Atera; wildcardy *)' }
 )
 $script:SectionGroups = [ordered]@{
     'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
-    'Bezpieczeństwo'       = @('Hardening', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
+    'Bezpieczeństwo'       = @('Protection', 'Hardening', 'Suspicious', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
-    'Role serwera'         = @('DomainController', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
+    'Role serwera'         = @('DomainController', 'ADSecurity', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
 }
 # Stan okna i blokady – zapisywane razem z ustawieniami, ale nie są „ustawieniami skanu”
 $script:UiState = [ordered]@{ WindowWidth = 1540; WindowHeight = 940; WindowMaximized = $false; LogVisible = $false; LogHeight = 200 }
@@ -2587,9 +3757,26 @@ function Invoke-ServerAnalysis {
     }
 
     # Grupy, konta
-    foreach ($r in $D.Admins) { if ($r.Member -match '^S-1-5-') { AddI 'Info' 'Uprawnienia' "Osierocony SID w grupie $($r.Group): $($r.Member)" 'Admins'; SetFlag $r 'info' } }
+    # Grupy obejmujące (prawie) wszystkich – rozpoznawane po SID, więc niezależnie od języka nazw
+    $wideSid = @{ 'S-1-1-0' = 'Wszyscy'; 'S-1-5-7' = 'logowanie anonimowe'; 'S-1-5-11' = 'Użytkownicy uwierzytelnieni'; 'S-1-5-32-545' = 'Użytkownicy'; 'S-1-5-4' = 'Interaktywni'; 'S-1-5-2' = 'Sieć' }
+    $wideRid = @{ '513' = 'Użytkownicy domeny'; '514' = 'Goście domeny'; '515' = 'Komputery domeny' }
+    foreach ($r in $D.Admins) {
+        $ms = "$($r.PSObject.Properties['SID'].Value)"; $gs = "$($r.PSObject.Properties['GroupSID'].Value)"
+        $wide = if ($wideSid.ContainsKey($ms)) { $wideSid[$ms] } elseif ($ms -match '^S-1-5-21-[\d-]+-(51[345])$') { $wideRid[$Matches[1]] } else { '' }
+        if ($wide -and $gs -eq 'S-1-5-32-544') { AddI 'Krytyczny' 'Uprawnienia' "W grupie $($r.Group) jest $($r.Member) ($wide) – administratorem serwera jest praktycznie każdy" 'Admins'; SetFlag $r 'crit' }
+        elseif ($wide -and $gs -eq 'S-1-5-32-580') { AddI 'Ostrzeżenie' 'Uprawnienia' "W grupie $($r.Group) jest $($r.Member) ($wide) – zdalne zarządzanie (WinRM) dla wszystkich" 'Admins'; SetFlag $r 'warn' }
+        elseif ($wide) { SetFlag $r 'info' }   # Użytkownicy pulpitu zdalnego – typowe na serwerach sesji RDS
+        elseif ($r.Member -match '^S-1-5-') { AddI 'Info' 'Uprawnienia' "Osierocony SID w grupie $($r.Group): $($r.Member)" 'Admins'; SetFlag $r 'info' }
+    }
     foreach ($r in $D.LocalUsers) {
         if ($r.Enabled -eq 'Tak' -and "$($r.SID)" -like '*-501') { AddI 'Ostrzeżenie' 'Konta' "Włączone konto Gość ($($r.Name))" 'LocalUsers'; SetFlag $r 'warn' }
+        elseif ($r.Enabled -eq 'Tak' -and "$($r.SID)" -like 'S-1-5-21-*-500') {
+            # wbudowany administrator z hasłem sprzed roku – zwykle to samo hasło z obrazu systemu na wielu serwerach (bez LAPS)
+            $pt = [datetime]::MinValue
+            if ([datetime]::TryParseExact("$($r.PasswordLastSet)", 'yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$pt) -and ((Get-Date) - $pt).TotalDays -gt 365) {
+                AddI 'Ostrzeżenie' 'Konta' "Wbudowane konto administratora ($($r.Name)) jest włączone, a jego hasło nie było zmieniane od $([int]((Get-Date) - $pt).TotalDays) dni – to samo hasło na wielu serwerach ułatwia ruch boczny (LAPS)" 'LocalUsers'; SetFlag $r 'warn'
+            }
+        }
         elseif ($r.Enabled -eq 'Tak' -and $r.PasswordNeverExpires -eq 'Tak') { SetFlag $r 'info' }
     }
     $pne = @($D.LocalUsers | Where-Object { $_.Enabled -eq 'Tak' -and $_.PasswordNeverExpires -eq 'Tak' })
@@ -2654,13 +3841,33 @@ function Invoke-ServerAnalysis {
         if ([double]$r.AgeDays -gt $C.CheckpointWarnDays) { AddI 'Ostrzeżenie' 'Hyper-V' "Checkpoint '$($r.Name)' na $($r.VM) ma $([math]::Floor([double]$r.AgeDays)) dni" 'Checkpoints'; SetFlag $r 'warn' }
     }
 
+    # Ochrona: antywirus/EDR (także innych producentów) i zapora – ocena wyliczona na serwerze z uwzględnieniem produktów innych firm
+    foreach ($r in @($D.PSObject.Properties['Protection'].Value | Where-Object { $_ })) {
+        $txt = "$($r.Component)$(if ($r.Product -and "$($r.Component)" -notlike "*$($r.Product)*") { " ($($r.Product))" }): $($r.State)$(if ($r.Detail) { " – $(Get-ShortText $r.Detail 200)" })"
+        switch ($r.Status) {
+            'Krytyczne' { AddI 'Krytyczny' 'Ochrona' $txt 'Protection'; SetFlag $r 'crit' }
+            'Uwaga'     { AddI 'Ostrzeżenie' 'Ochrona' $txt 'Protection'; SetFlag $r 'warn' }
+            'Info'      { SetFlag $r 'info' }
+        }
+    }
+
     # Konfiguracja bezpieczeństwa
+    # 'Zalecenie' = warto poprawić, ale bez pilności: jedna zbiorcza informacja na serwer zamiast wielu ostrzeżeń na całej flocie
+    $recs = New-Object System.Collections.Generic.List[string]
     foreach ($r in $D.Hardening) {
         switch ($r.Status) {
             'Krytyczne' { AddI 'Krytyczny' 'Konfiguracja' "$($r.Check): $($r.Value)" 'Hardening'; SetFlag $r 'crit' }
             'Uwaga'     { AddI 'Ostrzeżenie' 'Konfiguracja' "$($r.Check): $($r.Value)" 'Hardening'; SetFlag $r 'warn' }
+            'Zalecenie' { $recs.Add("$($r.Check)"); SetFlag $r 'info' }
             'Info'      { SetFlag $r 'info' }
         }
+    }
+    if ($recs.Count) { AddI 'Info' 'Zalecenia' ("Do utwardzenia ($($recs.Count)): " + (Join-Short $recs 4)) 'Hardening' }
+
+    # Active Directory: wiersze oznaczamy na każdym kontrolerze, a problemy zgłaszamy raz na domenę (Update-VmIndex)
+    foreach ($r in @($D.PSObject.Properties['ADSecurity'].Value)) {
+        if (-not $r) { continue }
+        switch ("$($r.Status)") { 'Krytyczne' { SetFlag $r 'crit' } 'Uwaga' { SetFlag $r 'warn' } 'Zalecenie' { SetFlag $r 'info' } 'Info' { SetFlag $r 'info' } }
     }
 
     # Kontroler domeny (ten sam układ co konfiguracja bezpieczeństwa)
@@ -2813,7 +4020,49 @@ function Invoke-ServerAnalysis {
         if (@(("$($r.Name)" -split ' -> ') | Where-Object { $ign -notcontains $_ }).Count) { SetFlag $r 'info' }
     }
     $exc = @($D.Persistence | Where-Object { "$($_.Type)" -like 'Defender*' })
-    if ($exc.Count) { AddI 'Info' 'Bezpieczeństwo' ("Wykluczenia Defendera ($($exc.Count)): " + (Join-Short ($exc | ForEach-Object { $_.Name }) 4)) 'Persistence'; foreach ($r in $exc) { SetFlag $r 'info' } }
+    # zbyt szerokie wykluczenia – typowe dla atakującego albo „szybkiej naprawy” wydajności, która wyłącza ochronę całego obszaru
+    $wide = @(foreach ($r in $exc) { $w = Get-RiskyExclusion $r; if ($w) { SetFlag $r 'warn'; [pscustomobject]@{ R = $r; Why = $w } } })
+    foreach ($x in $wide) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Zbyt szerokie wykluczenie Defendera: $($x.R.Name) ($($x.Why)) – pliki z tego obszaru nie są skanowane" 'Persistence' }
+    $rest = @($exc | Where-Object { "$($_.Flag)" -ne 'warn' })
+    if ($rest.Count) { AddI 'Info' 'Bezpieczeństwo' ("Wykluczenia Defendera ($($rest.Count)): " + (Join-Short ($rest | ForEach-Object { $_.Name }) 4)) 'Persistence'; foreach ($r in $rest) { SetFlag $r 'info' } }
+
+    # Podejrzane linie poleceń w usługach, zadaniach, autostarcie, konsumentach WMI i instalacjach usług (7045/4697)
+    foreach ($src in @(
+        @{ Rows = @($D.Services); Field = 'Path'; Sec = 'Services'; What = 'Usługa'; NameF = 'Name'; Svc = $true }
+        @{ Rows = @($D.Tasks); Field = 'Action'; Sec = 'Tasks'; What = 'Zadanie'; NameF = 'Path'; Svc = $false }
+        @{ Rows = @($D.Autostart); Field = 'Command'; Sec = 'Autostart'; What = 'Autostart'; NameF = 'Name'; Svc = $false }
+        @{ Rows = @($D.Persistence | Where-Object { "$($_.Type)" -like 'WMI – konsument*' }); Field = 'Detail'; Sec = 'Persistence'; What = 'Subskrypcja WMI'; NameF = 'Name'; Svc = $false }
+        @{ Rows = @($D.SecurityEvents | Where-Object { $_ -and [int]$_.Id -in 7045, 4697 }); Field = 'Detail'; Sec = 'SecurityEvents'; What = 'Instalacja usługi'; NameF = 'Time'; Svc = $true }
+    )) {
+        foreach ($r in $src.Rows) {
+            if (-not $r) { continue }
+            $hit = Get-SuspiciousCommand "$($r.($src.Field))" $src.Svc
+            if (-not $hit) { continue }
+            if ($hit.Sev -eq 'Info') { SetFlag $r 'info'; continue }   # tylko oznaczenie wiersza (np. ukryte okno PowerShella w zadaniu)
+            AddI $hit.Sev 'Podejrzane' "$($src.What) $($r.($src.NameF)): $($hit.Text) – $(Get-ShortText "$($r.($src.Field))" 160)" $src.Sec
+            SetFlag $r $(if ($hit.Sev -eq 'Krytyczny') { 'crit' } else { 'warn' })
+        }
+    }
+
+    # Wskaźniki naruszenia zebrane na serwerze (sekcja Podejrzane); zatwierdzone narzędzia zdalnego dostępu – tylko informacja
+    $approved = @($C.ApprovedRemoteTools | Where-Object { $_ })
+    foreach ($r in @($D.PSObject.Properties['Suspicious'].Value | Where-Object { $_ })) {
+        $lvl = "$($r.Level)"
+        if ("$($r.Type)" -eq 'Narzędzie zdalnego dostępu' -and @($approved | Where-Object { "$($r.Name)" -like $_ -or "$($r.Detail)" -like "*$_*" }).Count) { $lvl = 'Info' }
+        # Defender wyłącza się sam, gdy ochronę przejmuje inny antywirus – to nie sabotaż
+        if (("$($r.Type)" -like 'Defender: ochrona lub skanowanie wyłączone*' -or "$($r.Type)" -like 'Defender: wyłączono ochronę w konfiguracji*') -and $D.System -and "$($D.System.PSObject.Properties['AvThirdParty'].Value)") { $lvl = 'Info' }
+        # PowerShell oznacza jako podejrzane także zwykłe narzędzia – ostrzegamy dopiero, gdy treść pasuje do wzorców ataku
+        if ("$($r.Type)" -like 'PowerShell: skrypt oznaczony*') {
+            $hit = Get-SuspiciousCommand "$($r.Detail)" $false
+            if ($hit -and $hit.Sev -ne 'Info') { $lvl = $(if ($hit.Sev -eq 'Krytyczny') { 'Krytyczne' } else { 'Uwaga' }) }
+            elseif ("$($r.Detail)" -match $script:Ps4104AttackRx) { $lvl = 'Uwaga' }
+        }
+        $r.Level = $lvl   # ocena stacji widoczna w kolumnie Poziom, sortowaniu i eksportach
+        $sev = switch ($lvl) { 'Krytyczne' { 'Krytyczny' } 'Uwaga' { 'Ostrzeżenie' } default { 'Info' } }
+        if ($sev -eq 'Info') { SetFlag $r 'info'; continue }   # informacja – tylko oznaczenie wiersza (jak w pozostałych sekcjach)
+        AddI $sev 'Podejrzane' "$($r.Type): $($r.Name)$(if ("$($r.Detail)") { " – $(Get-ShortText $r.Detail 220)" })" 'Suspicious'
+        SetFlag $r $(if ($sev -eq 'Krytyczny') { 'crit' } else { 'warn' })
+    }
 
     # Sesje, połączenia, błędy zbierania
     # Rozłączona sesja nie ma nazwy sesji (kolumna SESSIONNAME w quser jest pusta) – niezależne od języka systemu
@@ -2842,6 +4091,9 @@ function Invoke-ServerAnalysis {
             if (@($D.PSObject.Properties['Failed'].Value) -contains $k -or @($Prev.PSObject.Properties['Failed'].Value) -contains $k) { continue }
             if (@($Prev._Present) -notcontains $k -or @($D._Present) -notcontains $k) { continue }
             $curRows = @($D.$k); $oldRows = @($Prev.$k)
+            # sekcja pominięta w poprzednim skanie – porównanie z ostatnim skanem, w którym była zebrana (Merge-PrevSections)
+            $pf = if ($Prev.PSObject.Properties['_PrevFrom'] -and $Prev._PrevFrom -and $Prev._PrevFrom[$k]) { "$($Prev._PrevFrom[$k])" } else { '' }
+            $chgSince = if ($pf) { "od skanu z $pf" } else { 'od poprzedniego skanu' }
             if ($def.Filter) { $curRows = @($curRows | Where-Object $def.Filter); $oldRows = @($oldRows | Where-Object $def.Filter) }
             $oldSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($r in $oldRows) { [void]$oldSet.Add((& $def.KeyFn $r)) }
@@ -2854,11 +4106,12 @@ function Invoke-ServerAnalysis {
                 if (-not $oldSet.Contains($key)) { $new.Add($key); SetFlag $r $fl }
             }
             $removed = @($oldSet | Where-Object { -not $curSet.Contains($_) })
-            foreach ($x in $new)     { $changes.Add([pscustomobject]@{ Section = $def.Label; Change = 'Nowe'; Item = $x; Flag = $fl }) }
-            foreach ($x in $removed) { $changes.Add([pscustomobject]@{ Section = $def.Label; Change = 'Usunięte'; Item = $x; Flag = '' }) }
-            if ($new.Count -gt 0 -and $new.Count -le 5) { foreach ($x in $new) { AddI $def.Sev 'Zmiany' "Nowe od poprzedniego skanu ($($def.Label)): $x" 'Changes' } }
-            elseif ($new.Count -gt 5) { AddI $def.Sev 'Zmiany' "$($new.Count) nowych pozycji ($($def.Label)), np.: $(Join-Short $new 3)" 'Changes' }
-            if ($removed.Count) { AddI 'Info' 'Zmiany' "Usunięte od poprzedniego skanu ($($def.Label)): $(Join-Short $removed 3)" 'Changes' }
+            $secLabel = if ($pf) { "$($def.Label) (względem skanu z $pf)" } else { $def.Label }
+            foreach ($x in $new)     { $changes.Add([pscustomobject]@{ Section = $secLabel; Change = 'Nowe'; Item = $x; Flag = $fl }) }
+            foreach ($x in $removed) { $changes.Add([pscustomobject]@{ Section = $secLabel; Change = 'Usunięte'; Item = $x; Flag = '' }) }
+            if ($new.Count -gt 0 -and $new.Count -le 5) { foreach ($x in $new) { AddI $def.Sev 'Zmiany' "Nowe $chgSince ($($def.Label)): $x" 'Changes' } }
+            elseif ($new.Count -gt 5) { AddI $def.Sev 'Zmiany' "$($new.Count) nowych pozycji $chgSince ($($def.Label)), np.: $(Join-Short $new 3)" 'Changes' }
+            if ($removed.Count) { AddI 'Info' 'Zmiany' "Usunięte $chgSince ($($def.Label)): $(Join-Short $removed 3)" 'Changes' }
         }
     }
     # PS 5.1: @(List[object]) rzuca "Argument types do not match" – stąd ToArray()
@@ -2866,6 +4119,52 @@ function Invoke-ServerAnalysis {
 
     return , @($list | Sort-Object Rank)
 }
+# Treść skryptu PowerShell typowa dla ataków (obejście AMSI, wstrzykiwanie do pamięci, kradzież poświadczeń) – sprawdzana na stacji
+$script:Ps4104AttackRx = '(?i)amsiutils|amsiinitfailed|amsiscanbuffer|invoke-mimikatz|sekurlsa|kerberos::|lsadump|virtualalloc|writeprocessmemory|createremotethread|reflection\.assembly\]::load\(|\[system\.convert\]::frombase64string|invoke-shellcode|powersploit|\.downloadstring\(|invoke-webrequest.+\|\s*iex'
+# Podejrzane linie poleceń (LOLBins, pobieranie i wykonywanie kodu, zdalne wykonywanie) – sprawdzane na stacji, nie na serwerze.
+# Sev: dla usług i instalacji usług (Svc) / dla zadań, autostartu i WMI (Other). Ostrożnie z fałszywymi alarmami: narzędzia wdrożeń
+# (SCCM, PDQ, skrypty GPO) używają PowerShella z -EncodedCommand i ukrytym oknem – w zadaniach to ostrzeżenie, nie alarm.
+$script:SusCmdRules = @(
+    @{ Rx = '\\\\127\.0\.0\.1\\(admin|c)\$\\|%COMSPEC%\s+/[cq]\s+.*\becho\b.*[>|]'; T = 'wzorzec zdalnego wykonywania poleceń (smbexec / PsExec / impacket)'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
+    @{ Rx = '\bmshta(\.exe)?["'']?\s+["'']?(https?:|javascript:|vbscript:)'; T = 'mshta uruchamia skrypt z sieci'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
+    @{ Rx = '\brundll32(\.exe)?["'']?\s+["'']?javascript:'; T = 'rundll32 uruchamia JavaScript'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
+    @{ Rx = '\bregsvr32(\.exe)?\b.*(/i:\s*["'']?https?:|scrobj\.dll)'; T = 'regsvr32 ładuje skrypt (Squiblydoo)'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
+    @{ Rx = '\bcertutil(\.exe)?\b.*\s[-/](urlcache|decode|decodehex)\b'; T = 'certutil pobiera lub dekoduje plik'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
+    @{ Rx = '(iex|invoke-expression)\b.*(downloadstring|downloaddata|net\.webclient|invoke-webrequest|invoke-restmethod|\biwr\b|\birm\b)|(downloadstring|downloadfile)\s*\(\s*["'']https?://'; T = 'PowerShell pobiera i wykonuje kod z sieci'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
+    @{ Rx = '\b(powershell|pwsh)(\.exe)?["'']?\s(.*\s)?[-/]e(c|n|nc|nco|ncod|ncode|ncoded|ncodedcommand)?\s+[A-Za-z0-9+/=]{24,}'; T = 'PowerShell z zakodowanym poleceniem (-EncodedCommand)'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
+    @{ Rx = '\bbitsadmin(\.exe)?\b.*\s/(transfer|addfile|setnotifycmdline)\b'; T = 'bitsadmin pobiera plik albo uruchamia polecenie'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
+    @{ Rx = 'frombase64string|(\[char\]\s*\d+\s*\+\s*){3}'; T = 'zaciemniony kod (Base64 albo [char])'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
+    @{ Rx = '\b(powershell|pwsh)(\.exe)?["'']?\s(.*\s)?-w(i|in|ind|indo|indow|indows|indowst|indowsty|indowstyl|indowstyle)?\s+h(idden)?\b'; T = 'PowerShell z ukrytym oknem'; Svc = 'Ostrzeżenie'; Other = 'Info' }
+    @{ Rx = '(^|[\s"''=])[a-z]:\\(users\\public|perflogs|windows\\temp|\$recycle\.bin)\\[^"'']*\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr)\b'; T = 'program w katalogu ogólnodostępnym albo tymczasowym'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
+    @{ Rx = '\\appdata\\(local|roaming)\\[^"'']*\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr)\b'; T = 'program w profilu użytkownika (AppData)'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
+    @{ Rx = '(^|[\s"''=])[a-z]:\\programdata\\[^\\"'' ]+\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr)\b'; T = 'program bezpośrednio w C:\ProgramData'; Svc = 'Ostrzeżenie'; Other = 'Ostrzeżenie' }
+)
+function Get-SuspiciousCommand([string]$Text, [bool]$Service) {
+    # Najpoważniejsza pasująca reguła albo $null
+    if (-not $Text) { return $null }
+    $rank = @{ 'Krytyczny' = 0; 'Ostrzeżenie' = 1; 'Info' = 2 }
+    $best = $null
+    foreach ($r in $script:SusCmdRules) {
+        if (-not [regex]::IsMatch($Text, $r.Rx, 'IgnoreCase')) { continue }
+        $sv = if ($Service) { $r.Svc } else { $r.Other }
+        if (-not $best -or $rank[$sv] -lt $rank[$best.Sev]) { $best = @{ Text = $r.T; Sev = $sv } }
+    }
+    $best
+}
+function Get-RiskyExclusion($Row) {
+    # Wykluczenie Defendera obejmujące cały dysk, katalogi systemowe/tymczasowe, interpretery skryptów albo rozszerzenia plików wykonywalnych
+    $n = ("$($Row.Name)".Trim().ToLowerInvariant() -replace '(\\\*(\.\*)?)+$', '').TrimEnd('\')   # c:\* = cały dysk, c:\windows\temp\* = katalog
+    $t = "$($Row.Type)"
+    if ($t -like '*ścieżka*') {
+        if ($n -match '^[a-z]:$') { return 'cały dysk' }
+        if ($n -match '^(%?[a-z]+%?|[a-z]:)\\(windows|windows\\temp|windows\\system32|users|users\\public|programdata|temp|perflogs|program files( \(x86\))?)$' -or $n -match '^%(temp|tmp|windir|systemroot|programdata|userprofile)%$') { return 'katalog systemowy albo tymczasowy' }
+        if ($n -match '\\appdata\\(local|roaming)(\\temp)?$') { return 'profil użytkownika' }
+    }
+    if ($t -like '*proces*' -and $n -match '(^|\\)(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|wmic|msiexec|certutil|bitsadmin)\.exe$') { return 'interpreter albo narzędzie systemowe' }
+    if ($t -like '*rozszerzenie*' -and $n.TrimStart('.') -in 'exe', 'dll', 'ps1', 'bat', 'cmd', 'vbs', 'js', 'hta', 'scr', 'msi') { return 'rozszerzenie plików wykonywalnych' }
+    ''
+}
+
 function Get-DiagClassText([string]$Class) {
     switch ($Class) {
         'Dns' { 'DNS' } 'Offline' { 'Nie odpowiada' } 'WinRM' { 'WinRM nie działa' } 'Firewall' { 'Zapora' } 'Auth' { 'Uprawnienia' }
@@ -3033,10 +4332,12 @@ function Update-VmIndex {
     $script:VmIndex = @{ ByName = $byName; ByGuest = $byGuest; ById = $byId; All = [object[]]$all.ToArray() }
     $cross = New-Object System.Collections.Generic.List[object]
     $addX = {
-        param($key, $sev, $msg, $sec, $srvText, $cat)
+        param($key, $sev, $msg, $sec, $srvText, $cat, [string[]]$altKeys)
         $i = New-Issue $key $sev $(if ($cat) { $cat } elseif ($sec -eq 'Cluster') { 'Klaster' } else { 'Hyper-V' }) $msg $sec
         if ($srvText) { $i.Server = $srvText; $i._Search = ("$srvText $($i.Category) $msg").ToLowerInvariant() }
-        if (-not (Test-IssueIgnored $key $i.IssueKey)) { $cross.Add($i) }
+        $ign = Test-IssueIgnored $key $i.IssueKey
+        foreach ($ak in @($altKeys)) { if (-not $ign -and $ak -and $ak -ne $key) { $ign = Test-IssueIgnored $ak $i.IssueKey } }   # np. inne kontrolery tej samej domeny
+        if (-not $ign) { $cross.Add($i) }
     }
     # Klastry: ocena raz na klaster, z danych węzła reprezentującego (pierwszy alfabetycznie z udanym skanem)
     $clusters = @{}
@@ -3083,6 +4384,49 @@ function Update-VmIndex {
     if ($dcCount -ge 2 -and $dcByHost.Count -eq 1) {
         $h = @($dcByHost.Keys)[0]
         & $addX (@($script:Servers | Where-Object { $dcByHost[$h] -contains $_.Display })[0].Name) 'Ostrzeżenie' "Wszystkie skanowane kontrolery domeny ($($dcByHost[$h] -join ', ')) działają na jednym hoście $h – jego awaria wyłączy logowanie w domenie" 'System' ''
+    }
+    # Active Directory: ocena raz na domenę – z PDC (rola 5), a gdy go nie skanowano albo sekcja się nie udała, z pierwszego alfabetycznie DC
+    $doms = @{}
+    foreach ($it in @($script:Servers)) {
+        $d = $script:Data[$it.Name]
+        if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['System'] -or -not $d.System -or -not $d.System.IsDC -or -not $d.PSObject.Properties['ADSecurity']) { continue }
+        if (@($d.PSObject.Properties['Failed'].Value) -contains 'ADSecurity' -or @($d.Skipped) -contains 'ADSecurity' -or -not @($d.ADSecurity | Where-Object { $_ }).Count) { continue }
+        $dn = "$($d.System.Domain)".ToLowerInvariant()
+        if (-not $doms.ContainsKey($dn)) { $doms[$dn] = New-Object System.Collections.Generic.List[object] }
+        $doms[$dn].Add(@{ Key = $it.Name; D = $d; Pdc = ([int]$d.System.PSObject.Properties['DomainRoleId'].Value -eq 5); Stale = [bool]($d.PSObject.Properties['_ScanNote'] -and $d._ScanNote) })
+    }
+    foreach ($dn in @($doms.Keys | Sort-Object)) {
+        $rep = @($doms[$dn] | Sort-Object { $_.Stale }, { -not $_.Pdc }, { $_.Key })[0]
+        $dcKeys = [string[]]@($doms[$dn] | ForEach-Object { $_.Key })
+        $recs = New-Object System.Collections.Generic.List[string]
+        foreach ($r in @($rep.D.ADSecurity | Where-Object { $_ })) {
+            switch ("$($r.Status)") {
+                'Krytyczne' { & $addX $rep.Key 'Krytyczny' "$($r.Check): $($r.Value)" 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys }
+                'Uwaga'     { & $addX $rep.Key 'Ostrzeżenie' "$($r.Check): $($r.Value)" 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys }
+                'Zalecenie' { $recs.Add("$($r.Check)") }
+            }
+        }
+        if ($recs.Count) { & $addX $rep.Key 'Info' ("Do utwardzenia w domenie ($($recs.Count)): " + (Join-Short $recs 4)) 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys }
+    }
+    # Ochrona – odstępstwo od floty: serwer bez agenta AV/EDR, który działa na co najmniej 80% serwerów (od 10 serwerów z danymi)
+    $inv = @{}; $invName = @{}; $withInv = New-Object System.Collections.Generic.List[object]
+    foreach ($it in @($script:Servers)) {
+        $d = $script:Data[$it.Name]
+        if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['SecInventory'] -or @($d.PSObject.Properties['Skipped'].Value) -contains 'Protection' -or @($d.PSObject.Properties['Failed'].Value) -contains 'Protection') { continue }
+        $run = @(@($d.SecInventory) | Where-Object { $_ -and "$($_.State)" -eq 'Running' -and "$($_.Type)" -match 'AV|EDR' -and "$($_.Id)" -ne 'MDAV' })
+        $withInv.Add(@{ It = $it; Ids = @($run | ForEach-Object { "$($_.Id)" } | Select-Object -Unique) })
+        foreach ($x in $run) { $inv["$($x.Id)"] = 1 + [int]$inv["$($x.Id)"]; $invName["$($x.Id)"] = "$($x.Product)" }
+    }
+    if ($withInv.Count -ge 10) {
+        foreach ($id in @($inv.Keys)) {
+            $pct = [math]::Round(100 * $inv[$id] / $withInv.Count)
+            if ($pct -lt 80) { continue }
+            foreach ($w in $withInv) {
+                if ($w.Ids -contains $id) { continue }
+                if ($w.Ids.Count) { & $addX $w.It.Name 'Info' "Nie działa tu $($invName[$id]), który działa na $pct% serwerów – serwer chroni inny produkt ($($w.Ids -join ', '))" 'Protection' '' 'Ochrona' }
+                else { & $addX $w.It.Name 'Ostrzeżenie' "Nie działa tu $($invName[$id]), który działa na $pct% serwerów – agent niezainstalowany, zatrzymany albo usunięty" 'Protection' '' 'Ochrona' }
+            }
+        }
     }
     # Ta sama maszyna pod dwiema nazwami (alias DNS, nazwa klastra, adres IP) – skanowana podwójnie
     $byComp = @{}
@@ -5185,7 +6529,10 @@ function Get-ServerFull([string]$Name) {
     if ($d._File -and (Test-Path -LiteralPath $d._File)) { $full = Read-Snapshot $d._File }
     if (-not $full) { return $d }
     $prev = $null
-    if ($d.PSObject.Properties['_PrevFile'] -and $d._PrevFile -and (Test-Path -LiteralPath $d._PrevFile)) { $prev = Read-Snapshot $d._PrevFile }
+    if ($d.PSObject.Properties['_PrevFile'] -and $d._PrevFile -and (Test-Path -LiteralPath $d._PrevFile)) {
+        $prev = Read-Snapshot $d._PrevFile
+        if ($prev) { try { $prev = Merge-PrevSections $full $prev (Get-OlderOnlineSnapshots $Name $d._PrevFile) ([string[]]@($script:DiffDefs.Keys)) ([string[]]$script:ArrayKeys) } catch { } }
+    }
     foreach ($k in 'ScannedAt', '_File', '_PrevFile', '_ScanNote', '_ManualDiag') { if ($d.PSObject.Properties[$k]) { $full | Add-Member -NotePropertyName $k -NotePropertyValue $d.$k -Force } }
     $all = Invoke-ServerAnalysis -Name $Name -D $full -Prev $prev
     $full | Add-Member -NotePropertyName _AllIssues -NotePropertyValue @($all) -Force
@@ -5202,7 +6549,7 @@ function Get-ServerFull([string]$Name) {
 # Sortowanie jest pamiętane osobno dla każdej tabeli i sekcji, więc przetrwa odświeżenie w trakcie skanu i zmianę serwera.
 $script:GridSort = @{}   # klucz tabeli (np. 'detail:Disks') -> lista @{ Path = właściwość; Desc = $true/$false }
 # kolumny z poziomem ważności sortujemy wg wagi, a nie alfabetycznie (rosnąco = najpierw najpoważniejsze)
-$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Info' = 3; 'OK' = 4 }
+$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Zalecenie' = 3; 'Info' = 3; 'OK' = 4 }
 
 function Get-SortKeys($Rows, [string]$Path) {
     # Klucze sortowania całej kolumny (jedno wywołanie na kolumnę – wywołanie funkcji na każdą komórkę było za wolne):
@@ -5344,7 +6691,7 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
         foreach ($i in @($(if ($showIgnored) { $d._Ignored } else { $d._Issues }))) { if ($i) { $all.Add($i) } }
         $crit += [int]$d._Crit; $warn += [int]$d._Warn; $ign += @($d._Ignored).Count
         $st = if ($script:AvailStats) { $script:AvailStats[$it.Name.ToLowerInvariant()] } else { $null }
-        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; UptimeDays = $null; CPU = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null
+        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; AV = ''; UptimeDays = $null; CPU = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null
                             Crit = [int]$d._Crit; Warn = [int]$d._Warn; Availability = (Get-AvailabilityText $it.Name); LastOk = $(if ($st) { $st.LastOk } else { '' }); ScanSec = $null; Scanned = $d.ScannedAt; Flag = '' }
         if ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) {
             $base.Status = 'Pominięty'; $base.Flag = 'muted'; $base.OS = "$($d.Unsupported)"
@@ -5358,6 +6705,7 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
             $online++
             $s = $d.System
             $base.Status = 'OK'; $base.OS = "$($s.OS)" -replace '^Microsoft ', ''
+            $base.AV = "$($s.PSObject.Properties['AV'].Value)"
             $base.UptimeDays = $s.UptimeDays; $base.CPU = $s.CpuLoad; $base.RAM = $s.RamUsedPct
             $base.MinDiskPct = (@($d.Disks) | Where-Object { $_ } | Measure-Object FreePct -Minimum).Minimum
             $base.PatchDays = $(if ($s.LastHotfixDays -ge 0) { $s.LastHotfixDays } else { $null })
@@ -5550,7 +6898,7 @@ function Add-Chip([string]$Text, [string]$Kind = '', [string]$Tip = '') {
 }
 function Get-MetricColor($v) { if ($v -ge 90) { '#FF5C6C' } elseif ($v -ge 75) { '#FFB547' } else { '#34D399' } }
 
-function Get-StatusFlag([string]$Status) { switch ($Status) { 'Błąd' { 'crit' } 'Krytyczne' { 'crit' } 'Uwaga' { 'warn' } 'Info' { 'info' } default { '' } } }
+function Get-StatusFlag([string]$Status) { switch ($Status) { 'Błąd' { 'crit' } 'Krytyczne' { 'crit' } 'Uwaga' { 'warn' } 'Zalecenie' { 'info' } 'Info' { 'info' } default { '' } } }
 function Get-DiagnosticsRows([string]$Name, $D) {
     # Sekcja „Diagnoza połączenia”: przyczyna, zalecenie, stan maszyny na hoście Hyper-V i wyniki prób ze stacji
     $dg = $null
@@ -5624,8 +6972,11 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -in 'HyperV', 'Checkpoints', 'VMStorage', 'HvHost' -and -not $D.System.IsHyperV) { return $false }
     if ($Key -eq 'LocalUsers' -and $D.System.IsDC) { return $false }
     if ($Key -eq 'DomainController' -and -not $D.System.IsDC) { return $false }
+    if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
-    if ($Key -in 'Downtime', 'Timings' -and -not $D.PSObject.Properties[$Key]) { return $false }   # starsze migawki
+    # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
+    if ($Key -in 'Downtime', 'Timings', 'Protection', 'Suspicious', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'Protection', 'Suspicious', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
     $true
 }
 function Get-WorstFlag($Rows) {
@@ -5992,7 +7343,7 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
         @{ Target = $t; Opt = @{
             CollectorText = $collectorText; CollectorArgs = $collectorArgs; Credential = $script:Cred; ConnectTimeoutSec = [int]$Config.ConnectTimeoutSec
             SnapDir = $snapDir; SafeName = (Get-SafeName $t); Compress = [bool]$Config.CompressSnapshots; ArrayKeys = [string[]]$script:ArrayKeys
-            PrevFile = $last; LastOnlineFile = $last; DiagPorts = [int[]]@($Config.DiagPorts); DiagTimeoutMs = [int]$Config.DiagTimeoutMs; Days = $days
+            PrevFile = $last; LastOnlineFile = $last; OlderFiles = (Get-OlderOnlineSnapshots $t $last); DiffKeys = [string[]]@($script:DiffDefs.Keys); DiagPorts = [int[]]@($Config.DiagPorts); DiagTimeoutMs = [int]$Config.DiagTimeoutMs; Days = $days
             Preflight = [bool]$Config.Preflight
         } }
         $it = Get-ServerItem $t
@@ -6141,7 +7492,8 @@ function Start-SnapshotLoad([switch]$Reanalyze) {
         # serwer niedostępny od wielu skanów: dołącz ostatnią udaną migawkę (ostatnie znane dane, host Hyper-V gościa)
         $on = Get-LastOnlineSnapshot $it.Name
         if ($on -and @($files | ForEach-Object { $_.Path }) -notcontains $on) { $files += @{ Path = $on; Offline = $false } }
-        @{ Target = $it.Name; Opt = @{ Files = $files; ArrayKeys = [string[]]$script:ArrayKeys } }
+        $online = [string[]]@(Get-SnapshotEntries $it.Name | Where-Object { -not $_.Offline } | Select-Object -First 12 | ForEach-Object { $_.Path })
+        @{ Target = $it.Name; Opt = @{ Files = $files; ArrayKeys = [string[]]$script:ArrayKeys; OnlineFiles = $online; DiffKeys = [string[]]@($script:DiffDefs.Keys) } }
     }
     $items = @($items)
     if (-not $items.Count) { return }
