@@ -1,6 +1,8 @@
 # ServerReview – Przegląd serwerów
 
-Narzędzie z interfejsem graficznym (WPF) do zbiorczego audytu serwerów Windows w domenie. Łączy się równolegle przez WinRM ze wszystkimi serwerami z listy i zbiera stan systemu oraz konfigurację bezpieczeństwa. Wskazuje problemy i pokazuje, co zmieniło się od poprzedniego skanu.
+Narzędzie z interfejsem graficznym (WPF) do zbiorczego audytu serwerów Windows w domenie. Łączy się równolegle przez WinRM ze wszystkimi serwerami z listy, zbiera stan systemu, konfigurację bezpieczeństwa i dane Hyper-V, wskazuje problemy i pokazuje, co zmieniło się od poprzedniego skanu. Gdy serwer nie odpowiada, program sam diagnozuje przyczynę i zapisuje ją w dzienniku dostępności.
+
+Program jest przygotowany na większe środowiska: kilkaset serwerów, w tym kilkanaście–kilkadziesiąt hostów Hyper-V z maszynami wirtualnymi. Skanuje tylko Windows. Maszyny z Linuksem rozpoznaje na hostach Hyper-V i pomija.
 
 Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatkowych modułów, a na serwerach niczego nie instaluje ani nie zmienia.
 
@@ -11,11 +13,18 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Uruchomienie](#uruchomienie)
 - [Pierwsze kroki](#pierwsze-kroki)
 - [Interfejs](#interfejs)
+- [Niedostępne serwery](#niedostępne-serwery)
+- [Hyper-V i klastry](#hyper-v-i-klastry)
+- [Bezpieczeństwo: ochrona, utwardzenie, wskaźniki naruszenia](#bezpieczeństwo-ochrona-utwardzenie-wskaźniki-naruszenia)
 - [Wykrywane problemy](#wykrywane-problemy)
+- [Wyciszanie problemów](#wyciszanie-problemów)
 - [Porównanie z poprzednim skanem](#porównanie-z-poprzednim-skanem)
 - [Raport HTML](#raport-html)
+- [Dziennik operacji i dziennik dostępności](#dziennik-operacji-i-dziennik-dostępności)
+- [Blokada programu (PIN)](#blokada-programu-pin)
 - [Ustawienia](#ustawienia)
 - [Pliki programu](#pliki-programu)
+- [Duże środowiska](#duże-środowiska)
 - [Rozwiązywanie problemów](#rozwiązywanie-problemów)
 - [Licencja](#licencja)
 
@@ -23,27 +32,31 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 
 | Obszar | Zbierane dane |
 |---|---|
-| **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu |
-| **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów, awarie BSOD i pliki zrzutów pamięci, zajętość dysków, zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
-| **Bezpieczeństwo** | podstawowy hardening (SMBv1, podpisywanie SMB, NLA, WDigest, poziom LM/NTLM, ochrona LSA, UAC, LLMNR, autologowanie, LAPS, SSL/TLS, PowerShell 2.0, Defender, zapora), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane, konta lokalne, certyfikaty, udziały, autostart |
+| **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, host Hyper-V, na którym działa maszyna |
+| **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
+| **Ochrona** | antywirus i EDR także innych producentów niż Microsoft (ok. 45 produktów: usługi, sterowniki, minifiltry, wpisy w Programach), stan Microsoft Defendera (tryb pasywny, sygnatury, składniki, ochrona przed naruszeniami, reguły ASR), awarie usług ochrony, zapora Windows albo zapora innego producenta, która przejęła filtrowanie ruchu |
+| **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-ochrona-utwardzenie-wskaźniki-naruszenia)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
+| **Podejrzane** | wskaźniki naruszenia i ukryte mechanizmy trwałości: przekierowanie programów ułatwień dostępu („sticky keys”), pakiety LSA, AppInit_DLLs, ukryte zadania i konta, biblioteki usług poza katalogiem systemowym, narzędzia zdalnego dostępu i narzędzia ofensywne, zrzuty pamięci lsass, wykrycia i wyłączenia Defendera, podejrzane linie poleceń, plik hosts, certyfikaty narzędzi przechwytujących TLS, udane logowania RDP z internetu |
 | **Usługi, sieć i pliki** | usługi (spoza Microsoft, zatrzymane automatyczne, działające na kontach użytkowników, z niecytowaną ścieżką), zadania harmonogramu spoza `\Microsoft\` z wynikiem ostatniego uruchomienia, karty sieciowe i adresacja, porty nasłuchujące i aktywne połączenia (z procesem i usługą), sesje użytkowników, zawartość wskazanych folderów |
 | **Oprogramowanie** | zainstalowane programy, ostatnie aktualizacje (KB) |
-| **Role serwera** | kontroler domeny (SYSVOL/DFSR, replikacja AD, podpisywanie LDAP i channel binding), Hyper-V (maszyny, checkpointy, dyski VM i zapas miejsca na ich wzrost) |
+| **Kontroler domeny** | SYSVOL/DFSR, replikacja AD, podpisywanie LDAP i channel binding, wyjątki bezpiecznego kanału Netlogon, konta i usługi wymagające Kerberos RC4 (zdarzenia KDCSVC 201–209) |
+| **Active Directory** | ocena raz na domenę: krbtgt, delegowanie, prawa replikacji (DCSync), AS-REP roasting i Kerberoasting kont uprzywilejowanych, grupy uprzywilejowane, LAPS, zaufania, hasła w SYSVOL (GPP cpassword i skrypty), zasady haseł, sIDHistory i inne |
+| **Hyper-V** | pojemność hosta (vCPU na procesor logiczny, RAM przydzielony maszynom, wolna pamięć), maszyny wirtualne ze stanem, heartbeatem, systemem gościa i adresami IP (z usług integracji), checkpointy, dyski VM i zapas miejsca na ich wzrost, replikacja, ustawienia startu, klaster pracy awaryjnej (węzły, wolumeny CSV, role maszyn, kworum) |
 
-Sekcje kontrolera domeny i Hyper-V pokazują się tylko na serwerach z tą rolą.
+Sekcje kontrolera domeny, Active Directory i Hyper-V pokazują się tylko na serwerach z tą rolą. Hasła wpisane w linię poleceń usług, zadań, autostartu i subskrypcji WMI (np. `-P haslo`, `password=…`) są maskowane już na serwerze i nie trafiają do migawek, raportów ani plików CSV.
 
 ## Wymagania
 
 **Stacja, z której uruchamiasz program**
 
 - Windows z Windows PowerShell 5.1 (interfejs korzysta z WPF). Uruchomienie z PowerShell 7 też działa, bo skrypt sam przełącza się wtedy na `powershell.exe`.
-- Dostęp do Active Directory, jeśli chcesz pobierać listę serwerów przyciskiem „Pobierz z AD”.
+- Dostęp do Active Directory, jeśli chcesz pobierać listę serwerów przyciskiem **AD** i sprawdzać konta komputerów w diagnozie niedostępności.
 
 **Serwery**
 
+- Windows Server 2012 R2 lub nowszy. Kolektor działa także w PowerShell 4.0 (2012 R2 bez WMF 5.1).
 - Włączony WinRM (domyślnie włączony od Windows Server 2012), port TCP 5985.
 - Konto z uprawnieniami administratora lokalnego. Bez nich nie da się m.in. odczytać dziennika Security.
-- Kolektor ma obejścia dla PowerShell 4.0 (Windows Server 2012 R2 bez WMF 5.1).
 
 ## Uruchomienie
 
@@ -59,36 +72,72 @@ powershell.exe -ExecutionPolicy Bypass -File .\ServerReview.ps1 -ServerListFile 
 
 `-ExecutionPolicy Bypass` dotyczy tylko tego jednego uruchomienia. Jeśli zasady wykonywania skryptów na stacji już na to pozwalają (np. `RemoteSigned`), wystarczy odblokować pobrany plik poleceniem `Unblock-File .\ServerReview.ps1` i uruchomić go jak każdy skrypt.
 
+Program działa w jednym egzemplarzu na folder danych. Drugie uruchomienie z tego samego folderu tylko o tym informuje.
+
+### Skan bez okna (Harmonogram zadań)
+
+Parametr `-Scan` skanuje wszystkie serwery z listy bez otwierania okna, zapisuje migawki, dziennik operacji i dziennik dostępności, a na koniec tworzy raport HTML. Nadaje się do zadania Harmonogramu zadań, np. codziennie rano:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Narzedzia\ServerReview\ServerReview.ps1 -Scan -ReportMode Summary
+```
+
+| Parametr | Znaczenie |
+|---|---|
+| `-Scan` | skan bez okna; PIN nie jest wymagany |
+| `-ReportMode Summary` | raport podsumowujący: problemy, niedostępność, Hyper-V i wiersze wymagające uwagi (domyślnie) |
+| `-ReportMode Full` | raport pełny ze wszystkimi sekcjami każdego serwera |
+| `-NoReport` | bez raportu HTML |
+
+Kod wyjścia: **0** – wszystkie serwery odpowiedziały, **1** – część serwerów bez połączenia lub z przekroczonym limitem czasu, **2** – skan się nie odbył (np. brak listy serwerów albo inny skan bez okna z tego folderu jeszcze trwa). Zadanie musi działać na koncie z uprawnieniami administratora na serwerach. Wyniki skanu bez okna widać po otwarciu programu.
+
 ## Pierwsze kroki
 
 1. **Dodaj serwery**, na jeden z trzech sposobów:
-   - **Pobierz z AD** dodaje włączone konta komputerów z systemem serwerowym, które logowały się do domeny w ostatnich 60 dniach.
-   - **Wczytaj listę** czyta plik TXT lub CSV. Bierze pierwszą wartość z każdej linii i pomija puste linie, linie zaczynające się od `#` oraz nagłówki typu `Name` czy `DNSHostName`.
+   - **AD** dodaje (po potwierdzeniu) włączone konta komputerów z systemem Windows Server (także Hyper-V Server i Azure Stack HCI), które logowały się do domeny w ostatnich 60 dniach. Pomija komputery z Linuksem dołączone do domeny i nazwy wirtualne klastra. Zakres można zawęzić do jednostki organizacyjnej w Ustawieniach.
+   - **Plik** wczytuje listę z pliku TXT lub CSV. Bierze pierwszą wartość z każdej linii i pomija puste linie, linie zaczynające się od `#` oraz nagłówki typu `Name` czy `DNSHostName`.
    - Wpisz nazwy w polu pod listą serwerów. Kilka nazw możesz oddzielić przecinkiem, średnikiem lub spacją.
 
-   Lista zapisuje się w `servers.txt` obok skryptu i wczytuje się przy następnym uruchomieniu.
-2. **Wybierz konto** (opcjonalnie). Przycisk „Konto: bieżące” pozwala podać inne poświadczenia, a „Anuluj” w tym oknie wraca do bieżącego konta.
-3. **Ustaw zakres zdarzeń** w polu „Zdarzenia z ostatnich … dni” (1–180) i kliknij **Skanuj wszystkie**. Trwający skan możesz przerwać tym samym przyciskiem.
-4. **Przejrzyj wyniki.** Po starcie programu widoczne są wyniki ostatniego skanu zapisane na dysku.
+   Duplikaty (np. `SRV01` i `srv01.firma.local`) są pomijane. Lista zapisuje się w `servers.txt` obok skryptu i wczytuje się przy następnym uruchomieniu. Jeśli wskazano własny plik CSV parametrem `-ServerListFile`, nie jest on nadpisywany – zmiany trafiają do `servers.txt`. Maszyny wirtualne z hostów Hyper-V, których brakuje na liście, dodasz w widoku **Hyper-V** (przycisk „Dodaj do listy”).
+2. **Wybierz konto** (opcjonalnie). Przycisk z nazwą konta otwiera menu: **Użyj innego konta…** (hasło jest raz sprawdzane w domenie, zanim trafi do serwerów) albo **Wróć do bieżącego konta**. Jeśli trzy kolejne serwery odrzucą podane hasło, a żaden go nie przyjmie, skan zatrzymuje się, żeby nie zablokować konta w domenie.
+3. **Ustaw zakres zdarzeń** w polu „Zdarzenia z ostatnich … dni” (1–180) i kliknij **Skanuj wszystkie** (F5). Trwający skan możesz przerwać tym samym przyciskiem albo przyciskiem „Przerwij” na pasku stanu.
+4. **Przejrzyj wyniki.** Po starcie programu widoczne są wyniki ostatniego skanu zapisane na dysku – także te z [skanu bez okna](#skan-bez-okna-harmonogram-zadań).
 
 ## Interfejs
 
+Okno ma trzy widoki, przełączane przyciskami na górze albo skrótami **Ctrl+1/2/3**: **Wszystkie serwery**, **Hyper-V** i **Szczegóły serwera**. Na górze są też: pole zakresu zdarzeń, przycisk konta, menu **Raport**, ustawienia (⚙, z licznikiem pomijanych sekcji), kłódka blokady i **Skanuj wszystkie**. Na dole okna jest pasek stanu z postępem operacji, przyciskiem **Przerwij** i przyciskiem **Dziennik**. Komunikaty o zakończonych operacjach pojawiają się na chwilę w prawym dolnym rogu.
+
 ### Wszystkie serwery
 
-- **Kafelki:** liczba serwerów, odpowiadających, bez połączenia, problemów krytycznych i ostrzeżeń.
-- **Wykryte problemy:** lista problemów ze wszystkich serwerów z filtrem poziomu i filtrem tekstowym. Zaznaczony wiersz pokazuje pełną treść pod tabelą, a dwuklik otwiera serwer w sekcji, której problem dotyczy.
-- **Stan serwerów:** jedna linia na serwer (system, uptime, CPU, RAM, najmniej wolnego miejsca na dysku, dni od aktualizacji, liczba problemów, czas skanu). Dwuklik otwiera szczegóły serwera.
+- **Kafelki:** serwery na liście, odpowiadające, bez połączenia, problemy krytyczne, ostrzeżenia oraz hosty Hyper-V i działające maszyny. Kliknięcie kafelka działa jak filtr (np. „Bez połączenia” pokazuje niedostępne serwery i ich problemy łączności, „Hyper-V” otwiera widok Hyper-V).
+- **Wykryte problemy:** lista problemów ze wszystkich serwerów z filtrem poziomu i filtrem tekstowym (Ctrl+F). Zaznaczony wiersz pokazuje pełną treść pod tabelą, a dwuklik otwiera serwer w sekcji, której problem dotyczy. Prawy klik: wycisz problem na tym serwerze albo na wszystkich, kopiuj treść, otwórz serwer. Pole **Wyciszone** pokazuje wyciszone problemy. Przycisk **CSV** zapisuje widoczne problemy.
+- **Stan serwerów:** jedna linia na każdy serwer z danymi (status, typ HV/VM, system – a dla niedostępnego przyczyna, host Hyper-V, uptime, CPU, RAM, najmniej wolnego miejsca na dysku, dni od aktualizacji, liczba problemów, dostępność z ostatnich 30 dni, ostatni udany skan, czas skanu). Dwuklik otwiera szczegóły serwera. Przycisk **CSV** zapisuje tabelę.
+
+### Hyper-V
+
+Zbiorczy widok wszystkich hostów i maszyn wirtualnych z przeskanowanych hostów:
+
+- **Hosty:** klaster, maszyny działające / wszystkie, vCPU na procesor logiczny, RAM przydzielony maszynom, stare checkpointy, liczba problemów.
+- **Maszyny:** host, stan, heartbeat, uptime, vCPU, pamięć (także dynamiczna), generacja i wersja konfiguracji, replikacja, checkpointy, dyski, system gościa, nazwa i adres IP gościa, czy maszyna jest na liście serwerów i jaki jest wynik jej skanu.
+- **Filtry:** wszystkie, działające, wyłączone, do sprawdzenia, spoza listy, plus pole tekstowe.
+- **Dodaj do listy** dodaje zaznaczone (albo wszystkie widoczne) maszyny Windows spoza listy. Maszyny z Linuksem i repliki Hyper-V Replica są pomijane i wyszarzone.
 
 ### Szczegóły serwera
 
-- **Nagłówek:** system i rola, znaczniki (uptime, IP, aktualizacje, oczekujący restart, antywirus, różnica czasu), obciążenie CPU i RAM, liczba problemów oraz przycisk **Skanuj ponownie** dla tego jednego serwera.
-- **Lista sekcji:** plakietka przy każdej sekcji pokazuje liczbę pozycji, a jej kolor najpoważniejszy problem w sekcji.
+- **Nagłówek:** system i rola, znaczniki (uptime, ostatni start, IP, host Hyper-V albo klaster, aktualizacje, oczekujący restart, antywirus, różnica czasu, dostępność z 30 dni, czas skanu z najwolniejszymi sekcjami), obciążenie CPU i RAM, liczba problemów oraz przyciski **Skanuj ponownie** i **Diagnozuj połączenie** dla tego jednego serwera. Dla serwera bez połączenia znaczniki pokazują przyczynę, od kiedy serwer nie odpowiada i kiedy ostatnio się udało.
+- **Lista sekcji:** plakietka przy każdej sekcji pokazuje liczbę pozycji, a jej kolor najpoważniejszy problem w sekcji. Oprócz danych z serwera są tu sekcje **Diagnoza połączenia**, **Historia skanów i dostępność**, **Zmiany od poprzedniego skanu**, **Przestoje** i **Czas zbierania sekcji** (które sekcje wydłużają skan).
 - **Tabela sekcji:**
-  - pole „Filtruj wiersze” przeszukuje wszystkie kolumny;
-  - **Eksport CSV** zapisuje widoczne wiersze w kolejności z tabeli (separator `;`, UTF-8);
+  - pole „Filtruj wiersze” (Ctrl+F) przeszukuje wszystkie kolumny;
+  - **CSV** zapisuje widoczne wiersze w kolejności z tabeli (separator `;`, UTF-8);
   - panel pod tabelą pokazuje pełną treść zaznaczonego wiersza i można ją stamtąd skopiować.
 
-Wiersze wymagające uwagi są kolorowane: czerwony oznacza problem krytyczny, żółty ostrzeżenie, a niebieski informację.
+Wiersze wymagające uwagi są kolorowane: czerwony oznacza problem krytyczny, żółty ostrzeżenie, a niebieski informację. Wyszarzone są pozycje celowo pomijane (np. maszyny z Linuksem).
+
+### Lista serwerów
+
+- Pole „Szukaj serwera” filtruje listę po nazwie, systemie i hoście Hyper-V. Przyciski nad listą pokazują: wszystkie, z problemami, bez połączenia, hosty Hyper-V, maszyny wirtualne, nieskanowane.
+- Można zaznaczyć wiele serwerów (Ctrl/Shift + klik). **Shift+F5** skanuje zaznaczone, a klawisz **Delete** usuwa je z listy.
+- Prawy klik otwiera menu: skanuj zaznaczone, diagnozuj połączenie, kopiuj nazwy, połączenie RDP, PowerShell (`Enter-PSSession`), Zarządzanie komputerem, Podgląd zdarzeń, Usługi, udział `C$`, przejście do hosta Hyper-V albo do maszyn hosta, usuń z listy.
 
 ### Sortowanie tabel
 
@@ -100,11 +149,84 @@ Wszystkie tabele można sortować kliknięciem w nagłówek kolumny:
 - puste pola zawsze trafiają na koniec, a kolumny z poziomem ważności sortują się od najpoważniejszych;
 - sortowanie jest zapamiętywane osobno dla każdej tabeli i sekcji, więc zostaje po przełączeniu serwera i przy odświeżaniu w trakcie skanu.
 
-### Lista serwerów
+### Skróty klawiszowe
 
-- Pole „Szukaj serwera” filtruje listę po nazwie.
-- Klawisz **Delete** usuwa zaznaczony serwer z listy.
-- Prawy klik otwiera menu z poleceniami: skanowanie tego serwera, połączenie RDP, Zarządzanie komputerem, Podgląd zdarzeń, Usługi oraz udział `C$`.
+| Skrót | Działanie |
+|---|---|
+| F5 | skanuj wszystkie serwery |
+| Shift+F5 | skanuj zaznaczone serwery |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 | widok: wszystkie serwery / Hyper-V / szczegóły serwera |
+| Ctrl+F | przejdź do pola filtra w bieżącym widoku |
+| Esc | wyczyść pole tekstowe, w którym jest kursor |
+| Ctrl+L | pokaż lub ukryj dziennik operacji |
+| Ctrl+Shift+L | zablokuj program (gdy ustawiono PIN) |
+| Delete | usuń zaznaczone serwery z listy |
+
+## Niedostępne serwery
+
+Gdy serwer nie odpowiada, program nie poprzestaje na komunikacie WinRM. Od razu, ze stacji i w tle, sprawdza:
+
+- **DNS:** czy nazwa się rozwiązuje, na jaki adres, oraz rekord odwrotny (PTR). PTR wskazujący inny komputer oznacza nieaktualny wpis DNS – częstą przyczynę błędów Kerberos.
+- **Ping i porty TCP** (domyślnie 5985 WinRM, 5986, 135, 445, 3389), równolegle i z limitem czasu. Port „zamknięty” (host odrzuca połączenie) znaczy, że serwer działa, ale nic na tym porcie nie nasłuchuje. „Brak odpowiedzi” to zapora albo wyłączony serwer.
+- **TrustedHosts** na stacji – dla serwerów dodanych po adresie IP.
+- **Konto komputera w AD:** czy istnieje, czy jest włączone, kiedy ostatnio logowało się do domeny i kiedy zmieniło hasło (stare hasło konta komputera to typowy objaw zerwanego kanału zabezpieczeń, np. po przywróceniu maszyny z checkpointu), system według AD.
+- **Zduplikowany SPN** `HTTP/<serwer>` na innym koncie – przy błędzie Kerberos 0x80090322.
+- **Kod błędu WinRM** – rozpoznawany po kodach niezależnych od języka systemu (np. odmowa dostępu, błędne hasło, Kerberos, limit powłok WinRM, przekroczony limit pamięci powłoki).
+- **Stan maszyny wirtualnej na hoście Hyper-V**, jeśli serwer jest maszyną z przeskanowanego hosta: wyłączona, zapisana, wstrzymana (zwykle brak miejsca na wolumenie z dyskami), w stanie krytycznym albo działająca, ale z systemem gościa, który nie odpowiada.
+
+Z tych wyników powstaje jedna przyczyna i zalecenie po polsku, np. „Serwer działa, ale WinRM (TCP 5985) jest blokowany – zapora na serwerze albo w sieci” z podpowiedzią, którą regułę zapory włączyć. Pełne wyniki prób są w sekcji **Diagnoza połączenia**, razem z ostatnimi udanymi danymi serwera (kiedy, jaki system, jaki adres). Diagnozę można powtórzyć przyciskiem **Diagnozuj połączenie** albo z menu listy serwerów, także dla wielu serwerów naraz. Na liście serwerów podpis pod nazwą od razu mówi, co się stało: „nie odpowiada”, „zapora blokuje WinRM”, „WinRM nie działa”, „brak w DNS”, „odmowa dostępu”, „błąd Kerberos”, „VM wyłączona na HV01”, „host HV02 nie odpowiada” itp.
+
+Poziom problemu zależy od przyczyny: maszyna wyłączona od ponad 30 dni to informacja (prawdopodobnie wycofana), błąd zbierania danych na działającym serwerze to ostrzeżenie, a serwer, który nie odpowiada, to problem krytyczny.
+
+**Awarie zbiorcze.** Gdy nie odpowiada host Hyper-V, a razem z nim maszyny, które ostatnio na nim działały, program pokazuje jeden problem krytyczny na hoście, a problemy maszyn obniża do ostrzeżeń z dopiskiem „zacznij od hosta”. Gdy nie odpowiada co najmniej 3 i co najmniej 80% znanych serwerów z jednej podsieci /24, pojawia się jeden problem „Sieć” dla całej podsieci. Gdy w pełnym skanie nie odpowiedział żaden serwer, a przyczyny to sieć lub DNS, program podejrzewa problem stacji (VPN, DNS, karta sieciowa) i zgłasza to zamiast setek osobnych awarii.
+
+**Szybki test portu i ponowna próba.** Przed połączeniem WinRM program sprawdza port 5985 (dwie próby po 3 s). Wyłączony serwer zostaje rozpoznany w kilka sekund i nie zajmuje wątku skanu przez pełny limit połączenia. Po skanie serwery z błędem, który może być chwilowy (serwer w trakcie restartu, WinRM jeszcze nie wystartował, chwilowy błąd sieci lub limitu powłok), są raz skanowane ponownie. Błędów DNS, zapory, uprawnień i Kerberos program nie ponawia. Obie funkcje można wyłączyć w Ustawieniach.
+
+**Przerwany skan to nie awaria.** Serwer, którego skan przerwano albo który nie zdążył w limicie czasu, zachowuje poprzednie dane. Przy przekroczeniu limitu pojawia się ostrzeżenie, że pokazane dane pochodzą z wcześniejszego skanu.
+
+Niedostępność jest zapamiętywana: po ponownym uruchomieniu programu serwer nadal jest pokazany jako niedostępny, z przyczyną i datą. Każdy wynik skanu trafia do [dziennika dostępności](#dziennik-operacji-i-dziennik-dostępności), a sekcja **Historia skanów i dostępność** pokazuje historię serwera z ostatnich 3 miesięcy.
+
+## Hyper-V i klastry
+
+- **Powiązanie gościa z maszyną.** Program łączy serwer z listy z maszyną wirtualną na hoście po identyfikatorze maszyny i nazwie hosta odczytanych z usług integracji gościa, a gdy ich brak – po nazwie systemu gościa (KVP) albo nazwie maszyny. Dzięki temu wie, na którym hoście działa serwer, i potrafi wyjaśnić jego niedostępność stanem maszyny.
+- **Linux jest pomijany.** Maszyny, których system gościa według hosta nie jest Windows, nie są skanowane ani zgłaszane jako niedostępne. Nie ostrzegamy też o ich heartbeacie.
+- **Pojemność hosta.** vCPU działających maszyn na procesor logiczny, RAM przydzielony maszynom i zapas wolnej pamięci hosta (na hoście Hyper-V wysokie zajęcie RAM to normalny stan – liczy się zapas na nowe maszyny i migracje).
+- **Klaster.** Stan węzłów, wolumenów CSV, ról maszyn i kworum jest oceniany raz na klaster, a nie na każdym węźle. Gdy przeskanowano wszystkie węzły, program sprawdza, czy klaster przetrwa awarię największego węzła (N+1). Przyrost dysków dynamicznych na wolumenach CSV i udziałach SMB jest sumowany ze wszystkich hostów, które z nich korzystają.
+- **Kontrolery domeny.** Ostrzeżenie, gdy wszystkie skanowane kontrolery domeny działają na jednym hoście.
+- **Duplikaty.** Ta sama maszyna dodana pod dwiema nazwami (alias DNS, adres IP, nazwa klastra) jest wykrywana.
+
+## Bezpieczeństwo: ochrona, utwardzenie, wskaźniki naruszenia
+
+### Antywirus, EDR i zapora innych producentów
+
+Na Windows Server nie ma Centrum zabezpieczeń, więc samo „Defender wyłączony” nic nie mówi. Program rozpoznaje produkt ochronny po usługach, załadowanych sterownikach i minifiltrach (`fltmc`), wpisach w Programach i rejestracjach w zaporze Windows. Katalog obejmuje m.in. Bitdefender GravityZone, ESET, Sophos, Kaspersky, Symantec/Broadcom, Trend Micro, Trellix/McAfee, CrowdStrike, SentinelOne, Cortex XDR, Carbon Black, Cylance, WithSecure, Defender for Endpoint i System Center Endpoint Protection. Sterownik z zakresu „antywirus” spoza katalogu też liczy się jako ochrona, więc nieznany produkt nie daje fałszywego alarmu.
+
+- Defender w trybie pasywnym albo usunięty przy działającym innym antywirusie jest stanem prawidłowym. W sekcji **Ochrona** widać, który produkt chroni serwer.
+- Wyłączona zapora Windows przy aktywnej zaporze innego producenta (np. Bitdefender z modułem zapory) to informacja, a nie ostrzeżenie. Program sprawdza też, kto ostatnio zmienił ustawienia zapory (zdarzenie 2003), czy profil faktycznie używany przez kartę sieciową przepuszcza ruch (`DefaultInboundAction = Allow`) i czy działają usługi BFE i MpsSvc.
+- Ostrzeżenia dotyczą realnych luk: brak jakiegokolwiek działającego antywirusa, zainstalowany, ale zatrzymany produkt, dwa klasyczne silniki skanujące naraz, usługa ochrony, która w okresie skanu kończyła działanie z błędem, serwer domenowy bez rozpoznanej sieci domenowej (zapora stosuje wtedy reguły profilu Publicznego).
+- Przy co najmniej 10 serwerach program porównuje flotę: serwer bez agenta, który działa na co najmniej 80% pozostałych, dostaje ostrzeżenie (albo informację, gdy chroni go inny produkt).
+
+### Utwardzenie i status „Zalecenie”
+
+Sekcja **Konfiguracja bezpieczeństwa** ocenia ustawienia w czterech stopniach: **Krytyczne** i **Uwaga** to realne ryzyko (np. Point and Print bez ostrzeżeń, `EDITF_ATTRIBUTESUBJECTALTNAME2` na urzędzie certyfikacji, WinRM z uwierzytelnianiem Basic, TrustedHosts `*`, przechowywane skróty LM, słabe szyfry SChannel włączone jawnie). **Zalecenie** to rzeczy, które warto poprawić, ale bez pilności, np. podpisywanie SMB, LLMNR i NetBIOS, WSUS po HTTP, zbędny bufor wydruku, ochrona LSA, rejestrowanie skryptów PowerShell, certyfikaty Secure Boot 2023. Zalecenia jednego serwera trafiają do jednej informacji „Do utwardzenia (N): …”, żeby przy kilkuset serwerach nie zalać listy ostrzeżeniami. **Info** to stan do wiadomości.
+
+Brak wpisu w rejestrze program ocenia według domyślnego zachowania danej wersji systemu (np. Windows Server 2025 domyślnie wymaga podpisywania SMB). Ustawienia z zasad grupy mają pierwszeństwo przed lokalnymi.
+
+### Active Directory
+
+Każdy kontroler domeny zbiera sekcję **Active Directory: bezpieczeństwo domeny**, a problemy są zgłaszane raz na domenę (z PDC, a gdy go nie skanowano, z pierwszego kontrolera) z opisem „domena …”. Odczyt idzie przez LDAP, bez modułu ActiveDirectory. Warunki są zapisane filtrami LDAP i program odczytuje tylko nazwy obiektów, nie hasła ani atrybuty poufne. Cały blok ma limit 90 s.
+
+Sprawdzane są m.in.: wiek hasła krbtgt, delegowanie nieograniczone, delegowanie do usług kontrolera domeny i RBCD na kontrolerach, prawa replikacji (DCSync) i pełna kontrola nad obiektem domeny poza grupami administracyjnymi (konto synchronizacji Entra Connect jest rozpoznawane jako oczekiwane), konta bez wstępnego uwierzytelniania Kerberos, konta uprzywilejowane z SPN, hasła zapisywane odwracalnie, konta z `PASSWD_NOTREQD`, konta bez AES, słowo „hasło” w opisie konta, liczność i nieużywane konta grup uprzywilejowanych, sIDHistory z SID-em uprzywilejowanym albo z tej samej domeny, `MachineAccountQuota`, zasady haseł i blokady kont, poziom funkcjonalny, Kosz AD, anonimowy dostęp do katalogu, zaufania bez filtrowania SID, pokrycie i rotacja LAPS, nieaktywne konta komputerów, hasła w SYSVOL (GPP `cpassword` i skrypty logowania).
+
+### Wskaźniki naruszenia (sekcja Podejrzane)
+
+Sekcja **Podejrzane** szuka śladów, które zwykle zostawia atakujący: przekierowanie programów ułatwień dostępu na ekranie logowania, własne pakiety LSA, AppInit_DLLs, pomocników netsh, monitorów wydruku, dostawców czasu, ukryte zadania harmonogramu (bez deskryptora SD), ukryte konta lokalne, biblioteki usług svchost spoza katalogu systemowego, wtyczkę serwera DNS, narzędzia zdalnego dostępu (AnyDesk, TeamViewer, ScreenConnect, RustDesk i ok. 20 innych), narzędzia ofensywne i zrzuty pamięci lsass, wykrycia i wyłączenia Defendera, dodane wykluczenia, przekierowane w pliku hosts domeny aktualizacji i producentów ochrony, zaufane certyfikaty narzędzi przechwytujących TLS oraz udane logowania RDP z adresów publicznych. Stacja dodatkowo sprawdza linie poleceń usług, zadań, autostartu i subskrypcji WMI pod kątem typowych technik (pobieranie i wykonywanie kodu, zakodowane polecenia, programy w katalogach tymczasowych).
+
+Narzędzia zdalnego dostępu używane w firmie wpisz w **Ustawienia → Listy → Zatwierdzone narzędzia zdalnego dostępu**. Wtedy są pokazywane jako informacja, a nie ostrzeżenie.
+
+Na Windows Server 2012 R2 z PowerShell 4.0 program nie sprawdza podpisów cyfrowych bibliotek (pakiety LSA, biblioteki usług), więc biblioteka spoza listy domyślnej ma tam poziom „Uwaga”, a nie „Krytyczne”.
+
+Kolektor sam nie wywołuje ostrzeżeń PowerShella o podejrzanej treści skryptu (zdarzenie 4104 na poziomie Warning, które systemy SIEM często traktują jako alarm). Skrypty oznaczone przez PowerShella na serwerze są pokazywane jako informacja, a ostrzeżeniem stają się dopiero wtedy, gdy ich treść pasuje do wzorców ataku.
 
 ## Wykrywane problemy
 
@@ -112,51 +234,87 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 
 **Krytyczny**
 
-- brak połączenia z serwerem;
-- mniej niż 10% wolnego miejsca na dysku;
-- nieudane logowania z adresów publicznych, czyli logowanie jest prawdopodobnie dostępne z internetu;
+- serwer nie odpowiada (z przyczyną z [diagnozy](#niedostępne-serwery)); maszyna wirtualna serwera wstrzymana (Paused) albo w stanie krytycznym na hoście;
+- host Hyper-V nie odpowiada razem z co najmniej 2 maszynami z listy, które na nim działały; nie odpowiada większość serwerów jednej podsieci; żaden serwer nie odpowiedział z powodu sieci stacji;
+- mniej niż 10% wolnego miejsca na dysku (także punkty montowania i wolumeny CSV);
+- nieudane logowania z adresów publicznych, czyli logowanie (RDP/SMB) jest prawdopodobnie dostępne z internetu;
 - wyczyszczony dziennik zdarzeń;
 - różnica czasu względem stacji co najmniej 300 s (limit Kerberos);
 - system po końcu wsparcia Microsoft;
-- dysk fizyczny w stanie awarii;
-- co najmniej 2 awarie BSOD w analizowanym okresie;
-- krytyczne ustawienia bezpieczeństwa: wyłączona ochrona w czasie rzeczywistym, sygnatury antywirusa starsze niż 7 dni, włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0;
-- kontroler domeny: błąd replikacji SYSVOL (DFSR), replikacja AD bez sukcesu od ponad doby, krytyczne zdarzenia replikacji.
+- dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
+- brak działającego antywirusa (także gdy produkt innego producenta jest zainstalowany, ale zatrzymany), sygnatury Defendera starsze niż 7 dni, zatrzymane usługi BFE lub zapory bez innej zapory;
+- krytyczne ustawienia bezpieczeństwa: włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0, Point and Print bez ostrzeżeń i uprawnień administratora, urząd certyfikacji z `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6);
+- w grupie Administratorzy jest grupa obejmująca wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy domeny i podobne);
+- wskaźniki naruszenia: przekierowany program ułatwień dostępu, niepodpisany pakiet LSA (PowerShell 5.1), ukryte zadanie harmonogramu, ukryte konto w grupie uprzywilejowanej, biblioteka usługi w katalogu tymczasowym, zrzut pamięci lsass, poważne zagrożenie wykryte przez Defendera, zablokowane w pliku hosts domeny aktualizacji, certyfikat narzędzia przechwytującego TLS, udane logowanie RDP z internetu, linia poleceń pobierająca i wykonująca kod;
+- Active Directory: delegowanie nieograniczone, delegowanie albo RBCD wobec kontrolerów domeny, prawa replikacji (DCSync) poza grupami administracyjnymi, uprzywilejowane konta z SPN albo bez wstępnego uwierzytelniania Kerberos, hasła w preferencjach zasad grupy (`cpassword`), uprzywilejowany SID w sIDHistory;
+- kontroler domeny: błąd replikacji SYSVOL (DFSR), replikacja AD bez sukcesu od ponad doby, krytyczne zdarzenia replikacji;
+- Hyper-V: maszyna wstrzymana (zwykle brak miejsca na wolumenie z dyskami) albo w stanie krytycznym (brak dostępu do plików maszyny);
+- klaster: węzeł w stanie Down, wolumen CSV nie Online, rola maszyny w stanie Failed.
 
 **Ostrzeżenie**
 
+- skan serwera przekroczył limit czasu (pokazane są poprzednie dane); serwer odpowiada, ale kolektor zakończył się błędem; maszyna wirtualna serwera wyłączona (do 30 dni) lub zapisana; niedostępny gość niedostępnego hosta Hyper-V;
 - mniej niż 20% wolnego miejsca na dysku;
 - uptime powyżej 45 dni, oczekujący restart, brak aktualizacji od ponad 45 dni;
-- użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci;
+- użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci (na hoście Hyper-V zamiast progu RAM liczy się zapas wolnej pamięci: mniej niż 8 GB);
 - zatrzymane usługi automatyczne, niecytowane ścieżki usług, nieudane zadania harmonogramu;
-- zdarzenia krytyczne w dziennikach, nieoczekiwane wyłączenia, pliki zrzutów pamięci;
-- co najmniej 25 nieudanych logowań, zmiany kont i członkostwa w grupach, włączone konto Gość;
-- certyfikaty wygasające w ciągu 30 dni, checkpointy Hyper-V starsze niż 7 dni, problemy z heartbeatem lub replikacją VM;
-- dysk dynamiczny VM, który może urosnąć ponad wolne miejsce na wolumenie;
+- zdarzenia krytyczne w dziennikach, nieoczekiwane wyłączenia (z odesłaniem do sekcji Przestoje), pojedyncza awaria BSOD, pliki zrzutów pamięci;
+- co najmniej 25 nieudanych logowań, utworzenie lub usunięcie konta, dodanie do grupy, włączone konto Gość;
+- certyfikaty wygasające w ciągu 30 dni;
 - pełny dziennik zdarzeń, dziennik Security obejmujący krótszy okres niż analiza, niepełna polityka audytu;
-- zużycie SSD co najmniej 90%, nieskorygowane błędy dysków, ponowienia operacji dyskowych;
+- zużycie SSD co najmniej 90%, nieskorygowane błędy dysków, błędy dysku i NTFS, co najmniej 10 ponowień lub resetów operacji dyskowych;
 - porty wrażliwe otwarte z dowolnego adresu, gdy karta sieciowa jest w profilu Publicznym;
 - subskrypcje WMI uruchamiające polecenia lub skrypty (możliwy mechanizm trwałości);
-- różnica czasu co najmniej 60 s, kontroler PDC bez zewnętrznego źródła czasu;
-- ustawienia hardeningu oznaczone jako „Uwaga”, np. włączony SMBv1, RDP bez NLA, wyłączony UAC;
+- różnica czasu co najmniej 60 s, kontroler PDC bez zewnętrznego źródła czasu albo biorący czas z hosta Hyper-V;
+- ustawienia hardeningu oznaczone jako „Uwaga”, np. włączony SMBv1, RDP bez NLA albo bez TLS, LM/NTLM poniżej poziomu 3, wyłączony UAC, Print Spooler na kontrolerze domeny, PowerShell 2.0, jawnie włączone TLS 1.0/1.1, WinRM bez szyfrowania lub z Basic, TrustedHosts `*`, dostęp anonimowy, `AlwaysInstallElevated`, wyłączona usługa Windows Update, błąd aktualizacji certyfikatów Secure Boot, szyfrowanie wniosków RPC urzędu certyfikacji niewymagane (ESC11);
+- ochrona: zapora Windows wyłączona bez potwierdzonej zapory innego producenta, profil zapory przepuszczający ruch przychodzący, dwa silniki antywirusowe naraz, wyłączone składniki Defendera, czujnik Defender for Endpoint nie działa, powtarzające się awarie usługi ochrony, serwer bez agenta ochrony działającego na większości floty;
+- wbudowane konto administratora włączone z hasłem starszym niż rok; grupa „wszyscy” w Użytkownikach zarządzania zdalnego;
+- Active Directory: hasło krbtgt starsze niż rok, zbyt liczne albo nieużywane konta uprzywilejowane, konta bez AES, z hasłem odwracalnym, `PASSWD_NOTREQD`, słowo „hasło” w opisie, anonimowe operacje LDAP, zaufanie bez filtrowania SID, niskie pokrycie LAPS albo hasła LAPS niezmieniane, minimalna długość hasła poniżej 8;
+- kontroler domeny: SYSVOL jeszcze na FRS, błędy replikacji z ostatniej doby, ostrzeżenia replikacji, wymuszanie podpisywania LDAP i channel binding wyłączone;
+- Hyper-V na hoście: usługa vmms nie działa; vCPU działających maszyn powyżej 6 na procesor logiczny; RAM przydzielony maszynom co najmniej 90% RAM hosta;
+- Hyper-V na maszynach: maszyna w stanie zapisanym, działająca maszyna bez odpowiedzi heartbeat (system gościa zawieszony), problemy replikacji, karta sieciowa niepodłączona do przełącznika, maszyna spoza klastra, która nie wystartuje sama po restarcie hosta, wyłączanie maszyny przez „TurnOff” przy zamykaniu hosta, pamięć dynamiczna na maksimum, łańcuch dysków różnicowych dłuższy niż 3, dysk maszyny na dysku systemowym hosta;
+- checkpointy starsze niż 7 dni, checkpoint typu Recovery starszy niż doba (pozostałość po kopii zapasowej);
+- dyski dynamiczne VM, które mogą urosnąć ponad wolne miejsce na wolumenie – na wolumenach CSV i udziałach SMB liczone łącznie dla wszystkich hostów;
+- klaster: węzeł w innym stanie niż Up/Down (np. Paused), rola częściowo online, kworum nie Online, klaster nie przetrwa awarii największego węzła (N+1);
+- wszystkie skanowane kontrolery domeny działają na jednym hoście;
+- zegar stacji różni się od większości serwerów (wtedy różnice czasu serwerów są liczone względem mediany, zamiast ostrzeżenia na każdym serwerze);
 - nowe pozycje od poprzedniego skanu.
 
 **Info**
 
+- zalecenie naprawy dla niedostępnego serwera; maszyna wyłączona od ponad 30 dni (prawdopodobnie wycofana); serwer z Linuksem pominięty;
 - podsumowanie błędów w dziennikach, zainstalowane usługi, nowe lub zaktualizowane oprogramowanie z ostatnich 14 dni;
 - konta z hasłem bez wygasania, osierocone SID-y w grupach, wygasłe certyfikaty;
 - udziały z zapisem dla Wszystkich, pliki wykonywalne w sprawdzanych folderach;
-- wyłączone maszyny wirtualne, rozłączone sesje, połączenia przychodzące z adresów publicznych, wykluczenia Defendera;
+- wyłączone maszyny wirtualne, stara wersja konfiguracji maszyny (Windows Server 2022/2025 jej nie uruchomi), przestoje z ostatnich dni z inicjatorem ostatniego restartu;
+- rozłączone sesje, połączenia przychodzące z adresów publicznych, wykluczenia Defendera;
 - zbliżający się koniec wsparcia systemu (365 dni);
+- skan serwera trwał co najmniej 70% limitu czasu (z trzema najwolniejszymi sekcjami);
+- ta sama maszyna na liście pod dwiema nazwami (alias DNS, adres IP, nazwa klastra);
+- zbiorcze zalecenia utwardzenia serwera („Do utwardzenia (N): …”) i domeny („Do utwardzenia w domenie (N): …”);
+- serwer chroniony innym produktem niż większość floty.
+
+Pozycje sekcji **Podejrzane** na poziomie informacji (zatwierdzone narzędzia zdalnego dostępu, skrypty oznaczone przez PowerShella bez cech ataku, zmiany Defendera wprowadzone zasadami grupy albo przy innym antywirusie) są tylko wyróżnione w tej sekcji i nie trafiają na listę problemów.
 - sekcje, których nie udało się zebrać na danym serwerze.
+
+## Wyciszanie problemów
+
+Przy kilkuset serwerach część problemów to świadome wyjątki (np. stara aplikacja wymagająca TLS 1.0). Takie problemy można wyciszyć:
+
+- prawy klik na problemie → **Wycisz na serwerze …** albo **Wycisz na wszystkich serwerach**;
+- wyciszony problem nie liczy się do kafelków, liczników na liście serwerów ani raportu podsumowującego, a w szczegółach serwera jest pokazany na końcu, wyszarzony;
+- pole **Wyciszone** nad listą problemów pokazuje wyciszone problemy, a prawy klik → **Przywróć** usuwa wyciszenie;
+- pełna lista reguł (serwer, treść, kiedy i kto wyciszył) jest w **Ustawienia → Wyciszone problemy…**.
+
+Reguła działa także w kolejnych skanach, bo wartości zmienne w treści problemu (procenty, liczby dni, daty, liczniki) są przy dopasowaniu pomijane. Nazwy maszyn, numery zdarzeń, portów i aktualizacji KB są brane pod uwagę, więc wyciszenie problemu jednej maszyny nie wycisza innych. Reguły zapisują się w `settings.json`.
 
 ## Porównanie z poprzednim skanem
 
-Każdy skan zapisuje migawkę danych serwera w pliku JSON. Kolejny skan porównuje się z poprzednim i w sekcji **Zmiany od poprzedniego skanu** pokazuje nowe oraz usunięte pozycje w obszarach:
+Każdy skan zapisuje migawkę danych serwera (skompresowany JSON). Kolejny skan porównuje się z poprzednim i w sekcji **Zmiany od poprzedniego skanu** pokazuje nowe oraz usunięte pozycje w obszarach:
 
 - usługi spoza Microsoft;
 - zadania harmonogramu;
-- porty nasłuchujące;
+- porty nasłuchujące (porty dynamiczne RPC 49152+ porównywane są po procesie i usłudze, bo zmieniają się po każdym restarcie);
 - grupy uprzywilejowane i konta lokalne;
 - udziały;
 - autostart;
@@ -164,50 +322,133 @@ Każdy skan zapisuje migawkę danych serwera w pliku JSON. Kolejny skan porównu
 - subskrypcje WMI i wykluczenia AV;
 - reguły zapory.
 
-Nowe pozycje są zgłaszane jako ostrzeżenia, a w przypadku oprogramowania jako informacja. Sekcja pominięta w którymkolwiek z porównywanych skanów nie jest porównywana.
+Nowe pozycje są zgłaszane jako ostrzeżenia, a w przypadku oprogramowania jako informacja.
+
+**Sekcja pominięta w poprzednim skanie.** Jeśli sekcję odznaczono na jeden lub kilka skanów (albo jej zebranie się nie udało), po ponownym włączeniu program porównuje ją z ostatnim skanem, w którym była zebrana – zmiany z okresu, gdy była pominięta, nie giną. Takie zmiany są podpisane „od skanu z <data>”. Sekcja pominięta albo niezebrana w bieżącym skanie nie jest porównywana (inaczej cała jej zawartość wyglądałaby na „usuniętą”).
+
+Pierwszy skan po aktualizacji programu do nowej wersji kolektora nie jest porównywany – zmiany są pokazywane od kolejnego skanu.
 
 ## Raport HTML
 
-Przycisk **Raport HTML** zapisuje raport w folderze `Reports` jako `Przeglad_serwerow_RRRRMMDD_GGMM.html` i otwiera go w przeglądarce. Raport zawiera:
+Menu **Raport** ma dwie wersje raportu:
 
-- kafelki z podsumowaniem i listę wszystkich problemów;
-- zwijane szczegóły każdego serwera ze wszystkimi sekcjami.
+- **Podsumowanie** – kafelki, wszystkie aktywne problemy, niedostępne serwery z przyczyną, hosty i maszyny Hyper-V wymagające uwagi oraz, dla każdego serwera, tylko wiersze oznaczone jako problem. Nadaje się do przesłania dalej.
+- **Pełny** – dodatkowo wszystkie sekcje każdego serwera, wczytywane kolejno z migawek (do 500 wierszy na sekcję). Przy ponad 60 serwerach program pyta o potwierdzenie, bo plik może mieć kilkadziesiąt MB.
 
-Wygląd dopasowuje się do jasnego lub ciemnego motywu systemu, a raport nadaje się do druku.
+Menu ma też pozycję **Otwórz folder raportów**. Raport zapisuje się w folderze `Reports` jako `Przeglad_serwerow_RRRRMMDD_GGMM.html` (wersja pełna z dopiskiem `_pelny`) i otwiera w przeglądarce. Wygląd dopasowuje się do jasnego lub ciemnego motywu systemu, a raport nadaje się do druku. Raport powstaje strumieniowo, bez wczytywania wszystkich danych do pamięci naraz.
+
+## Dziennik operacji i dziennik dostępności
+
+**Dziennik operacji** (przycisk **Dziennik** na pasku stanu albo **Ctrl+L**) to panel na dole okna z przebiegiem pracy programu: start i koniec skanów, wynik każdego serwera (z czasem skanu i najwolniejszymi sekcjami), przyczyny niedostępności, ponowne próby, zmiany ustawień, wyciszenia, błędy. Filtr pokazuje wszystko, tylko ostrzeżenia i błędy albo tylko błędy. Przy ukrytym panelu licznik na przycisku pokazuje liczbę nowych ostrzeżeń i błędów. Wpisy można skopiować, a przyciskami obok otworzyć plik dziennika albo folder `Logs`. Dziennik zapisuje się do pliku `Logs\ServerReview_RRRRMMDD.log` (jeden plik na dzień).
+
+**Dziennik dostępności** to plik `Logs\Availability_RRRRMM.csv` (jeden na miesiąc, separator `;`, otwiera się w Excelu). Każdy wynik skanu każdego serwera to jeden wiersz:
+
+| Kolumna | Zawartość |
+|---|---|
+| Czas | data i godzina wyniku |
+| Serwer | nazwa z listy |
+| Status | `OK`, `Brak połączenia`, `Błąd zbierania danych` albo `Limit czasu` |
+| CzasSkanu | czas skanu serwera [s] |
+| Krytyczne, Ostrzezenia | liczba problemów po udanym skanie |
+| Rodzaj | rodzaj niedostępności, np. `Offline`, `Firewall`, `WinRM`, `Dns`, `Auth`, `Kerberos` |
+| Szczegoly | przyczyna po polsku |
+
+Na tej podstawie tabela stanu serwerów pokazuje dostępność z ostatnich 30 dni i datę ostatniego udanego skanu, a szczegóły serwera – historię skanów. Obydwa dzienniki są przechowywane przez 90 dni (ustawienie „Przechowuj dziennik operacji i dostępności”).
+
+## Blokada programu (PIN)
+
+Blokada chroni otwarty program przed osobą postronną przy odblokowanej stacji (np. gdy administrator odejdzie od biurka z otwartym programem i poświadczeniami do serwerów).
+
+- **Ustawienie PIN-u:** **Ustawienia → Ustaw PIN…** (4–8 cyfr). Zmiana i usunięcie PIN-u wymagają podania obecnego. W `settings.json` zapisuje się tylko sól i skrót PBKDF2, nigdy sam PIN.
+- **Blokowanie:** przycisk z kłódką na górze okna, **Ctrl+Shift+L** albo automatycznie po bezczynności (domyślnie 10 minut, `0` wyłącza). Przy uruchomieniu programu PIN jest wymagany, jeśli zaznaczono „Wymagaj PIN-u przy uruchomieniu programu”.
+- **W czasie blokady** zawartość okien programu jest ukryta, ale skan w tle trwa dalej. PIN wpisuje się klawiaturą (także numeryczną) albo przyciskami na ekranie.
+- **Błędny PIN:** na ekranie blokady po 5 nieudanych próbach wpisywanie jest wstrzymane na 30 sekund (bez limitu cykli). Przy uruchomieniu programu 5 błędnych prób kończy program bez otwierania okna.
+- **Zamknięcie bez PIN-u:** przycisk **Zakończ awaryjnie** na ekranie blokady, potwierdzony drugim kliknięciem w ciągu 10 sekund. Program się wtedy zamyka, a dane zostają na dysku.
+
+Bez ustawionego PIN-u blokada jest wyłączona, a przycisk z kłódką ukryty. Skan bez okna (`-Scan`) nie wymaga PIN-u. Blokada nie chroni przed administratorem komputera – skrypt i pliki danych to zwykłe pliki.
 
 ## Ustawienia
 
-Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.json` obok skryptu i nadpisują wartości domyślne z bloku `$Config` na początku skryptu. Przycisk „Przywróć domyślne” wraca do tych wartości.
+Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.json` obok skryptu i nadpisują wartości domyślne z bloku `$Config` na początku skryptu. Przycisk „Przywróć domyślne” wraca do tych wartości, a „Folder danych” otwiera folder programu. Po zapisaniu zmienionych progów wyniki są analizowane ponownie, bez nowego skanu – od razu albo, jeśli trwa skan, zaraz po jego zakończeniu.
 
-**Zakres skanu.** Odznaczone sekcje nie są zbierane ani porównywane, co skraca skan. Liczba pomijanych sekcji wyświetla się przy zębatce.
+**Zakres skanu.** Odznaczone sekcje nie są zbierane ani porównywane, co skraca skan. Liczba pomijanych sekcji wyświetla się przy zębatce. Sekcja **Czas zbierania sekcji** w szczegółach serwera pokazuje, które sekcje trwają najdłużej.
 
-**Parametry i progi**
+**Skan**
 
 | Ustawienie | Domyślnie |
 |---|---|
 | Zakres zdarzeń [dni] | 7 |
-| Limit pobieranych zdarzeń na dziennik | 3000 |
-| Uwzględniaj ostrzeżenia z dzienników System/Application | nie |
-| Dysk: ostrzeżenie / krytyczne poniżej [% wolnego] | 20 / 10 |
-| RAM / pamięć wirtualna: ostrzeżenie od [%] | 90 / 90 |
+| Limit pobieranych zdarzeń (osobno dla każdego dziennika i rodzaju) | 3000 |
+| Uwzględniaj ostrzeżenia z dzienników System/Application (dużo szumu) | nie |
+| Ile serwerów skanować równolegle | 25 |
+| Limit czasu jednego serwera [s] | 300 |
+| Limit nawiązania połączenia WinRM [s] | 30 |
+| Limit czasu całego skanu [s] | 3600 |
+| Szybki test portu WinRM 5985 przed skanem (wyłączone serwery są rozpoznawane w kilka sekund) | tak |
+| Po skanie ponów raz serwery z błędem, który może być chwilowy (restart, przeciążony WinRM) | tak |
+
+**Progi: system i dyski**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Dysk: ostrzeżenie poniżej [% wolnego] | 20 |
+| Dysk: krytyczne poniżej [% wolnego] | 10 |
+| RAM: ostrzeżenie od [%] | 90 |
+| Pamięć wirtualna (commit): ostrzeżenie od [%] | 90 |
 | Uptime: ostrzeżenie powyżej [dni] | 45 |
 | Aktualizacje: ostrzeżenie po [dniach] | 45 |
-| Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem | 30 |
-| Checkpoint Hyper-V: ostrzeżenie po [dniach] | 7 |
-| Nieudane logowania: ostrzeżenie od [liczba] | 25 |
-| Nowe oprogramowanie: z ostatnich [dni] | 14 |
-| Różnica czasu: ostrzeżenie / krytyczne od [s] | 60 / 300 |
 | Koniec wsparcia systemu: uprzedzaj [dni] wcześniej | 365 |
+| Różnica czasu: ostrzeżenie od [s] | 60 |
+| Różnica czasu: krytyczne od [s] | 300 |
 | Zużycie SSD: ostrzeżenie od [%] | 90 |
 | Ponowienia/resety I/O dysku: ostrzeżenie od [liczba] | 10 |
 | BSOD: krytyczne od [liczba w okresie] | 2 |
-| Ile serwerów skanować równolegle | 25 |
-| Limit czasu całego skanu [s] | 900 |
-| Ile migawek każdego serwera przechowywać | 30 |
-| Foldery sprawdzane na serwerach | `C:\Temp`, `C:\Windows\Temp`, `C:\Users\Public\Downloads`, `C:\Install`, `C:\Scripts` |
-| Usługi automatyczne, których zatrzymanie jest OK | lista usług systemowych (obsługuje wildcardy `*`) |
-| Porty wrażliwe dla sekcji Ekspozycja | 21, 22, 23, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 5985, 5986 |
-| Subskrypcje WMI traktowane jako systemowe | subskrypcje obecne w czystym systemie |
+
+**Progi: bezpieczeństwo**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem | 30 |
+| Nieudane logowania: ostrzeżenie od [liczba] | 25 |
+| Nowe oprogramowanie: z ostatnich [dni] | 14 |
+
+**Hyper-V**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Checkpoint: ostrzeżenie po [dniach] | 7 |
+| Host: RAM przydzielony działającym maszynom – ostrzeżenie od [% RAM hosta] | 90 |
+| Host: vCPU działających maszyn na procesor logiczny – ostrzeżenie powyżej | 6 |
+| Host: ostrzeżenie, gdy wolnej pamięci zostaje mniej niż [GB] (zamiast progu RAM %) | 8 |
+| Maszyna wyłączona dłużej niż [dni] = prawdopodobnie wycofana (informacja zamiast ostrzeżenia) | 30 |
+
+**Diagnostyka i Active Directory**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Diagnoza niedostępności: limit próby DNS/ping/portu [ms] | 2000 |
+| Diagnoza niedostępności: sprawdzane porty TCP (jeden na linię) | 5985, 5986, 135, 445, 3389 |
+| „Pobierz z AD”: jednostka organizacyjna (DN), puste = cała domena | (puste – cała domena) |
+| „Pobierz z AD”: pomijaj konta nieaktywne dłużej niż [dni] | 60 |
+
+**Dane, dziennik i blokada**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Ile migawek (skanów) każdego serwera przechowywać | 30 |
+| Kompresuj migawki (.json.gz – ok. 10x mniej miejsca) | tak |
+| Przechowuj dziennik operacji i dostępności [dni] | 90 |
+| Blokada programu po bezczynności [min] (0 = wyłączona; wymaga PIN-u) | 10 |
+
+**Listy**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Foldery sprawdzane na serwerach (jeden na linię, zmienne środowiskowe dozwolone) | `C:\Temp`, `C:\Windows\Temp`, `C:\Users\Public\Downloads`, `C:\Install`, `C:\Scripts` |
+| Usługi automatyczne, których zatrzymanie jest OK (jedna na linię, wildcardy `*`) | lista usług systemowych (obsługuje wildcardy `*`) |
+| Porty wrażliwe dla sekcji Ekspozycja (jeden na linię) | 21, 22, 23, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 5985, 5986 |
+| Subskrypcje WMI traktowane jako systemowe (jedna na linię) | subskrypcje obecne w czystym systemie |
+| Zatwierdzone narzędzia zdalnego dostępu – tylko informacja, nie ostrzeżenie (jedno na linię, np. TeamViewer, Atera; wildcardy `*`) | (puste) |
 
 Pole „Zdarzenia z ostatnich … dni” w głównym oknie zmienia zakres tylko dla bieżącego skanu.
 
@@ -219,33 +460,59 @@ Program trzyma wszystkie dane w folderze, w którym leży skrypt:
 
 ```text
 ServerReview.ps1
-servers.txt                                  lista serwerów
-settings.json                                ustawienia z okna Ustawienia
-Snapshots\RRRRMMDD_GGMMSS\<serwer>.json      migawki skanów
-Reports\Przeglad_serwerow_RRRRMMDD_GGMM.html raporty HTML
+servers.txt                                       lista serwerów
+settings.json                                     ustawienia, wyciszenia, stan okna, skrót PIN-u
+Snapshots\RRRRMMDD_GGMMSS\<serwer>.json.gz        migawki skanów (skompresowane)
+Snapshots\RRRRMMDD_GGMMSS\<serwer>.offline.json   nieudana próba: błąd i wynik diagnozy
+Reports\Przeglad_serwerow_RRRRMMDD_GGMM.html      raporty HTML
+Logs\ServerReview_RRRRMMDD.log                    dziennik operacji
+Logs\Availability_RRRRMM.csv                      dziennik dostępności
 ```
 
-Jeśli skrypt uruchomiono bez pliku (np. wklejony do konsoli), zamiast folderu skryptu używany jest `%USERPROFILE%\Documents\ServerReview`.
+Jeśli skrypt uruchomiono bez pliku (np. wklejony do konsoli), zamiast folderu skryptu używany jest `%USERPROFILE%\Documents\ServerReview`. Jeśli folder skryptu jest tylko do odczytu (np. udział sieciowy), dane trafiają do `%LOCALAPPDATA%\ServerReview`, a lista serwerów i ustawienia są tam kopiowane przy pierwszym uruchomieniu.
 
-Dla każdego serwera przechowywanych jest domyślnie 30 ostatnich migawek. Starsze są usuwane po skanie, a puste foldery skanów znikają.
+Dla każdego serwera przechowywanych jest domyślnie 30 ostatnich migawek (znaczniki nieudanych prób też się liczą). Starsze są usuwane po skanie, ale ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych. Puste foldery starych skanów znikają. Migawki z poprzednich wersji programu (`.json`) są nadal odczytywane. Migawki i ustawienia zapisują się przez plik tymczasowy, więc przerwany zapis nie psuje danych.
+
+## Duże środowiska
+
+Program jest przygotowany na kilkaset serwerów i kilkadziesiąt hostów Hyper-V:
+
+- każdy serwer to osobne zadanie w puli wątków, z własnym limitem czasu liczonym od chwili, gdy jego skan faktycznie ruszył – serwery z końca kolejki nie są oznaczane jako niedostępne tylko dlatego, że czekały;
+- hosty Hyper-V i serwery, które ostatnio skanowały się najdłużej, idą na początek kolejki, żeby nie wydłużać końcówki skanu;
+- odbiór wyników, zapis migawek, parsowanie i diagnoza niedostępności odbywają się w tle; okno odświeża się co ok. 1,5 s i pozostaje responsywne;
+- migawki są kompresowane (ok. 10 razy mniej miejsca), a w pamięci trzymane są tylko dane potrzebne do list i raportu podsumowującego – pełne dane serwera wczytują się z dysku przy otwarciu jego szczegółów;
+- wyniki z dysku wczytują się przy starcie równolegle, a indeks migawek powstaje w jednym przejściu po folderach;
+- liczba równoległych połączeń, limity czasu i liczba przechowywanych migawek są w Ustawieniach.
+
+Przy ok. 400 serwerach rozsądne wartości to 25–50 równoległych skanów i limit jednego serwera 300 s. Jeśli serwery z dużymi dziennikami zdarzeń skanują się długo, sekcja **Czas zbierania sekcji** pokaże, co warto wyłączyć albo ograniczyć.
 
 ## Rozwiązywanie problemów
 
-- **Brak połączenia z serwerem.** Sprawdź WinRM poleceniem `Test-WSMan SRV01`. Na serwerze włączysz go przez `Enable-PSRemoting -Force`, a zapora musi przepuszczać port 5985.
-- **Serwer dodany po adresie IP.** WinRM wymaga wtedy wpisu w TrustedHosts na stacji i podania konta przyciskiem „Konto”:
+- **Brak połączenia z serwerem.** Otwórz sekcję **Diagnoza połączenia** – przyczyna i zalecenie są tam wypisane. Najczęstsze przypadki:
+  - *Serwer nie odpowiada w sieci* – wyłączony, odłączony albo całkowicie odfiltrowany; dla maszyny wirtualnej sprawdź stan na hoście.
+  - *Port 5985 zamknięty* – usługa WinRM zatrzymana albo brak listenera: `Enable-PSRemoting -Force` na serwerze.
+  - *Port 5985 blokowany* – reguła zapory „Windows Remote Management (HTTP-In)” wyłączona albo ograniczona do podsieci lokalnej (np. karta sieciowa w profilu Publicznym), albo zapora sieciowa między stacją a serwerem.
+  - *Kerberos 0x80090322* – zduplikowany SPN `HTTP/<serwer>`, alias DNS albo nieaktualny rekord DNS; diagnoza pokazuje konto, na którym jest SPN.
+  - *Odmowa dostępu* – konto nie jest administratorem lokalnym serwera.
+- **Serwer dodany po adresie IP.** WinRM wymaga wtedy wpisu w TrustedHosts na stacji i podania konta przyciskiem z nazwą konta:
 
   ```powershell
   Set-Item WSMan:\localhost\Client\TrustedHosts -Value 10.0.0.5 -Concatenate
   ```
 
-- **„Przekroczono limit czasu”.** Zwiększ limit czasu skanu w ustawieniach albo odznacz najwolniejsze sekcje, np. połączenia, oprogramowanie lub foldery.
+- **„Przekroczono limit czasu jednego serwera”.** Zwiększ limit w Ustawieniach albo odznacz najwolniejsze sekcje (sekcja **Czas zbierania sekcji** pokazuje, które to są). Do czasu następnego udanego skanu widoczne są poprzednie dane serwera.
+- **„Kolektor przerwał pracę” / „kolektor nie kompiluje się”.** Serwer odpowiada, ale skrypt zbierający dane zakończył się błędem. Treść błędu (z numerem linii i wersją PowerShell serwera) jest w diagnozie i w dzienniku operacji.
+- **„Proces WinRM przerwał pracę”.** Najczęściej limit pamięci powłoki WinRM na serwerze: `winrm set winrm/config/winrs @{MaxMemoryPerShellMB="2048"}` albo odznacz duże sekcje.
 - **Puste zdarzenia bezpieczeństwa.** Konto musi mieć uprawnienia administratora na serwerze. Sekcja **Polityka audytu** pokazuje, których zdarzeń system w ogóle nie rejestruje.
 - **Informacja „Nie udało się zebrać: …”.** Jedna sekcja nie zadziałała na danym serwerze, np. brak modułu w starszym systemie. Pozostałe dane są kompletne.
+- **Coś poszło nie tak.** Zajrzyj do dziennika operacji (Ctrl+L) – błędy programu i serwerów są tam opisane, także w pliku `Logs\ServerReview_RRRRMMDD.log`.
 - **Popsute polskie znaki po edycji skryptu.** Zapisuj plik jako UTF-8 z BOM, bo Windows PowerShell 5.1 bez BOM odczytuje go w złym kodowaniu.
 
 ### Czy program coś zmienia na serwerach?
 
-Nie, tylko odczytuje dane. Jedyny zapis to tymczasowy plik z wynikiem `auditpol /backup` w folderze `%TEMP%` serwera, usuwany zaraz po odczytaniu.
+Nie, tylko odczytuje dane. Jedyne zapisy to pliki tymczasowe w folderze `%TEMP%` serwera, usuwane zaraz po odczytaniu: wynik `auditpol /backup` oraz – tylko na kontrolerach domeny – wynik `secedit /export` z obowiązującymi zasadami haseł. Kontrole Active Directory tylko czytają katalog i nie odczytują haseł ani atrybutów poufnych (LAPS, BitLocker).
+
+Kolektor nie zawiera treści, które PowerShell uznaje za podejrzane, więc skan nie zostawia na serwerach ostrzeżeń 4104 ani alarmów SIEM. Starsze wersje programu takie ostrzeżenia wywoływały – sekcja **Podejrzane** pokazuje je osobno jako informację.
 
 ## Licencja
 
