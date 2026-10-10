@@ -3115,7 +3115,8 @@ function Add-SnapshotIndexEntry([string]$Name, [string]$Path, [bool]$Offline) {
 }
 function Get-SnapshotEntries([string]$Name) {
     $l = $script:SnapIndex[(Get-SnapshotKey $Name)]
-    if ($l) { @($l) } else { @() }
+    # lista z New-Object jest opakowana w PSObject – @($l) rzuca wtedy „Argument types do not match” (PS 5.1), więc ToArray()
+    if ($l) { $l.ToArray() } else { @() }
 }
 function Get-OlderOnlineSnapshots([string]$Name, [string]$AfterPath, [int]$Max = 8) {
     # Udane migawki starsze niż $AfterPath (od najnowszej) – źródło sekcji pominiętych w poprzednim skanie (Merge-PrevSections)
