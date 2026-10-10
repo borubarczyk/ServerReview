@@ -281,7 +281,6 @@ $Collector = {
         $sys.Domain        = $cs.Domain
         $sys.DomainRole    = $roles[[int]$cs.DomainRole]
         $sys.IsDC          = ([int]$cs.DomainRole -ge 4)
-        $sys.PartOfDomain  = [bool]$cs.PartOfDomain
         $sys.DomainRoleId  = [int]$cs.DomainRole
         $sys.BuildNumber   = [int]$os.BuildNumber
         # Pamięć wirtualna (commit): limit = RAM + pliki stronicowania
@@ -364,295 +363,33 @@ $Collector = {
     try { $sys.TimeZone = [TimeZoneInfo]::Local.Id } catch { $sys.TimeZone = '' }   # Get-TimeZone jest dopiero w PS 5.1
     $sys.PSVersion = $PSVersionTable.PSVersion.ToString()
 
-    # ── Ochrona: antywirus i EDR (także innych producentów) oraz zapora ──
-    # Na Windows Server nie ma Centrum zabezpieczeń (root\SecurityCenter2), więc produkt rozpoznajemy po usługach, załadowanych
-    # minifiltrach (fltmc), sterownikach, wpisach Programów i rejestracjach zapory. Wyłączony Defender albo zapora Windows to stan
-    # prawidłowy, gdy ochronę przejął inny produkt – wtedy tylko informacja. Katalog: Svc/Core – usługi (Core = działa produkt),
-    # Path – ścieżka usługi, Uninst – wpis w Programach, Flt – minifiltry, Rtp – minifiltr ochrony plików w czasie rzeczywistym,
-    # AvSvc/AvFlt – dodatkowy warunek „to jest antywirus”, Fw – Replace (własna zapora) / Manage (zarządza zaporą Windows) / None,
-    # FwInd – usługa albo sterownik aktywnego modułu zapory, FwIf – moduł zapory zainstalowany (wpis w Programach).
-    $protection = New-Object System.Collections.Generic.List[object]
-    $secInventory = @()
-    $sys.AV = ''; $sys.AvActive = $false; $sys.AvThirdParty = ''; $sys.FirewallManagedBy = ''
-    $svcAll = @()
-    $t0 = $sw.Elapsed.TotalSeconds
-    if (Want 'Protection') {
-        function Add-Prot($comp, $prod, $state, $detail, $status) { $protection.Add([pscustomobject]@{ Component = $comp; Product = "$prod"; State = "$state"; Detail = (Short "$detail" 500); Status = $status }) }
-        $secCat = @(
-            @{ Id = 'MDAV';    Name = 'Microsoft Defender Antivirus';             Type = 'AV';        Svc = '^(WinDefend|WdNisSvc|MDCoreSvc)$'; Core = '^WinDefend$'; Flt = '^wdfilter$'; Rtp = '^wdfilter$' }
-            @{ Id = 'MDE';     Name = 'Microsoft Defender for Endpoint (Sense)';  Type = 'EDR';       Svc = '^Sense$'; Core = '^Sense$'; Flt = '^mssecflt$' }
-            @{ Id = 'SCEP';    Name = 'System Center Endpoint Protection / Microsoft Antimalware'; Type = 'AV'; Svc = '^MsMpSvc$'; Core = '^MsMpSvc$'; Path = @('*\Microsoft Security Client\*'); Uninst = '^(System Center (2012 )?Endpoint Protection|Microsoft Security Client|Microsoft Antimalware|Forefront Endpoint Protection)'; Flt = '^mpfilter$'; Rtp = '^mpfilter$' }
-            @{ Id = 'BDGZ';    Name = 'Bitdefender GravityZone (BEST)';           Type = 'EDR+AV';    Svc = '^(EPSecurityService|EPProtectedService|EPIntegrationService|EPUpdateService|EPRedline)$'; Core = '^(EPSecurityService|EPProtectedService)$'; Path = @('*\Bitdefender\Endpoint Security\*'); Uninst = '^Bitdefender Endpoint Security Tools'; Flt = '^(gzflt|bdsvm|trufos|avc3|avckf|atc|gemma|ignis|hbflt|vlflt|bddevflt|edrsensor|bdprivmon)$'; Fw = 'Replace'; FwInd = '^(bdfwfpf|bdfndisf6?)$' }
-            @{ Id = 'ESET';    Name = 'ESET (Server Security / Endpoint / PROTECT)'; Type = 'AV';     Svc = '^(ekrn|EraAgentSvc)$'; Core = '^ekrn$'; Path = @('*\ESET\ESET Security\*', '*\ESET\ESET File Security\*', '*\ESET\ESET Server Security\*', '*\ESET\ESET Endpoint*'); Uninst = '^ESET (Server Security|File Security|Endpoint Security|Endpoint Antivirus|Mail Security|Security|NOD32|Management Agent|Inspect Connector)'; Flt = '^(eamonm|ehdrv|edevmon|edevmonm)$'; Rtp = '^eamonm$'; Fw = 'Replace'; FwIf = '^ESET Endpoint Security'; FwInd = '^(epfwwfp)$' }
-            @{ Id = 'SOPHOS';  Name = 'Sophos (Intercept X / Server Protection)'; Type = 'EDR+AV';    Svc = '^(SAVService|SAVAdminService|SntpService|hmpalertsvc|swi_service|swi_filter|swi_update(_64)?|SEDService|sophossps|Sophos .+)$'; Core = '^(SAVService|SEDService|Sophos Endpoint Defense Service|Sophos File Scanner Service|hmpalertsvc)$'; Path = @('*\Sophos\Endpoint Defense\*', '*\Sophos\Sophos Anti-Virus\*', '*\Sophos\Sophos File Scanner\*', '*\Sophos\Management Communications System\*', '*\HitmanPro.Alert\*'); Uninst = '^Sophos (Endpoint Agent|Anti-Virus|Intercept X|Server Protection|Endpoint Defense)'; Flt = '^(sophosed|savonaccess|sld|soidriver)$'; Fw = 'Replace'; FwIf = '^Sophos Client Firewall'; FwInd = '^(Sophos Client Firewall.*|SCFService|SCFManager)$' }
-            @{ Id = 'KES';     Name = 'Kaspersky Endpoint Security';              Type = 'EDR+AV';    Svc = '^(AVP(\..+)?|avpsus)$'; Core = '^AVP'; Path = @('*\Kaspersky Lab\Kaspersky Endpoint Security*'); Uninst = '^Kaspersky Endpoint Security'; Flt = '^(klif|klam|klbg|kldback|kldlinf|kldtool|klboot|klfdefsf|klrsps|klsnsr|klifks|klifaa|klifsm)$'; Fw = 'Replace'; FwInd = '^klwfp$' }
-            @{ Id = 'KSWS';    Name = 'Kaspersky Security for Windows Server / Embedded Systems Security'; Type = 'AV'; Svc = '^(KAVFS|KAVFSGT|KAVFSSLP|KAVFSSCS)$'; Core = '^KAVFS$'; Path = @('*\Kaspersky Lab\Kaspersky Security*', '*\Kaspersky Lab\Kaspersky Embedded*'); Uninst = '^Kaspersky (Security .*Windows Server|Embedded Systems Security|Industrial CyberSecurity)'; Flt = '^(klif|klam|klbg|kldback|kldlinf|kldtool|klboot|klfdefsf|klrsps|klsnsr|klifks|klifaa|klifsm)$'; Fw = 'Manage' }
-            @{ Id = 'KSC';     Name = 'Kaspersky Security Center Network Agent';  Type = 'Agent';     Svc = '^klnagent$'; Core = '^klnagent$'; Uninst = '^Kaspersky Security Center .*Network Agent' }
-            @{ Id = 'SEP';     Name = 'Broadcom/Symantec Endpoint Protection';    Type = 'AV';        Svc = '^(SepMasterService|SepScanService|SmcService|SNAC|Smcinst)$'; Core = '^SepMasterService$'; Path = @('*\Symantec\Symantec Endpoint Protection\*', '*\Broadcom\Symantec Endpoint Protection\*'); Uninst = '^Symantec Endpoint (Protection|Security)'; Flt = '^(srtsp|srtsp64|eectrl|symefasi|symevnt|symevent|bhdrvx64)$'; Rtp = '^srtsp(64)?$'; Fw = 'Replace' }
-            @{ Id = 'TMAO';    Name = 'Trend Micro Apex One / OfficeScan / WFBS'; Type = 'AV';        Svc = '^(ntrtscan|tmlisten|TmCCSF|TMBMServer|TmPfw|TmProxy|PccNTUpd|TmWSCSvc)$'; Core = '^ntrtscan$'; Path = @('*\Trend Micro\Security Agent\*', '*\Trend Micro\OfficeScan Client\*', '*\Trend Micro\Client Server Security Agent\*'); Uninst = '^Trend Micro (Apex One Security Agent|OfficeScan|Worry-Free Business Security Agent|Security Agent)'; Flt = '^(tmevtmgr|tmeyes|tmesflt|fileflt|tmkmsnsr|tmpreflt|tmxpflt|hfileflt|acdriver|sakfile|sakmfile|tmums|tmumh|tmais)$'; Fw = 'Replace'; FwInd = '^(TmPfw)$' }
-            @{ Id = 'TMDSA';   Name = 'Trend Micro Deep Security / Cloud One / Vision One Server & Workload'; Type = 'EDR+AV'; Svc = '^(ds_agent|ds_monitor|ds_notifier|Amsp)$'; Core = '^ds_agent$'; AvSvc = '^Amsp$'; Path = @('*\Trend Micro\Deep Security Agent\*', '*\Trend Micro\AMSP\*'); Uninst = '^Trend Micro Deep Security Agent'; Flt = '^(tmevtmgr|tmeyes|tmesflt|tmkmsnsr|tmumh|tmums|tmais)$'; Fw = 'Replace'; FwInd = '^tbimdsa$' }
-            @{ Id = 'ENS';     Name = 'Trellix/McAfee Endpoint Security (ENS)';   Type = 'AV';        Svc = '^(mfemms|mfefire|mfevtp|mfewc|mfeesp|mfetp|mfeatp|masvc|macmnsvc|macompatsvc)$'; Core = '^mfemms$'; Path = @('*\McAfee\Endpoint Security\*', '*\Trellix\Endpoint Security\*'); Uninst = '^(McAfee|Trellix) Endpoint Security'; Flt = '^(mfehidk|mfencoas|epdrv|swin|mfesec|mfeaskm|mfencfilter)$'; Fw = 'Replace'; FwIf = '^(McAfee|Trellix) Endpoint Security Firewall'; FwInd = '^mfefire$' }
-            @{ Id = 'VSE';     Name = 'McAfee VirusScan Enterprise 8.x (EOL)';    Type = 'AV';        Svc = '^(McShield|McTaskManager|McAfeeFramework|McAfeeEngineService)$'; Core = '^McShield$'; Uninst = '^McAfee VirusScan Enterprise' }
-            @{ Id = 'HX';      Name = 'Trellix HX (FireEye Endpoint Agent)';      Type = 'EDR';       Svc = '^xagt$'; Core = '^xagt$'; Path = @('*\FireEye\xagt\*') }
-            @{ Id = 'CS';      Name = 'CrowdStrike Falcon';                       Type = 'EDR+AV';    Svc = '^CSFalconService$'; Core = '^CSFalconService$'; Path = @('*\CrowdStrike\*'); Uninst = '^CrowdStrike (Windows Sensor|Falcon)'; Flt = '^csagent$'; Fw = 'Manage' }
-            @{ Id = 'S1';      Name = 'SentinelOne';                              Type = 'EDR+AV';    Svc = '^(SentinelAgent|SentinelHelperService|SentinelStaticEngine|LogProcessorService)$'; Core = '^SentinelAgent$'; Path = @('*\SentinelOne\*'); Uninst = '^Sentinel Agent'; Flt = '^sentinelmonitor$'; Fw = 'Manage' }
-            @{ Id = 'CBC';     Name = 'VMware/Broadcom Carbon Black Cloud';       Type = 'EDR+AV';    Svc = '^(CbDefense|CbDefenseWSC)$'; Core = '^CbDefense$'; Path = @('*\Confer\*'); Uninst = '^(Carbon Black Cloud Sensor|CB Defense Sensor|VMware Carbon Black Cloud)' }
-            @{ Id = 'CBR';     Name = 'Carbon Black EDR (Response)';              Type = 'EDR';       Svc = '^CarbonBlack$'; Core = '^CarbonBlack$'; Path = @('*\CarbonBlack\*'); Flt = '^carbonblackk$' }
-            @{ Id = 'CBAC';    Name = 'Carbon Black App Control (Bit9)';          Type = 'AppControl'; Svc = '^Parity$'; Core = '^Parity$'; Path = @('*\Bit9\*'); Flt = '^(b9kernel|paritydriver)$' }
-            @{ Id = 'CYLANCE'; Name = 'Cylance PROTECT/OPTICS (BlackBerry / Arctic Wolf Aurora)'; Type = 'NGAV'; Svc = '^(CylanceSvc|CyOptics)$'; Core = '^CylanceSvc$'; Path = @('*\Cylance\*'); Uninst = '^(Cylance|BlackBerry Protect|Arctic Wolf Aurora)'; Flt = '^(cyprotectdrv64|cyprotectdrv32|cyoptics)$' }
-            @{ Id = 'CORTEX';  Name = 'Palo Alto Cortex XDR (Traps)';             Type = 'EDR+AV';    Svc = '^(cyserver|CyveraService|tlaservice|twdservice)$'; Core = '^(cyserver|CyveraService)$'; Path = @('*\Palo Alto Networks\Traps\*'); Uninst = '^(Cortex XDR|Traps)'; Flt = '^(cyvrfsfd|tedrdrv)$'; Fw = 'Manage' }
-            @{ Id = 'CYBR';    Name = 'Cybereason';                               Type = 'EDR+AV';    Svc = '^(CybereasonActiveProbe|CybereasonCRS|CybereasonBlocki)$'; Core = '^CybereasonActiveProbe$'; Path = @('*\Cybereason\*'); Flt = '^crexecprev$' }
-            @{ Id = 'MBAM';    Name = 'Malwarebytes / ThreatDown';                Type = 'EDR+AV';    Svc = '^(MBAMService|MBEndpointAgent|MBCloudEA)$'; Core = '^(MBAMService|MBEndpointAgent)$'; Path = @('*\Malwarebytes\*'); Uninst = '^(Malwarebytes|ThreatDown)'; Flt = '^(mbam|monitoring|flightrecorder|mbamshuriken|farwflt|mbamwatchdog)$' }
-            @{ Id = 'PANDA';   Name = 'WatchGuard EPDR / Panda Adaptive Defense'; Type = 'EDR+AV';    Svc = '^(PandaAetherAgent|PSUAService|NanoServiceMain)$'; Core = '^(PSUAService|NanoServiceMain)$'; Path = @('*\Panda Security\*'); Uninst = '^(Panda |WatchGuard (EPDR|EDR|EPP|Endpoint))'; Flt = '^(psinfile|psinproc|nanoavmf|shldflt)$'; Fw = 'Replace' }
-            @{ Id = 'WITH';    Name = 'WithSecure / F-Secure';                    Type = 'EDR+AV';    Svc = '^(fshoster|fsulprothoster|fsulhoster|FSMA|fsdevcon|FSAUA|fsorsp)'; Core = '^(fshoster|fsulprothoster|fsulhoster)'; Path = @('*\F-Secure\*', '*\WithSecure\*'); Uninst = '^(F-Secure|WithSecure)'; Flt = '^(fsgk|fshs|fsatp)$'; Fw = 'Manage' }
-            @{ Id = 'AVAST';   Name = 'Avast Business Antivirus';                 Type = 'AV';        Svc = '^(avast! Antivirus|aswBcc|Avast Business Console Client Antivirus Service|AvastWscReporter|aswbIDSAgent)$'; Core = '^avast! Antivirus$'; Path = @('*\AVAST Software\*'); Uninst = '^Avast (Business|Antivirus|Premium|Free)'; Flt = '^(aswmonflt|aswsp)$'; Fw = 'Unknown' }
-            @{ Id = 'AVG';     Name = 'AVG Business Antivirus';                   Type = 'AV';        Svc = '^(AVG Antivirus|avgbIDSAgent|AVGWscReporter)$'; Core = '^AVG Antivirus$'; Path = @('*\AVG\Antivirus\*'); Uninst = '^AVG (Business|AntiVirus|Internet Security)'; Flt = '^(avgmfx64|avgmfx86|avgmfi64)$'; Fw = 'Unknown' }
-            @{ Id = 'WEBROOT'; Name = 'Webroot SecureAnywhere';                   Type = 'AV';        Svc = '^(WRSVC|WRCoreService|WRSkyClient)$'; Core = '^(WRSVC|WRCoreService)$'; Path = @('*\Webroot\*'); Uninst = '^Webroot SecureAnywhere'; Flt = '^(wrkrn|wrcore(\.x64)?|wraekernel|arcore(\.x64)?|ssfmonm)$' }
-            @{ Id = 'GDATA';   Name = 'G DATA Security Client';                   Type = 'AV';        Svc = '^(AVKWCtl|AVKProxy|GDScan|GDFwSvc|AVKService|GDBackupSvc)$'; Core = '^(AVKWCtl|GDScan)$'; Path = @('*\G DATA\*'); Uninst = '^G DATA'; Flt = '^(miniicpt|hookcentre|pkticpt|gddcv)$'; Fw = 'Replace'; FwInd = '^GDFwSvc$' }
-            @{ Id = 'CISCO';   Name = 'Cisco Secure Endpoint (AMP)';              Type = 'EDR+AV';    Svc = '^(CiscoAMP|CiscoSecureEndpoint|immunetprotect|CiscoOrbital)'; Core = '^(CiscoAMP|CiscoSecureEndpoint|immunetprotect)'; Path = @('*\Cisco\AMP\*'); Uninst = '^(Cisco Secure Endpoint|Cisco AMP for Endpoints)'; Flt = '^(immunetprotect|immunetselfprotect|ciscoampheurdriver|ciscoampcefwdriver|ciscosam)$'; Fw = 'Unknown' }
-            @{ Id = 'FCT';     Name = 'FortiClient (EPP)';                        Type = 'AV';        Svc = '^(FA_Scheduler|FCT_SecSvr|FortiESNAC|FMAPOService)$'; Core = '^FA_Scheduler$'; AvFlt = '^(fortishield|fortimon2|fortirmon|fortiaptfilter)$'; Path = @('*\Fortinet\FortiClient\*'); Uninst = '^FortiClient'; Flt = '^(fortishield|fortimon2|fortirmon|fortiaptfilter)$' }
-            @{ Id = 'FEDR';    Name = 'FortiEDR';                                 Type = 'EDR+AV';    Svc = '^(FortiEDRCollectorService|FortiEDR Collector Service)$'; Core = '^FortiEDR'; Path = @('*\Fortinet\FortiEDR\*'); Uninst = '^FortiEDR' }
-            @{ Id = 'CPHE';    Name = 'Check Point Harmony Endpoint';             Type = 'EDR+AV';    Svc = '^(EPWD|CPDA|vsmon|EFRService|CPEPNMS)$'; Core = '^(EPWD|CPDA)$'; Path = @('*\CheckPoint\Endpoint Security\*'); Uninst = '^(Check Point Endpoint Security|Check Point Harmony Endpoint|Harmony Endpoint)'; Flt = '^(epregflt|epklib|cphsmon|cpepmon)$'; Fw = 'Replace'; FwInd = '^(vsdatant|vsmon)$' }
-            @{ Id = 'ELASTIC'; Name = 'Elastic Defend (Elastic Endpoint)';        Type = 'EDR';       Svc = '^(ElasticEndpoint|Elastic Agent)$'; Core = '^ElasticEndpoint$'; Path = @('*\Elastic\Endpoint\*', '*\Elastic\Agent\*'); Flt = '^elasticendpoint$' }
-            @{ Id = 'HUNT';    Name = 'Huntress (EDR; AV = Microsoft Defender)';  Type = 'EDR';       Svc = '^(HuntressAgent|HuntressUpdater|HuntressRio)$'; Core = '^HuntressAgent$'; Path = @('*\Huntress\*'); Uninst = '^Huntress'; Flt = '^huntmon$' }
-            @{ Id = 'ACRONIS'; Name = 'Acronis Cyber Protect (backup + anti-ransomware)'; Type = 'Backup'; Svc = '^(AcronisActiveProtectionService|aakore|MMS|AcrSch2Svc|AcronisAgent|CyberProtectService)$'; Core = '^(aakore|MMS)$'; Path = @('*\Acronis\*'); Uninst = '^Acronis (Cyber Protect|Agent|Cyber Backup)'; Flt = '^(file_protector|ngscan)$' }
-            @{ Id = 'EMSI';    Name = 'Emsisoft Anti-Malware';                    Type = 'AV';        Svc = '^(a2AntiMalware)$'; Core = '^a2AntiMalware$'; Path = @('*\Emsisoft*'); Uninst = '^Emsisoft'; Flt = '^(a2ertpx64|a2ertpx86|a2gffx64|a2gffx86|a2acc64|a2acc|eppfilebackup)$' }
-            @{ Id = 'COMODO';  Name = 'Xcitium / Comodo Client Security';         Type = 'EDR+AV';    Svc = '^(cmdAgent|ITSMService)$'; Core = '^cmdAgent$'; Path = @('*\COMODO\*', '*\Xcitium\*', '*\ITarian\*'); Uninst = '^(COMODO|Xcitium|Comodo Client)'; Flt = '^(cmdguard|cmdccav|cmdcwagt|cfrmd)$'; Fw = 'Replace'; FwInd = '^inspect$' }
-            @{ Id = 'AWN';     Name = 'Arctic Wolf Agent (MDR, nie AV)';          Type = 'Telemetry'; Svc = '^(ArcticWolfAgent|Arctic Wolf Agent|AWAgent)$'; Core = '^(ArcticWolfAgent|Arctic Wolf Agent|AWAgent)$'; Path = @('*\Arctic Wolf Networks\*'); Uninst = '^Arctic Wolf Agent' }
-            @{ Id = 'R7';      Name = 'Rapid7 Insight Agent (podatności/IDR, nie AV)'; Type = 'Telemetry'; Svc = '^ir_agent$'; Core = '^ir_agent$'; Path = @('*\Rapid7\Insight Agent\*'); Uninst = '^Rapid7 Insight Agent' }
-            @{ Id = 'SYSMON';  Name = 'Sysmon (telemetria)';                      Type = 'Telemetry'; Svc = '^Sysmon(64)?$'; Core = '^Sysmon(64)?$'; Flt = '^sysmondrv$' }
-            @{ Id = 'QUALYS';  Name = 'Qualys Cloud Agent (podatności)';          Type = 'Telemetry'; Svc = '^QualysAgent$'; Core = '^QualysAgent$'; Path = @('*\Qualys\*') }
-            @{ Id = 'TANIUM';  Name = 'Tanium Client';                            Type = 'Telemetry'; Svc = '^Tanium Client$'; Core = '^Tanium Client$'; Path = @('*\Tanium\*'); Flt = '^taniumrecorderdrv$' }
-            @{ Id = 'TLOCK';   Name = 'ThreatLocker (kontrola aplikacji)';        Type = 'AppControl'; Svc = '^ThreatLockerService$'; Core = '^ThreatLockerService$' }
-        )
-        $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName)
-
-        # Fakty: minifiltry (wiersze danych fltmc nie są tłumaczone), sterowniki, Programy, rejestracje zapory
-        $flt = @{}
-        try { foreach ($l in @(& "$env:SystemRoot\System32\fltmc.exe" filters 2>$null)) { if ("$l" -match '^\s*(\S+)\s+\d+\s+(\d{5,6}(?:\.\d+)?)\s') { $flt[$Matches[1].ToLower()] = [double]$Matches[2] } } } catch { }
-        $drv = @{}
-        try { foreach ($d in [System.ServiceProcess.ServiceController]::GetDevices()) { $drv[$d.ServiceName.ToLower()] = "$($d.Status)" } } catch { }
-        if (-not $drv.Count) { foreach ($d in @(Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue)) { $drv["$($d.Name)".ToLower()] = "$($d.State)" } }
-        $un = @()
-        foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
-            foreach ($p in @(Get-ItemProperty $k -ErrorAction SilentlyContinue)) { if ($p.DisplayName) { $un += [pscustomobject]@{ Name = "$($p.DisplayName)".Trim(); Version = "$($p.DisplayVersion)" } } }
-        }
-        $fwReg = @()
-        try { $col = New-Object -ComObject HNetCfg.FwProducts -ErrorAction Stop; foreach ($x in $col) { $fwReg += [pscustomobject]@{ Name = "$($x.DisplayName)"; Categories = (@($x.RuleCategories) -join ',') } } } catch { }
-
-        # Dopasowanie katalogu
-        $agentRx = '(?i)^(masvc|macmnsvc|macompatsvc|McAfeeFramework|McTaskManager|EraAgentSvc|EPUpdateService|avpsus|klnagent|tmlisten|PccNTUpd|swi_update(_64)?|Sophos (MCS Agent|MCS Client|AutoUpdate Service|Health Service))$|agent$|update'
-        $prod = New-Object System.Collections.Generic.List[object]
-        $known = @{}
-        foreach ($c in $secCat) {
-            $svc = @()
-            foreach ($s in $svcAll) {
-                $hit = ("$($s.Name)" -match $c.Svc)
-                if (-not $hit -and $c.Path) { foreach ($pp in $c.Path) { if ("$($s.PathName)" -like $pp) { $hit = $true; break } } }
-                if ($hit) { $svc += $s }
-            }
-            $fl = @(); if ($c.Flt) { foreach ($n in @($flt.Keys)) { if ($n -match $c.Flt) { $fl += $n; $known[$n] = 1 } } }
-            $ins = @(); if ($c.Uninst) { foreach ($u in $un) { if ($u.Name -match $c.Uninst) { $ins += "$($u.Name) $($u.Version)".Trim() } } }
-            $ins = @($ins | Select-Object -Unique)
-            if (-not ($svc.Count -or $fl.Count -or $ins.Count)) { continue }
-            $core    = @($svc | Where-Object { "$($_.Name)" -match $c.Core })
-            $coreRun = @($core | Where-Object { $_.State -eq 'Running' })
-            # nazwa głównej usługi mogła się zmienić w nowej wersji produktu: gdy jej nie ma, a usługi produktu działają, nie alarmujemy
-            # (agenty zarządzania i aktualizacji nie świadczą o działającym silniku antywirusa)
-            $coreGuess = (-not $core.Count) -and [bool]@($svc | Where-Object { $_.State -eq 'Running' -and "$($_.Name)" -notmatch $agentRx }).Count
-            $state = if ($coreRun.Count -or $coreGuess) { 'Running' } elseif (@($core | Where-Object { $_.StartMode -eq 'Disabled' }).Count) { 'Disabled' } elseif ($core.Count) { 'Stopped' } elseif ($svc.Count) { 'NoCore' } elseif ($fl.Count) { 'FilterOnly' } else { 'UninstallOnly' }
-            $avRun = ($c.Type -match 'AV') -and $state -eq 'Running'
-            if ($avRun -and $c.AvSvc) { $avRun = [bool]@($svc | Where-Object { "$($_.Name)" -match $c.AvSvc -and $_.State -eq 'Running' }).Count }
-            if ($avRun -and $c.AvFlt -and $flt.Count) { $avRun = [bool]@($flt.Keys | Where-Object { $_ -match $c.AvFlt }).Count }
-            $rtpMissing = $false
-            if ($avRun -and $c.Rtp -and $flt.Count) { $rtpMissing = -not @($flt.Keys | Where-Object { $_ -match $c.Rtp }).Count }   # tylko gdy fltmc zadziałał
-            $fwMode = if ($c.Fw) { $c.Fw } else { 'None' }
-            if ($c.FwIf -and -not @($ins | Where-Object { $_ -match $c.FwIf }).Count -and $fwMode -eq 'Replace') { $fwMode = 'None' }
-            $fwOn = $false
-            if ($c.FwInd -and $fwMode -ne 'None') {
-                foreach ($s in $svc) { if ("$($s.Name)" -match $c.FwInd -and $s.State -eq 'Running') { $fwOn = $true } }
-                foreach ($k in @($drv.Keys)) { if ($k -match $c.FwInd -and $drv[$k] -eq 'Running') { $fwOn = $true } }
-            }
-            $dir = ''
-            foreach ($s in $svc) { $pn = "$($s.PathName)"; if ($pn -match '^\s*"([^"]+)\\[^\\"]+"' -or $pn -match '^\s*(\S+)\\[^\\\s]+\.exe') { $dir = $Matches[1]; break } }
-            $prod.Add([pscustomobject]@{
-                Id = $c.Id; Product = $c.Name; Type = $c.Type; State = $state; AvRunning = $avRun; RtpFilterMissing = $rtpMissing; Dir = $dir
-                Services = (@($svc | ForEach-Object { "$($_.Name) ($($_.State))" }) -join ', '); Filters = ($fl -join ', '); Installed = ($ins -join '; ')
-                FwMode = $fwMode; FwActive = $fwOn; CoreGuess = $coreGuess
-            })
-        }
-        $products = [object[]]$prod.ToArray()
-        $secInventory = @($products | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Product = $_.Product; Type = $_.Type; State = $_.State } })
-        # minifiltr z zakresu „FSFilter Anti-Virus” (320000–329999) spoza katalogu = antywirus, którego nie znamy z nazwy
-        $unk = @($flt.Keys | Where-Object { $flt[$_] -ge 320000 -and $flt[$_] -lt 330000 -and -not $known.ContainsKey($_) -and $_ -ne 'vsepflt' } | ForEach-Object { "$_ ($($flt[$_]))" })
-        $agentless = $flt.ContainsKey('vsepflt')   # VMware Guest Introspection – ochrona bezagentowa na poziomie hiperwizora
-
-        # Microsoft Defender: CIM (działa bez modułu Defender, także na 2012 R2 z agentem Defender for Endpoint)
-        $build = [Environment]::OSVersion.Version.Build
-        $wd = $svcAll | Where-Object { $_.Name -eq 'WinDefend' } | Select-Object -First 1
-        $dvMode = ''; $dvRtp = $false; $dvSig = $null; $dvTamper = $null; $dvPlat = ''; $dvSub = @(); $dvNote = ''; $dvQuick = $null
-        if ($wd) {
-            try {
-                $mp = Get-CimInstance -Namespace 'root/Microsoft/Windows/Defender' -ClassName MSFT_MpComputerStatus -ErrorAction Stop
-                $dvMode = if ("$($mp.AMRunningMode)") { "$($mp.AMRunningMode)" } elseif ($mp.AMServiceEnabled -and $mp.AntivirusEnabled) { 'Normal' } else { 'Not running' }
-                $dvRtp = [bool]$mp.RealTimeProtectionEnabled
-                # wiek jest UInt32; 4294967295 = nigdy (rzutowanie na [int] rzuciłoby wyjątek i Defender wyglądałby na wyłączony)
-                $sa = [int64]$mp.AntivirusSignatureAge; $dvSig = if ($sa -ge 65535) { 9999 } else { [int]$sa }
-                $dvPlat = "$($mp.AMProductVersion)"
-                if ($null -ne $mp.IsTamperProtected) { $dvTamper = [bool]$mp.IsTamperProtected }
-                if ($mp.OnAccessProtectionEnabled -eq $false) { $dvSub += 'ochrona przy dostępie do plików' }
-                if ($mp.BehaviorMonitorEnabled -eq $false) { $dvSub += 'monitorowanie zachowania' }
-                if ($mp.IoavProtectionEnabled -eq $false) { $dvSub += 'skanowanie pobranych plików' }
-                if ($mp.NISEnabled -eq $false) { $dvSub += 'inspekcja sieci' }
-                $qa = [int64]$mp.QuickScanAge; $dvQuick = if ($qa -ge 65535) { $null } else { [int]$qa }
-            } catch { $dvMode = 'Not running'; $dvNote = "stan niedostępny: $($_.Exception.Message)" }
-        }
-        elseif ($build -ge 14393) { $dvMode = 'Removed' }
-        else { $dvMode = 'NotInstalled' }   # 2012 R2 bez Defender for Endpoint / SCEP
-        $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
-        $dvGpo = ("$(RegV $pol 'DisableAntiSpyware')" -eq '1') -or ("$(RegV $pol 'DisableAntiVirus')" -eq '1') -or ("$(RegV "$pol\Real-Time Protection" 'DisableRealtimeMonitoring')" -eq '1')
-        $dvForce = ("$(RegV 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection' 'ForceDefenderPassiveMode')" -eq '1') -or ("$(RegV 'HKLM:\SOFTWARE\Microsoft\Windows Advanced Threat Protection' 'ForceDefenderPassiveMode')" -eq '1')
-        $mdeOn = "$(RegV 'HKLM:\SOFTWARE\Microsoft\Windows Advanced Threat Protection\Status' 'OnboardingState')" -eq '1'
-        $sense = $svcAll | Where-Object { $_.Name -eq 'Sense' } | Select-Object -First 1
-        $scep = $svcAll | Where-Object { $_.Name -eq 'MsMpSvc' } | Select-Object -First 1
-        $scepOn = $scep -and $scep.State -eq 'Running' -and "$(RegV 'HKLM:\SOFTWARE\Microsoft\Microsoft Antimalware\Real-Time Protection' 'DisableRealtimeMonitoring')" -ne '1'
-
-        # Ocena: jeden wynik „czy serwer ma działający antywirus”, potem szczegóły
-        $third   = @($products | Where-Object { $_.Id -notin 'MDAV', 'MDE' })
-        $thirdAv = @($third | Where-Object { $_.AvRunning })
-        $thirdDn = @($third | Where-Object { $_.Type -match 'AV' -and ($_.State -in 'Stopped', 'Disabled' -or ($_.State -in 'NoCore', 'UninstallOnly' -and $_.Installed)) })
-        $defAct  = ($dvMode -match '^Normal') -and $dvRtp
-        $defPas  = ($dvMode -match 'Passive|EDR') -or $dvForce
-        $anyAv   = $defAct -or $thirdAv.Count -or $scepOn -or $unk.Count
-        $names   = (@($thirdAv | ForEach-Object { $_.Product }) -join ', ')
-        $dvTxt   = switch -regex ($dvMode) { '^Normal' { "aktywny, ochrona w czasie rzeczywistym $(if ($dvRtp) { 'włączona' } else { 'WYŁĄCZONA' })" } 'Passive|EDR' { "tryb pasywny ($dvMode)" } '^Removed' { 'usunięty z systemu' } '^NotInstalled' { 'niezainstalowany (2012 R2)' } default { "nie działa ($dvMode) $dvNote" } }
-        if ($dvGpo) { $dvTxt += ', wyłączony zasadami GPO' }
-        if ($dvForce) { $dvTxt += ', wymuszony tryb pasywny (ForceDefenderPassiveMode)' }
-
-        foreach ($x in $products) {
-            if ($x.Id -eq 'MDAV') { continue }
-            $what = switch -regex ($x.Type) { 'AV' { 'Antywirus / EDR'; break } '^EDR' { 'EDR (wykrywanie i reagowanie)'; break } 'AppControl' { 'Kontrola aplikacji'; break } 'Backup' { 'Kopie zapasowe / ochrona przed ransomware'; break } default { 'Agent monitorujący (nie antywirus)' } }
-            $stTxt = switch ($x.State) { 'Running' { 'działa' } 'Disabled' { 'WYŁĄCZONY' } 'Stopped' { 'ZATRZYMANY' } 'NoCore' { 'brak głównej usługi' } 'FilterOnly' { 'tylko sterownik' } default { 'tylko wpis w Programach' } }
-            Add-Prot $what $x.Product $stTxt ("usługi: $($x.Services)$(if ($x.Filters) { "; sterowniki: $($x.Filters)" })$(if ($x.Installed) { "; $($x.Installed)" })$(if ($x.CoreGuess) { '; główna usługa nierozpoznana – stan ustalony z pozostałych usług produktu' })") $(if ($x.State -eq 'Running') { 'OK' } else { 'Info' })
-        }
-        if ($unk.Count) { Add-Prot 'Antywirus (nierozpoznany)' 'sterownik antywirusowy spoza katalogu' 'załadowany' ($unk -join ', ') 'Info' }
-
-        if (-not $anyAv) {
-            if ($agentless) { Add-Prot 'Antywirus' '' 'brak agenta' 'załadowany VMware Guest Introspection (vsepflt) – ochrona bezagentowa (NSX / Deep Security / GravityZone SVA); sprawdź w konsoli, czy maszyna jest chroniona' 'Uwaga'; $sys.AV = 'ochrona bezagentowa (VMware)?' }
-            elseif ($thirdDn.Count) {
-                # tuż po starcie systemu usługa ochrony może jeszcze się uruchamiać
-                $fresh = $false; try { $fresh = ($now - $os.LastBootUpTime).TotalMinutes -lt 15 } catch { }
-                Add-Prot 'Antywirus' ((@($thirdDn | ForEach-Object { $_.Product })) -join ', ') 'zainstalowany, ale NIE DZIAŁA' ("$((@($thirdDn | ForEach-Object { "$($_.Product): $($_.Services)" })) -join '; ')$(if ($fresh) { ' – serwer działa krócej niż 15 minut, sprawdź ponownie' })") $(if ($fresh) { 'Uwaga' } else { 'Krytyczne' })
-                $sys.AV = "$((@($thirdDn | ForEach-Object { $_.Product })) -join ', ') – nie działa"
-            }
-            elseif ($defPas) { Add-Prot 'Antywirus' 'Microsoft Defender Antivirus' $dvMode "Defender: $dvTxt, a żaden inny antywirus nie działa" 'Krytyczne'; $sys.AV = "Defender ($dvMode) – brak innego antywirusa" }
-            else { Add-Prot 'Antywirus' 'Microsoft Defender Antivirus' 'BRAK OCHRONY' "Defender: $dvTxt; nie wykryto innego antywirusa" 'Krytyczne'; $sys.AV = 'brak aktywnego antywirusa' }
-        }
-        else {
-            $sys.AvActive = $true
-            if ($thirdAv.Count) {
-                $sys.AV = $names; $sys.AvThirdParty = $names
-                Add-Prot 'Microsoft Defender' 'Microsoft Defender Antivirus' $(if ($defAct) { 'aktywny' } else { 'nieaktywny' }) "Defender: $dvTxt; ochronę zapewnia $names" 'OK'
-                $classic = @($thirdAv | Where-Object { $_.Type -eq 'AV' })
-                if ($defAct -and $classic.Count) { Add-Prot 'Antywirus – dwa silniki' "Microsoft Defender + $((@($classic | ForEach-Object { $_.Product })) -join ', ')" 'oba aktywne' 'dwa silniki skanujące w czasie rzeczywistym spowalniają serwer i bywają niestabilne – przełącz Defender w tryb pasywny albo usuń go' 'Uwaga' }
-                elseif ($defAct) { Add-Prot 'Antywirus' 'Microsoft Defender Antivirus' 'aktywny obok EDR/NGAV' $names 'Info' }
-                foreach ($x in @($thirdAv | Where-Object { $_.RtpFilterMissing })) { Add-Prot 'Antywirus – ochrona plików' $x.Product 'sterownik nie załadowany' 'usługa działa, ale sterownik ochrony plików w czasie rzeczywistym nie jest załadowany – ochrona może być wyłączona' 'Uwaga' }
-            }
-            elseif ($defAct) { $sys.AV = 'Microsoft Defender'; Add-Prot 'Microsoft Defender' 'Microsoft Defender Antivirus' 'aktywny' "Defender: $dvTxt" 'OK' }
-            elseif ($scepOn) { $sys.AV = 'System Center Endpoint Protection'; Add-Prot 'Antywirus' 'System Center Endpoint Protection' 'działa' 'MsMpSvc' 'OK' }
-            else { $sys.AV = "antywirus nierozpoznany: $($unk -join ', ')"; Add-Prot 'Antywirus' 'nierozpoznany produkt' 'sterownik załadowany' "Defender: $dvTxt; załadowany sterownik antywirusowy spoza katalogu: $($unk -join ', ') – sprawdź, jaki to produkt" 'Info' }
-            foreach ($x in $thirdDn) { Add-Prot 'Antywirus' $x.Product 'zainstalowany, ale nie działa' "$($x.Services) – awaria albo pozostałość po migracji" 'Uwaga' }
-        }
-        # Defender jako główny antywirus – szczegóły
-        if ($defAct -and -not $thirdAv.Count) {
-            Add-Prot 'Microsoft Defender – sygnatury' 'Microsoft Defender Antivirus' "$dvSig dni" '' $(if ($dvSig -le 3) { 'OK' } elseif ($dvSig -le 7) { 'Uwaga' } else { 'Krytyczne' })
-            if ($dvSub.Count) { Add-Prot 'Microsoft Defender – składniki' 'Microsoft Defender Antivirus' 'część wyłączona' ($dvSub -join ', ') 'Uwaga' }
-            if ($null -ne $dvTamper) { Add-Prot 'Microsoft Defender – ochrona przed naruszeniami' 'Microsoft Defender Antivirus' $(if ($dvTamper) { 'włączona' } else { 'wyłączona' }) 'chroni ustawienia Defendera przed zmianą przez złośliwe oprogramowanie' $(if ($dvTamper) { 'OK' } else { 'Info' }) }
-            if ($null -ne $dvQuick) { Add-Prot 'Microsoft Defender – szybki skan' 'Microsoft Defender Antivirus' "$dvQuick dni temu" '' $(if ($dvQuick -le 14) { 'OK' } else { 'Info' }) }
-            if ($dvPlat -like '4.10.*') { Add-Prot 'Microsoft Defender – platforma' 'Microsoft Defender Antivirus' $dvPlat 'platforma nigdy nie była aktualizowana (KB4052623)' 'Uwaga' }
-            # Ustawienia wpływające na skuteczność: ochrona w chmurze (MAPS), niechciane aplikacje, ochrona sieci, reguły ASR (akcja 1 = blokuj, 2 = audyt, 6 = ostrzeż)
-            try {
-                $mpp  = Get-CimInstance -Namespace 'root/Microsoft/Windows/Defender' -ClassName MSFT_MpPreference -ErrorAction Stop
-                $maps = switch ("$($mpp.MAPSReporting)") { '0' { 'wyłączona' } '1' { 'podstawowa' } '2' { 'zaawansowana' } default { "$($mpp.MAPSReporting)" } }
-                $pua  = switch ("$($mpp.PUAProtection)") { '1' { 'blokowanie' } '2' { 'audyt' } default { 'wyłączona' } }
-                $np   = switch ("$($mpp.EnableNetworkProtection)") { '1' { 'blokowanie' } '2' { 'audyt' } default { 'wyłączona' } }
-                $asrA = @(@($mpp.AttackSurfaceReductionRules_Actions) | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
-                $asrB = @($asrA | Where-Object { $_ -eq 1 }).Count
-                Add-Prot 'Microsoft Defender – dodatkowe zabezpieczenia' 'Microsoft Defender Antivirus' "reguły ASR: $($asrA.Count) (blokujące: $asrB)" "ochrona w chmurze: $maps; niechciane aplikacje (PUA): $pua; ochrona sieci: $np" $(if ("$($mpp.MAPSReporting)" -eq '0' -or $asrB -eq 0) { 'Info' } else { 'OK' })
-            } catch { }
-        }
-        # Awarie usług ochrony w okresie skanu (Service Control Manager 7031/7034; param1 = nazwa wyświetlana usługi z tego serwera)
-        try {
-            $dn2svc = @{}; foreach ($s in $svcAll) { $dn2svc["$($s.DisplayName)".ToLowerInvariant()] = "$($s.Name)" }
-            $protSvc = @{}
-            foreach ($x in $products) { foreach ($nm in @("$($x.Services)" -split ', ')) { $nm = ($nm -replace '\s\([^)]*\)$', '').Trim(); if ($nm) { $protSvc[$nm.ToLowerInvariant()] = $x.Product } } }
-            $crash = @{}
-            foreach ($e in @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; Id = 7031, 7034; StartTime = $since } -MaxEvents 300 -ErrorAction SilentlyContinue)) {
-                $sn = $dn2svc["$((EvMap $e)['param1'])".ToLowerInvariant()]
-                if (-not $sn -or -not $protSvc.ContainsKey($sn.ToLowerInvariant())) { continue }
-                if (-not $crash.ContainsKey($sn)) { $crash[$sn] = @{ N = 0; P = $protSvc[$sn.ToLowerInvariant()]; Last = $e.TimeCreated } }
-                $crash[$sn].N++
-            }
-            foreach ($sn in $crash.Keys) { $c = $crash[$sn]; Add-Prot 'Awaria usługi ochrony' $c.P "$($c.N)× w $Days dni" "usługa $sn kończyła działanie nieoczekiwanie (ostatnio $(D $c.Last)) – ochrona była przerywana; sprawdź dziennik producenta i sterowniki" $(if ($c.N -ge 2) { 'Uwaga' } else { 'Info' }) }
-        } catch { }
-        if ($mdeOn -and (-not $sense -or $sense.State -ne 'Running')) { Add-Prot 'EDR' 'Microsoft Defender for Endpoint' 'czujnik nie działa' "serwer wdrożony (OnboardingState=1), ale usługa Sense: $(if ($sense) { $sense.State } else { 'brak' })" 'Uwaga' }
-
-        # Zapora: profile w użyciu, GPO, domyślna akcja, usługi; wyłączony profil przy zaporze innego producenta = informacja
-        try {
-            $active = @{}
-            foreach ($p in @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)) { $active["$($p.Name)"] = $p }
-            $netCat = @(); try { $netCat = @(Get-NetConnectionProfile -ErrorAction Stop | ForEach-Object { "$($_.NetworkCategory)" }) } catch { }
-            $inUse = @($netCat | ForEach-Object { if ($_ -eq 'DomainAuthenticated') { 'Domain' } else { $_ } } | Select-Object -Unique)
-            $fwRegOn = @($fwReg | Where-Object { ",$($_.Categories)," -like '*,2,*' })
-            $fwProd = @($products | Where-Object { $_.State -eq 'Running' -and $_.FwMode -ne 'None' })
-            $last = $null
-            try {
-                $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Firewall With Advanced Security/Firewall'; Id = 2003; StartTime = $now.AddDays(-30) } -MaxEvents 20 -ErrorAction Stop)
-                if ($ev.Count) { $m = EvMap $ev[0]; $last = [pscustomobject]@{ Time = (D $ev[0].TimeCreated); App = $m['ModifyingApplication']; User = $m['ModifyingUser'] } }
-            } catch { }
-            $off = New-Object System.Collections.Generic.List[string]; $offUsed = New-Object System.Collections.Generic.List[string]; $gpoOff = New-Object System.Collections.Generic.List[string]
-            foreach ($pn in 'Domain', 'Private', 'Public') {
-                $a = $active[$pn]
-                if (-not $a) { continue }
-                $gk = if ($pn -eq 'Private') { 'PrivateProfile' } else { "$($pn)Profile" }
-                if ("$(RegV "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\$gk" 'EnableFirewall')" -eq '0') { $gpoOff.Add($pn) }
-                if ("$($a.Enabled)" -ne 'True') { $off.Add($pn); if ($inUse -contains $pn) { $offUsed.Add($pn) } }
-                elseif ($inUse -contains $pn -and "$($a.DefaultInboundAction)" -eq 'Allow') { Add-Prot 'Zapora' 'Zapora Windows' "profil $($pn): włączona, ale PRZEPUSZCZA ruch przychodzący" 'domyślna akcja dla ruchu przychodzącego: Allow (DefaultInboundAction) – reguły blokujące nie mają znaczenia' 'Uwaga' }
-            }
-            $who = if ($last -and $last.App) { "; ostatnia zmiana ustawień zapory: $($last.Time) przez $($last.App)" } else { '' }
-            $gpoTxt = if ($gpoOff.Count) { "; wyłączona zasadami grupy (GPO): $($gpoOff -join ', ')" } else { '' }
-            if (-not $off.Count) { Add-Prot 'Zapora' 'Zapora Windows' 'włączona' $(if ($fwProd.Count) { "obok niej: $((@($fwProd | ForEach-Object { $_.Product })) -join ', ')" }) 'OK' }
-            else {
-                $owner = @($fwProd | Where-Object { $_.FwMode -eq 'Replace' -and $_.FwActive })
-                $repl  = @($fwProd | Where-Object { $_.FwMode -eq 'Replace' -and -not $_.FwActive })
-                $mgr   = @($fwProd | Where-Object { $_.FwMode -eq 'Manage' })
-                $byEv  = @(); if ($last -and $last.App) { $byEv = @($fwProd | Where-Object { $_.Dir -and "$($last.App)" -like "$($_.Dir)*" }) }
-                $state = "wyłączona: $($off -join ', ')"
-                if ($fwRegOn.Count) { $v = "filtrowanie ruchu przejął produkt zarejestrowany w zaporze Windows: $((@($fwRegOn | ForEach-Object { $_.Name })) -join ', ')"; $st = 'Info'; $sys.FirewallManagedBy = (@($fwRegOn | ForEach-Object { $_.Name }) -join ', ') }
-                elseif ($owner.Count) { $v = "ruch filtruje zapora produktu $((@($owner | ForEach-Object { $_.Product })) -join ', ') – sprawdź jej politykę w konsoli producenta"; $st = 'Info'; $sys.FirewallManagedBy = (@($owner | ForEach-Object { $_.Product }) -join ', ') }
-                elseif ($byEv.Count) { $v = "zaporę wyłączył $((@($byEv | ForEach-Object { $_.Product })) -join ', ') (zdarzenie 2003), który przejmuje filtrowanie"; $st = 'Info'; $sys.FirewallManagedBy = (@($byEv | ForEach-Object { $_.Product }) -join ', ') }
-                elseif ($repl.Count) { $v = "$((@($repl | ForEach-Object { $_.Product })) -join ', ') ma moduł zapory, ale nie potwierdzono, że jest włączony – sprawdź politykę produktu"; $st = 'Uwaga' }
-                elseif ($mgr.Count) { $v = "$((@($mgr | ForEach-Object { $_.Product })) -join ', ') zarządza regułami ZAPORY WINDOWS, która jest wyłączona – ruch nie jest filtrowany"; $st = 'Uwaga' }
-                else { $v = 'nie wykryto zapory innego producenta – serwer nie filtruje ruchu przychodzącego'; $st = 'Uwaga' }
-                if ($st -eq 'Uwaga' -and -not $offUsed.Count -and $inUse.Count) { $st = 'Info'; $v += ' (wyłączone profile nie są używane przez żadną kartę sieciową)' }
-                Add-Prot 'Zapora' 'Zapora Windows' $state "$v$gpoTxt$who" $st
-            }
-            $bfe = $svcAll | Where-Object { $_.Name -eq 'BFE' } | Select-Object -First 1
-            $mps = $svcAll | Where-Object { $_.Name -eq 'MpsSvc' } | Select-Object -First 1
-            if ($bfe -and $bfe.State -ne 'Running') { Add-Prot 'Zapora – Base Filtering Engine' 'Windows' $bfe.State 'bez BFE nie działa filtrowanie ruchu ani IPsec' 'Krytyczne' }
-            if ($mps -and $mps.State -ne 'Running') { Add-Prot 'Zapora – usługa MpsSvc' 'Zapora Windows' $mps.State $(if ($fwProd.Count) { "działa: $((@($fwProd | ForEach-Object { $_.Product })) -join ', ')" } else { 'zapora Windows nie działa' }) $(if ($fwProd.Count) { 'Uwaga' } else { 'Krytyczne' }) }
-            # serwer w domenie, a żadna karta nie rozpoznała sieci domenowej (NLA) – obowiązuje profil Publiczny/Prywatny (np. WinRM tylko z podsieci lokalnej)
-            if ($sys.PartOfDomain -and $netCat.Count -and -not ($netCat -contains 'DomainAuthenticated')) { Add-Prot 'Zapora – profil sieci' 'Windows' "brak profilu domenowego ($((@($netCat | Select-Object -Unique)) -join ', '))" 'serwer w domenie nie rozpoznał sieci domenowej – zapora stosuje reguły profilu Publicznego/Prywatnego; zwykle pomaga restart usługi NLA (Network Location Awareness) albo poprawa DNS' 'Uwaga' }
-        } catch { $errs.Add("Ochrona (zapora): $($_.Exception.Message)") }
-        $timings['Ochrona'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
-    }
-
     # ── Konfiguracja bezpieczeństwa ──
     $hard = New-Object System.Collections.Generic.List[object]
     function Add-Check($check, $value, $status) { $hard.Add([pscustomobject]@{ Check = $check; Value = "$value"; Status = $status }) }
     $t0 = $sw.Elapsed.TotalSeconds
     if (Want 'Hardening') {
 
+    try {
+        $mp = Get-MpComputerStatus
+        if (-not $mp.AMServiceEnabled -or "$($mp.AMRunningMode)" -match 'Passive|EDR') {
+            $sys.AV = "Defender (tryb: $($mp.AMRunningMode))"
+            Add-Check 'Defender' "tryb $($mp.AMRunningMode) – prawdopodobnie inny antywirus" 'Info'
+        } else {
+            $sys.AV = 'Microsoft Defender'
+            Add-Check 'Defender – ochrona w czasie rzeczywistym' $(if ($mp.RealTimeProtectionEnabled) { 'włączona' } else { 'WYŁĄCZONA' }) $(if ($mp.RealTimeProtectionEnabled) { 'OK' } else { 'Krytyczne' })
+            $age = [int]$mp.AntivirusSignatureAge
+            Add-Check 'Defender – wiek sygnatur [dni]' $age $(if ($age -le 3) { 'OK' } elseif ($age -le 7) { 'Uwaga' } else { 'Krytyczne' })
+            Add-Check 'Defender – dni od szybkiego skanu' $mp.QuickScanAge $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })
+            if ($mp.PSObject.Properties['IsTamperProtected']) { Add-Check 'Defender – ochrona przed naruszeniami' $(if ($mp.IsTamperProtected) { 'włączona' } else { 'wyłączona' }) $(if ($mp.IsTamperProtected) { 'OK' } else { 'Info' }) }
+        }
+    } catch { $sys.AV = 'brak danych z Defendera'; Add-Check 'Antywirus' 'Defender niedostępny (inny AV lub starszy system)' 'Info' }
+
+    try {
+        foreach ($p in (Get-NetFirewallProfile -PolicyStore ActiveStore)) {
+            $on = "$($p.Enabled)" -eq 'True'
+            Add-Check "Zapora – profil $($p.Name)" $(if ($on) { 'włączona' } else { 'wyłączona' }) $(if ($on) { 'OK' } else { 'Uwaga' })
+        }
+    } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $smb = Get-SmbServerConfiguration
         Add-Check 'SMBv1 (serwer)' $(if ($smb.EnableSMB1Protocol) { 'włączony' } else { 'wyłączony' }) $(if ($smb.EnableSMB1Protocol) { 'Uwaga' } else { 'OK' })
@@ -724,7 +461,7 @@ $Collector = {
     # ── Dalsze utwardzenie: tylko odczyt rejestru, usług i WMI. Status 'Zalecenie' = warto poprawić (w analizie jedna zbiorcza informacja
     #    na serwer), 'Uwaga'/'Krytyczne' = realne ryzyko. Brak wpisu w rejestrze oceniamy według domyślnego zachowania danej wersji systemu.
     $osB = [int]$sys.BuildNumber   # 9600 = 2012 R2, 14393 = 2016, 17763 = 2019, 20348 = 2022, 26100 = 2025
-    if (-not $svcAll) { $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName) }
+    $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName)
     function Svc([string]$Name) { $svcAll | Where-Object { $_.Name -eq $Name } | Select-Object -First 1 }
     function HErr([string]$What, $E) { $errs.Add("Konfiguracja bezpieczeństwa ($What): $($E.Exception.Message) [linia $($E.InvocationInfo.ScriptLineNumber)]") }
     function Is1($v) { "$v" -eq '1' }
@@ -2396,8 +2133,6 @@ $Collector = {
     [pscustomobject]@{
         System         = [pscustomobject]$sys
         Hardening      = $hardening
-        Protection     = [object[]]$protection.ToArray()
-        SecInventory   = [object[]]@($secInventory)
         Disks          = $disks
         Network        = $network
         Listening      = $listening
@@ -3044,7 +2779,6 @@ $script:Sections = @(
     @{ Key = 'History';        Header = 'Historia skanów i dostępność'; Computed = $true }
     @{ Key = 'Changes';        Header = 'Zmiany od poprzedniego skanu' }
     @{ Key = 'System';         Header = 'System' }
-    @{ Key = 'Protection';     Header = 'Ochrona: antywirus, EDR, zapora' }
     @{ Key = 'Hardening';      Header = 'Konfiguracja bezpieczeństwa' }
     @{ Key = 'EventLogs';      Header = 'Dzienniki zdarzeń' }
     @{ Key = 'AuditPolicy';    Header = 'Polityka audytu' }
@@ -3154,8 +2888,7 @@ $script:Headers = @{
     Owner = 'Właściciel'; Parent = 'Checkpoint nadrzędny'; StateSince = 'W tym stanie od'; MemMaxGB = 'RAM maks. [GB]'; MemDemandGB = 'RAM zapotrzebowanie [GB]'
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
-    Truncated = 'Limit zdarzeń osiągnięty'; Component = 'Składnik'; Product = 'Produkt'; AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'
-    FirewallManagedBy = 'Zapora zarządzana przez'; GroupSID = 'SID grupy'
+    Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
 }
 #endregion
 
@@ -3484,7 +3217,7 @@ $script:SettingDefs = @(
 )
 $script:SectionGroups = [ordered]@{
     'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
-    'Bezpieczeństwo'       = @('Protection', 'Hardening', 'Suspicious', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
+    'Bezpieczeństwo'       = @('Hardening', 'Suspicious', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
     'Role serwera'         = @('DomainController', 'ADSecurity', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
 }
@@ -3841,16 +3574,6 @@ function Invoke-ServerAnalysis {
         if ([double]$r.AgeDays -gt $C.CheckpointWarnDays) { AddI 'Ostrzeżenie' 'Hyper-V' "Checkpoint '$($r.Name)' na $($r.VM) ma $([math]::Floor([double]$r.AgeDays)) dni" 'Checkpoints'; SetFlag $r 'warn' }
     }
 
-    # Ochrona: antywirus/EDR (także innych producentów) i zapora – ocena wyliczona na serwerze z uwzględnieniem produktów innych firm
-    foreach ($r in @($D.PSObject.Properties['Protection'].Value | Where-Object { $_ })) {
-        $txt = "$($r.Component)$(if ($r.Product -and "$($r.Component)" -notlike "*$($r.Product)*") { " ($($r.Product))" }): $($r.State)$(if ($r.Detail) { " – $(Get-ShortText $r.Detail 200)" })"
-        switch ($r.Status) {
-            'Krytyczne' { AddI 'Krytyczny' 'Ochrona' $txt 'Protection'; SetFlag $r 'crit' }
-            'Uwaga'     { AddI 'Ostrzeżenie' 'Ochrona' $txt 'Protection'; SetFlag $r 'warn' }
-            'Info'      { SetFlag $r 'info' }
-        }
-    }
-
     # Konfiguracja bezpieczeństwa
     # 'Zalecenie' = warto poprawić, ale bez pilności: jedna zbiorcza informacja na serwer zamiast wielu ostrzeżeń na całej flocie
     $recs = New-Object System.Collections.Generic.List[string]
@@ -4049,8 +3772,8 @@ function Invoke-ServerAnalysis {
     foreach ($r in @($D.PSObject.Properties['Suspicious'].Value | Where-Object { $_ })) {
         $lvl = "$($r.Level)"
         if ("$($r.Type)" -eq 'Narzędzie zdalnego dostępu' -and @($approved | Where-Object { "$($r.Name)" -like $_ -or "$($r.Detail)" -like "*$_*" }).Count) { $lvl = 'Info' }
-        # Defender wyłącza się sam, gdy ochronę przejmuje inny antywirus – to nie sabotaż
-        if (("$($r.Type)" -like 'Defender: ochrona lub skanowanie wyłączone*' -or "$($r.Type)" -like 'Defender: wyłączono ochronę w konfiguracji*') -and $D.System -and "$($D.System.PSObject.Properties['AvThirdParty'].Value)") { $lvl = 'Info' }
+        # Defender w trybie pasywnym – ochronę przejął inny antywirus, więc wyłączenia Defendera to nie sabotaż
+        if (("$($r.Type)" -like 'Defender: ochrona lub skanowanie wyłączone*' -or "$($r.Type)" -like 'Defender: wyłączono ochronę w konfiguracji*') -and $D.System -and "$($D.System.PSObject.Properties['AV'].Value)" -like 'Defender (tryb:*') { $lvl = 'Info' }
         # PowerShell oznacza jako podejrzane także zwykłe narzędzia – ostrzegamy dopiero, gdy treść pasuje do wzorców ataku
         if ("$($r.Type)" -like 'PowerShell: skrypt oznaczony*') {
             $hit = Get-SuspiciousCommand "$($r.Detail)" $false
@@ -4407,26 +4130,6 @@ function Update-VmIndex {
             }
         }
         if ($recs.Count) { & $addX $rep.Key 'Info' ("Do utwardzenia w domenie ($($recs.Count)): " + (Join-Short $recs 4)) 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys }
-    }
-    # Ochrona – odstępstwo od floty: serwer bez agenta AV/EDR, który działa na co najmniej 80% serwerów (od 10 serwerów z danymi)
-    $inv = @{}; $invName = @{}; $withInv = New-Object System.Collections.Generic.List[object]
-    foreach ($it in @($script:Servers)) {
-        $d = $script:Data[$it.Name]
-        if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['SecInventory'] -or @($d.PSObject.Properties['Skipped'].Value) -contains 'Protection' -or @($d.PSObject.Properties['Failed'].Value) -contains 'Protection') { continue }
-        $run = @(@($d.SecInventory) | Where-Object { $_ -and "$($_.State)" -eq 'Running' -and "$($_.Type)" -match 'AV|EDR' -and "$($_.Id)" -ne 'MDAV' })
-        $withInv.Add(@{ It = $it; Ids = @($run | ForEach-Object { "$($_.Id)" } | Select-Object -Unique) })
-        foreach ($x in $run) { $inv["$($x.Id)"] = 1 + [int]$inv["$($x.Id)"]; $invName["$($x.Id)"] = "$($x.Product)" }
-    }
-    if ($withInv.Count -ge 10) {
-        foreach ($id in @($inv.Keys)) {
-            $pct = [math]::Round(100 * $inv[$id] / $withInv.Count)
-            if ($pct -lt 80) { continue }
-            foreach ($w in $withInv) {
-                if ($w.Ids -contains $id) { continue }
-                if ($w.Ids.Count) { & $addX $w.It.Name 'Info' "Nie działa tu $($invName[$id]), który działa na $pct% serwerów – serwer chroni inny produkt ($($w.Ids -join ', '))" 'Protection' '' 'Ochrona' }
-                else { & $addX $w.It.Name 'Ostrzeżenie' "Nie działa tu $($invName[$id]), który działa na $pct% serwerów – agent niezainstalowany, zatrzymany albo usunięty" 'Protection' '' 'Ochrona' }
-            }
-        }
     }
     # Ta sama maszyna pod dwiema nazwami (alias DNS, nazwa klastra, adres IP) – skanowana podwójnie
     $byComp = @{}
@@ -6691,7 +6394,7 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
         foreach ($i in @($(if ($showIgnored) { $d._Ignored } else { $d._Issues }))) { if ($i) { $all.Add($i) } }
         $crit += [int]$d._Crit; $warn += [int]$d._Warn; $ign += @($d._Ignored).Count
         $st = if ($script:AvailStats) { $script:AvailStats[$it.Name.ToLowerInvariant()] } else { $null }
-        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; AV = ''; UptimeDays = $null; CPU = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null
+        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; UptimeDays = $null; CPU = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null
                             Crit = [int]$d._Crit; Warn = [int]$d._Warn; Availability = (Get-AvailabilityText $it.Name); LastOk = $(if ($st) { $st.LastOk } else { '' }); ScanSec = $null; Scanned = $d.ScannedAt; Flag = '' }
         if ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) {
             $base.Status = 'Pominięty'; $base.Flag = 'muted'; $base.OS = "$($d.Unsupported)"
@@ -6705,7 +6408,6 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
             $online++
             $s = $d.System
             $base.Status = 'OK'; $base.OS = "$($s.OS)" -replace '^Microsoft ', ''
-            $base.AV = "$($s.PSObject.Properties['AV'].Value)"
             $base.UptimeDays = $s.UptimeDays; $base.CPU = $s.CpuLoad; $base.RAM = $s.RamUsedPct
             $base.MinDiskPct = (@($d.Disks) | Where-Object { $_ } | Measure-Object FreePct -Minimum).Minimum
             $base.PatchDays = $(if ($s.LastHotfixDays -ge 0) { $s.LastHotfixDays } else { $null })
@@ -6975,8 +6677,8 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
     # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
-    if ($Key -in 'Downtime', 'Timings', 'Protection', 'Suspicious', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
-    if ($Key -in 'Downtime', 'Timings', 'Protection', 'Suspicious', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'Suspicious', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'Suspicious', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
     $true
 }
 function Get-WorstFlag($Rows) {
