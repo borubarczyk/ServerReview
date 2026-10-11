@@ -377,10 +377,10 @@ $Collector = {
         } else {
             $sys.AV = 'Microsoft Defender'
             Add-Check 'Defender – ochrona w czasie rzeczywistym' $(if ($mp.RealTimeProtectionEnabled) { 'włączona' } else { 'WYŁĄCZONA' }) $(if ($mp.RealTimeProtectionEnabled) { 'OK' } else { 'Krytyczne' })
-            $age = [int]$mp.AntivirusSignatureAge
-            Add-Check 'Defender – wiek sygnatur [dni]' $age $(if ($age -le 3) { 'OK' } elseif ($age -le 7) { 'Uwaga' } else { 'Krytyczne' })
+            $age = [int64]$mp.AntivirusSignatureAge   # UInt32; 4294967295 = brak daty aktualizacji (rzutowanie na [int] rzuciłoby wyjątek)
+            Add-Check 'Defender – wiek sygnatur [dni]' $(if ($age -ge 65535) { 'brak daty aktualizacji' } else { $age }) $(if ($age -le 3) { 'OK' } elseif ($age -le 7) { 'Uwaga' } else { 'Krytyczne' })
             Add-Check 'Defender – dni od szybkiego skanu' $mp.QuickScanAge $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })
-            if ($mp.PSObject.Properties['IsTamperProtected']) { Add-Check 'Defender – ochrona przed naruszeniami' $(if ($mp.IsTamperProtected) { 'włączona' } else { 'wyłączona' }) $(if ($mp.IsTamperProtected) { 'OK' } else { 'Info' }) }
+            if ($null -ne $mp.IsTamperProtected) { Add-Check 'Defender – ochrona przed naruszeniami' $(if ($mp.IsTamperProtected) { 'włączona' } else { 'wyłączona' }) $(if ($mp.IsTamperProtected) { 'OK' } else { 'Info' }) }
         }
     } catch { $sys.AV = 'brak danych z Defendera'; Add-Check 'Antywirus' 'Defender niedostępny (inny AV lub starszy system)' 'Info' }
 
@@ -2889,6 +2889,8 @@ $script:Headers = @{
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
     Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
+    # pola ze starszych migawek (wersja z sekcją Ochrona)
+    AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'; FirewallManagedBy = 'Zapora zarządzana przez'; PartOfDomain = 'W domenie'
 }
 #endregion
 
@@ -3113,7 +3115,8 @@ function Add-SnapshotIndexEntry([string]$Name, [string]$Path, [bool]$Offline) {
 }
 function Get-SnapshotEntries([string]$Name) {
     $l = $script:SnapIndex[(Get-SnapshotKey $Name)]
-    if ($l) { @($l) } else { @() }
+    # lista z New-Object jest opakowana w PSObject – @($l) rzuca wtedy „Argument types do not match” (PS 5.1), więc ToArray()
+    if ($l) { $l.ToArray() } else { @() }
 }
 function Get-OlderOnlineSnapshots([string]$Name, [string]$AfterPath, [int]$Max = 8) {
     # Udane migawki starsze niż $AfterPath (od najnowszej) – źródło sekcji pominiętych w poprzednim skanie (Merge-PrevSections)
@@ -3772,8 +3775,9 @@ function Invoke-ServerAnalysis {
     foreach ($r in @($D.PSObject.Properties['Suspicious'].Value | Where-Object { $_ })) {
         $lvl = "$($r.Level)"
         if ("$($r.Type)" -eq 'Narzędzie zdalnego dostępu' -and @($approved | Where-Object { "$($r.Name)" -like $_ -or "$($r.Detail)" -like "*$_*" }).Count) { $lvl = 'Info' }
-        # Defender w trybie pasywnym – ochronę przejął inny antywirus, więc wyłączenia Defendera to nie sabotaż
-        if (("$($r.Type)" -like 'Defender: ochrona lub skanowanie wyłączone*' -or "$($r.Type)" -like 'Defender: wyłączono ochronę w konfiguracji*') -and $D.System -and "$($D.System.PSObject.Properties['AV'].Value)" -like 'Defender (tryb:*') { $lvl = 'Info' }
+        # Defender w trybie pasywnym albo EDR (migawki z wersji z sekcją Ochrona: wykryty antywirus innego producenta) – ochronę
+        # przejął inny produkt, więc wyłączenia Defendera to nie sabotaż. Wyłączony Defender bez innego antywirusa („Not running”) zostaje ostrzeżeniem.
+        if (("$($r.Type)" -like 'Defender: ochrona lub skanowanie wyłączone*' -or "$($r.Type)" -like 'Defender: wyłączono ochronę w konfiguracji*') -and $D.System -and ("$($D.System.PSObject.Properties['AV'].Value)" -match '^Defender \(tryb: .*(Passive|EDR)' -or "$($D.System.PSObject.Properties['AvThirdParty'].Value)")) { $lvl = 'Info' }
         # PowerShell oznacza jako podejrzane także zwykłe narzędzia – ostrzegamy dopiero, gdy treść pasuje do wzorców ataku
         if ("$($r.Type)" -like 'PowerShell: skrypt oznaczony*') {
             $hit = Get-SuspiciousCommand "$($r.Detail)" $false
