@@ -2345,7 +2345,7 @@ function Invoke-CveApi([string]$Url, [string]$Proxy, [int]$TimeoutSec = 120) {
 
 function ConvertTo-CveRow($V) {
     # Wiersz Security Update Guide → zwarty zapis. Pomijamy wpisy bez poprawki do zainstalowania („Not a Vulnerability”,
-    # naprawione po stronie Microsoft). Poprawka „Hotpatch” tylko wtedy, gdy nie ma zwykłej aktualizacji zbiorczej.
+    # naprawione po stronie Microsoft). Hot = kompilacja aktualizacji „Hotpatch” (serwery z hotpatchem mają niższy numer poprawki).
     $sev = "$($V.severity)"
     if ($sev -notin 'Critical', 'Important', 'Moderate', 'Low') { return $null }
     if ("$($V.productStatus)" -and "$($V.productStatus)" -ne 'fixed') { return $null }
@@ -2361,24 +2361,26 @@ function ConvertTo-CveRow($V) {
         if ("$($k.downloadName)" -match 'Hotpatch') { if (-not $hot -or [version]$fb -lt [version]$hot) { $hot = $fb } }
         elseif (-not $fix -or [version]$fb -lt [version]$fix) { $fix = $fb }
     }
-    if (-not $fix) { $fix = $hot }
+    if (-not $fix) { $fix = $hot; $hot = '' } elseif ($hot -and [version]$hot -ge [version]$fix) { $hot = '' }
     if (-not $fix -and -not $kbs.Count) { return $null }
     $score = 0.0
     [void][double]::TryParse("$($V.baseScore)", [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$score)
     $init = ConvertTo-CveDate $V.initialReleaseDate
     $month = if ($init.Length -ge 7) { $init.Substring(0, 7) } else { '' }
     try { $month = [datetime]::ParseExact("$($V.releaseNumber)", 'yyyy-MMM', [Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM') } catch { }
-    [pscustomobject]@{ Cve = "$($V.cveNumber)"; Sev = $sev; Impact = "$($V.impact)"; Score = $score; Month = $month; Init = $init; Fix = $fix; Kb = ($kbs -join ',') }
+    [pscustomobject]@{ Cve = "$($V.cveNumber)"; Sev = $sev; Impact = "$($V.impact)"; Score = $score; Month = $month; Init = $init; Fix = $fix; Hot = $hot; Kb = ($kbs -join ',') }
 }
 
 function Sync-CveProduct([string]$Product, [string]$Path, [int]$Months, [int]$RefreshHours, [string]$Proxy, [bool]$Force) {
-    # Wiersze Security Update Guide jednego systemu (np. 'Windows Server 2022'). Pierwsze pobranie obejmuje cały okres, kolejne – tylko
-    # wpisy wydane albo poprawione od ostatniej synchronizacji (z zapasem 40 dni). Gdy sieć zawiedzie, zostają dane z pliku.
+    # Wiersze Security Update Guide jednego systemu (np. 'Windows Server 2022'). Pobranie przyrostowe: wpisy wydane od ostatniej
+    # synchronizacji (z zapasem 40 dni). Poprawione CVE zachowują datę wydania, więc co 7 dni pobierany jest cały okres.
+    # Gdy sieć zawiedzie, zostają dane z pliku.
     $now = [DateTime]::UtcNow
     $from = (New-Object DateTime -ArgumentList $now.Year, $now.Month, 1).AddMonths(-$Months).ToString('yyyy-MM-dd')
     $old = $null
     if ([IO.File]::Exists($Path)) { try { $old = Read-SnapshotText $Path | ConvertFrom-Json } catch { $old = $null } }
-    $full = (-not $old) -or ((ConvertTo-CveDate $old.From) -gt $from)   # okres wydłużony w ustawieniach – pobranie od początku
+    # pobranie od początku: brak danych, okres wydłużony w ustawieniach albo minął tydzień od pełnego pobrania
+    $full = (-not $old) -or ((ConvertTo-CveDate $old.From) -gt $from) -or ((Get-CveAgeHours $old.PSObject.Properties['FullSynced'].Value) -ge 168)
     if (-not $Force -and -not $full -and (Get-CveAgeHours $old.Synced) -lt $RefreshHours) { return @{ Data = $old; Changed = $false; Note = '' } }
     try {
         $rows = @{}
@@ -2398,7 +2400,8 @@ function Sync-CveProduct([string]$Product, [string]$Path, [int]$Months, [int]$Re
             if ($pages -ge 500) { throw 'zbyt wiele stron odpowiedzi MSRC' }
         }
         $keep = [object[]]@($rows.Values | Where-Object { (ConvertTo-CveDate $_.Init) -ge $from } | Sort-Object Cve)
-        $data = [pscustomobject]@{ Product = $Product; From = $from; Synced = $now.ToString('yyyy-MM-ddTHH:mm:ssZ'); Rows = $keep }
+        $fs = if ($full) { $now } else { $now.AddHours(-(Get-CveAgeHours $old.PSObject.Properties['FullSynced'].Value)) }
+        $data = [pscustomobject]@{ Product = $Product; From = $from; Synced = $now.ToString('yyyy-MM-ddTHH:mm:ssZ'); FullSynced = $fs.ToString('yyyy-MM-ddTHH:mm:ssZ'); Rows = $keep }
         Write-SnapshotText $Path (ConvertTo-Json $data -Depth 4 -Compress)
         @{ Data = $data; Changed = $true; Note = '' }
     } catch {
@@ -2457,33 +2460,43 @@ function Sync-CveKev([string]$Path, [int]$RefreshHours, [string]$Proxy, [bool]$F
 function New-CveIndex($Data) {
     # Indeks jednego systemu: grupy wierszy według kompilacji z poprawką (rosnąco) i według miesiąca biuletynu oraz KB → miesiąc.
     # Ocena serwera przegląda kilkanaście grup zamiast tysięcy wierszy.
-    $bases = @{}; $months = @{}; $kbMonth = @{}
+    $bases = @{}; $hbases = @{}; $hotRevs = @{}; $months = @{}; $kbMonth = @{}; $kbRev = @{}
     foreach ($r in @($Data.Rows)) {
         if (-not $r) { continue }
         $m = "$($r.Month)"
         if (-not $months.ContainsKey($m)) { $months[$m] = New-Object System.Collections.Generic.List[object] }
         $months[$m].Add($r)
         foreach ($k in ("$($r.Kb)" -split ',')) { if ($k -and (-not $kbMonth.ContainsKey($k) -or $kbMonth[$k] -lt $m)) { $kbMonth[$k] = $m } }
-        $p = "$($r.Fix)" -split '\.'
-        if ($p.Count -ne 4) { continue }
-        $b = "$($p[0]).$($p[1]).$($p[2])"
-        $rev = [int]$p[3]
-        if (-not $bases.ContainsKey($b)) { $bases[$b] = @{} }
-        if (-not $bases[$b].ContainsKey($rev)) { $bases[$b][$rev] = New-Object System.Collections.Generic.List[object] }
-        $bases[$b][$rev].Add($r)
+        # zwykłe grupy wg Fix; dla serwerów z hotpatchem wg Hot (gdy jest), inaczej Fix
+        $hot = if ($r.PSObject.Properties['Hot']) { "$($r.Hot)" } else { '' }
+        if ($hot) { $hotRevs[$hot] = 1 }
+        foreach ($tg in @(@{ B = $bases; F = "$($r.Fix)" }, @{ B = $hbases; F = $(if ($hot) { $hot } else { "$($r.Fix)" }) })) {
+            $p = $tg.F -split '\.'
+            if ($p.Count -ne 4) { continue }
+            $b = "$($p[0]).$($p[1]).$($p[2])"
+            $rev = [int]$p[3]
+            if (-not $tg.B.ContainsKey($b)) { $tg.B[$b] = @{} }
+            if (-not $tg.B[$b].ContainsKey($rev)) { $tg.B[$b][$rev] = New-Object System.Collections.Generic.List[object] }
+            $tg.B[$b][$rev].Add($r)
+            # KB → najwyższy numer poprawki, z którym występuje (aktualizacje miesięczne są kumulatywne – metoda KB)
+            if ([object]::ReferenceEquals($tg.B, $bases)) { foreach ($k in ("$($r.Kb)" -split ',')) { if ($k -and (-not $kbRev.ContainsKey($k) -or $kbRev[$k] -lt $rev)) { $kbRev[$k] = $rev } } }
+        }
     }
-    $bOut = @{}
-    foreach ($b in @($bases.Keys)) {
-        $bOut[$b] = [object[]]@(@($bases[$b].Keys) | Sort-Object | ForEach-Object { @{ Rev = [int]$_; Rows = [object[]]$bases[$b][$_].ToArray(); Crit = 0; Expl = [string[]]@(); Months = [string[]]@() } })
+    $bOut = @{}; $hOut = @{}
+    foreach ($pair in @(@{ In = $bases; Out = $bOut }, @{ In = $hbases; Out = $hOut })) {
+        foreach ($b in @($pair.In.Keys)) {
+            $src = $pair.In[$b]
+            $pair.Out[$b] = [object[]]@(@($src.Keys) | Sort-Object | ForEach-Object { @{ Rev = [int]$_; Rows = [object[]]$src[$_].ToArray(); Crit = 0; Expl = [string[]]@(); Months = [string[]]@() } })
+        }
     }
     $mOut = [object[]]@(@($months.Keys) | Sort-Object | ForEach-Object { @{ Month = "$_"; Rows = [object[]]$months[$_].ToArray(); Crit = 0; Expl = [string[]]@(); Months = [string[]]@("$_") } })
-    @{ Product = "$($Data.Product)"; From = (ConvertTo-CveDate $Data.From); SyncedAgeH = (Get-CveAgeHours $Data.Synced); Count = @($Data.Rows).Count; Bases = $bOut; Months = $mOut; KbMonth = $kbMonth }
+    @{ Product = "$($Data.Product)"; From = (ConvertTo-CveDate $Data.From); SyncedAgeH = (Get-CveAgeHours $Data.Synced); Count = @($Data.Rows).Count; Bases = $bOut; HotBases = $hOut; HotRevs = $hotRevs; Months = $mOut; KbMonth = $kbMonth; KbRev = $kbRev }
 }
 
 function Set-CveIndexFlags($Index, [hashtable]$Expl, [hashtable]$Kev) {
     # Grupy indeksu: wykorzystywane (Microsoft albo CISA KEV), krytyczne (bez wykorzystywanych) i miesiące biuletynów
     $all = New-Object System.Collections.Generic.List[object]
-    foreach ($arr in @($Index.Bases.Values)) { foreach ($g in $arr) { $all.Add($g) } }
+    foreach ($arr in @(@($Index.Bases.Values) + @($Index.HotBases.Values))) { foreach ($g in $arr) { $all.Add($g) } }
     foreach ($g in $Index.Months) { $all.Add($g) }
     foreach ($g in $all) {
         $crit = 0; $ms = @{}
@@ -2503,16 +2516,19 @@ function Sync-CveData([hashtable]$Opt) {
     $changed = $false
     $h = [int]$Opt.RefreshHours; $f = [bool]$Opt.Force
     $expl = @{}; $kev = @{}
+    $age = 0.0   # wiek najstarszego użytego źródła [h]
     try {
         $x = Sync-CveExploited (Join-Path $Opt.Dir 'cve_exploited.json.gz') $h "$($Opt.Proxy)" $f
         if ($x.Changed) { $changed = $true }
         if ($x.Note) { $notes.Add("Microsoft (wykorzystywane): $($x.Note)") }
+        $age = [Math]::Max($age, [double](Get-CveAgeHours $x.Data.Synced))
         foreach ($i in @($x.Data.Items)) { if ($i) { $expl["$($i.Cve)"] = "$($i.Title)" } }
     } catch { $notes.Add("Microsoft (wykorzystywane): $($_.Exception.Message)") }
     try {
         $x = Sync-CveKev (Join-Path $Opt.Dir 'cve_kev.json.gz') $h "$($Opt.Proxy)" $f
         if ($x.Changed) { $changed = $true }
         if ($x.Note) { $notes.Add("CISA KEV: $($x.Note)") }
+        $age = [Math]::Max($age, [double](Get-CveAgeHours $x.Data.Synced))
         foreach ($i in @($x.Data.Items)) { if ($i) { $kev["$($i.Cve)"] = @{ Added = (ConvertTo-CveDate $i.Added); Ransom = "$($i.Ransom)" } } }
     } catch { $notes.Add("CISA KEV: $($_.Exception.Message)") }
     $products = @{}
@@ -2522,12 +2538,13 @@ function Sync-CveData([hashtable]$Opt) {
             $x = Sync-CveProduct $p.Name $p.Path ([int]$Opt.Months) $h "$($Opt.Proxy)" $f
             if ($x.Changed) { $changed = $true }
             if ($x.Note) { $notes.Add("$($p.Name): $($x.Note)") }
+            $age = [Math]::Max($age, [double](Get-CveAgeHours $x.Data.Synced))
             $ix = New-CveIndex $x.Data
             Set-CveIndexFlags $ix $expl $kev
             $products[$p.Name] = $ix
         } catch { $notes.Add("$($p.Name): $($_.Exception.Message)") }
     }
-    @{ Products = $products; Expl = $expl; Kev = $kev; Notes = [string[]]$notes.ToArray(); Changed = $changed; Done = [DateTime]::UtcNow }
+    @{ Products = $products; Expl = $expl; Kev = $kev; Notes = [string[]]$notes.ToArray(); Changed = $changed; Done = [DateTime]::UtcNow; AgeH = $age }
 }
 
 # Treść wątku tła. Tryby: Scan (kolektor + zapis migawki + diagnostyka po błędzie), Diag (sama diagnostyka), Load (migawki z dysku),
@@ -3844,6 +3861,7 @@ function Update-StationNetwork($St) {
 $script:CveDb = $null          # wynik Sync-CveData: Products (indeksy wg systemu), Expl, Kev, Notes, Done
 $script:CveIssue = $null       # problem stacji: dane CVE nie zostały pobrane (albo tylko częściowo)
 $script:CveRecheck = $false    # flota zmieniła się w trakcie pobierania – po zakończeniu sprawdzić brakujące systemy
+$script:CveRestart = $false    # ustawienia CVE zapisane w trakcie pobierania – po zakończeniu pobrać ponownie z nowymi
 $script:CveLastFail = [datetime]::MinValue
 # Nazwa systemu w danych Microsoft wg numeru kompilacji (tylko Windows Server; Server Core ma te same poprawki)
 $script:CveProducts = @{ '9200' = 'Windows Server 2012'; '9600' = 'Windows Server 2012 R2'; '14393' = 'Windows Server 2016'; '17763' = 'Windows Server 2019'; '20348' = 'Windows Server 2022'; '26100' = 'Windows Server 2025' }
@@ -3863,8 +3881,9 @@ function Get-CveCacheFile([string]$Product) { Join-Path $Config.CacheDir ('cve_'
 function Get-CveSummary($D) {
     <#
         Brakujące poprawki Windows na serwerze: kompilacja serwera (System.Build z numerem poprawki UBR) porównana z kompilacją,
-        w której Microsoft naprawił każdą CVE. Bez numeru poprawki (2012/2012 R2) – według zainstalowanych KB: CVE z biuletynów
-        nowszych niż najnowszy biuletyn, którego poprawka jest zainstalowana. $null = funkcja wyłączona albo to nie Windows Server.
+        w której Microsoft naprawił każdą CVE (serwer z hotpatchem – z kompilacją aktualizacji Hotpatch). Bez numeru poprawki
+        (2012/2012 R2) – według zainstalowanych KB: najnowsza zainstalowana aktualizacja wyznacza numer poprawki serwera.
+        $null = funkcja wyłączona albo to nie Windows Server.
     #>
     if (-not $Config.CveCheck -or -not $D -or -not $D.PSObject.Properties['System'] -or -not $D.System) { return $null }
     $s = $D.System
@@ -3879,14 +3898,25 @@ function Get-CveSummary($D) {
     if ($base -and "$($p[3])" -match '^\d+$' -and $idx.Bases.ContainsKey($base)) {
         $rev = [int]$p[3]
         $sum.Method = 'Build'
-        $groups = @($idx.Bases[$base] | Where-Object { $_.Rev -gt $rev })
+        # numer poprawki z aktualizacji Hotpatch: CVE z miesięcy hotpatch naprawia niższa kompilacja niż zwykła aktualizacja zbiorcza
+        $set = if ($idx.HotRevs.ContainsKey("$base.$rev") -and $idx.HotBases.ContainsKey($base)) { $sum.Method = 'Hotpatch'; $idx.HotBases[$base] } else { $idx.Bases[$base] }
+        $groups = @($set | Where-Object { $_.Rev -gt $rev })
     } else {
         $kbs = @("$($s.PSObject.Properties['HotFixIds'].Value)" -split ',' | Where-Object { $_ } | ForEach-Object { $_ -replace '^KB', '' })
         if (-not $kbs.Count) { $sum.State = 'Unknown'; return $sum }
-        $pm = ''
-        foreach ($k in $kbs) { $m = $idx.KbMonth[$k]; if ($m -and $m -gt $pm) { $pm = $m } }
-        $sum.Method = if ($pm) { 'KB' } else { 'KB-older' }
-        $groups = @($idx.Months | Where-Object { $_.Month -gt $pm })
+        # aktualizacje miesięczne są kumulatywne: najnowsza zainstalowana wyznacza numer poprawki serwera
+        $kr = -1
+        foreach ($k in $kbs) { if ($idx.KbRev.ContainsKey($k) -and $idx.KbRev[$k] -gt $kr) { $kr = $idx.KbRev[$k] } }
+        $b3 = if ($p.Count -ge 3) { "$($p[0]).$($p[1]).$($p[2])" } else { '' }
+        if ($kr -ge 0 -and $idx.Bases.ContainsKey($b3)) {
+            $sum.Method = 'KB'
+            $groups = @($idx.Bases[$b3] | Where-Object { $_.Rev -gt $kr })
+        } else {
+            $pm = ''
+            foreach ($k in $kbs) { $m = $idx.KbMonth[$k]; if ($m -and $m -gt $pm) { $pm = $m } }
+            $sum.Method = if ($pm) { 'KB' } else { 'KB-older' }
+            $groups = @($idx.Months | Where-Object { $_.Month -gt $pm })
+        }
     }
     $ex = New-Object 'System.Collections.Generic.HashSet[string]'
     $ms = @{}
@@ -3910,7 +3940,12 @@ function Get-CveIssues([string]$Name, $Sum) {
     elseif ($Sum -and $Sum.State -eq 'Ok' -and $Sum.Missing) {
         $tot = "brakuje łącznie $($Sum.Missing) poprawek CVE z biuletynów od $($Sum.Oldest)"
         if ($Sum.Method -eq 'KB-older') { $tot += " (żadna zainstalowana poprawka nie pochodzi z okresu danych – serwer może być aktualizowany jeszcze dawniej)" }
-        if ($Sum.Expl) { $out.Add((New-Issue $Name 'Krytyczny' 'Podatności' "Brak poprawek dla aktywnie wykorzystywanych podatności Windows ($($Sum.Expl)): $(Join-Short $Sum.ExplIds 5); $tot – zainstaluj najnowszą aktualizację zbiorczą" 'Cve')) }
+        if ($Sum.Expl) {
+            $i = New-Issue $Name 'Krytyczny' 'Podatności' "Brak poprawek dla aktywnie wykorzystywanych podatności Windows ($($Sum.Expl)): $(Join-Short $Sum.ExplIds 5); $tot – zainstaluj najnowszą aktualizację zbiorczą" 'Cve'
+            # klucz wyciszenia z pełnego zestawu CVE: wyciszenie znanych nie ukryje nowej wykorzystywanej podatności
+            $i.IssueKey = 'Podatności|Cve|wykorzystywane|' + (@($Sum.ExplIds) -join ',')
+            $out.Add($i)
+        }
         if ($Sum.Crit) { $out.Add((New-Issue $Name 'Ostrzeżenie' 'Podatności' "Brak poprawek dla krytycznych podatności Windows: $($Sum.Crit); $tot" 'Cve')) }
         if (-not $Sum.Expl -and -not $Sum.Crit) { $out.Add((New-Issue $Name 'Info' 'Podatności' "Brakujące poprawki Windows: $tot" 'Cve')) }
     }
@@ -3937,7 +3972,7 @@ function Get-CveRows($D) {
         }
     }
     $arr = [object[]]@($rows.ToArray() | Sort-Object @{ Expression = { if ($_.Exploited) { 0 } else { 1 } } }, @{ Expression = 'Cvss'; Descending = $true }, Cve)
-    $sum | Add-Member -NotePropertyName _Rows -NotePropertyValue $arr -Force
+    if (-not $D.PSObject.Properties['_Slim']) { $sum | Add-Member -NotePropertyName _Rows -NotePropertyValue $arr -Force }   # lekkie kopie: bez bufora
     $arr
 }
 
@@ -3965,32 +4000,33 @@ function Get-CveWantedProducts {
     [string[]]@($set.Keys | Sort-Object)
 }
 
-function Set-CveIssue([string]$Text, [string]$Severity = 'Ostrzeżenie') {
+function Set-CveIssue([string]$Text, [string]$Severity = 'Info') {
     $script:CveIssue = $null
     if ($Text) { $i = New-Issue '(stacja)' $Severity 'Podatności' $Text 'Cve'; $i.Server = 'Stacja'; $script:CveIssue = $i }
 }
 
-function Start-CveUpdate([switch]$Force, [switch]$Auto) {
+function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     <#
         Pobranie/odświeżenie danych CVE w tle (pula Remote – przy starcie Local jest zajęta wczytywaniem migawek).
         -Auto: tylko gdy brakuje danych dla systemu z floty albo są starsze niż CveRefreshHours; po nieudanej próbie przerwa 30 min.
     #>
     if (-not $Config.CveCheck) { return }
     if (Get-Operation 'Cve') {
-        if ($Auto) { $script:CveRecheck = $true } else { Show-Toast 'Dane CVE są już pobierane.' 'info' }
+        if ($Restart) { $script:CveRestart = $true; Show-Toast 'Dane CVE są właśnie pobierane – po zakończeniu zostaną pobrane ponownie z nowymi ustawieniami.' 'info' 6 }
+        elseif ($Auto) { $script:CveRecheck = $true } else { Show-Toast 'Dane CVE są już pobierane.' 'info' }
         return
     }
     $want = @(Get-CveWantedProducts)
     if (-not $want.Count) { if (-not $Auto) { Show-Toast 'Brak danych serwerów Windows Server – najpierw wykonaj skan.' 'info' }; return }
     if ($Auto -and -not $Force) {
         $db = $script:CveDb
-        $stale = (-not $db) -or (([DateTime]::UtcNow - $db.Done).TotalHours -ge $Config.CveRefreshHours) -or [bool]@($want | Where-Object { -not $db.Products.ContainsKey($_) }).Count
+        $stale = (-not $db) -or (([double]$db.AgeH + ([DateTime]::UtcNow - $db.Done).TotalHours) -ge $Config.CveRefreshHours) -or [bool]@($want | Where-Object { -not $db.Products.ContainsKey($_) }).Count
         if (-not $stale -or ((Get-Date) - $script:CveLastFail).TotalMinutes -lt 30) { return }
     }
     $prods = [object[]]@($want | ForEach-Object { @{ Name = $_; Path = (Get-CveCacheFile $_) } })
     $items = @(@{ Target = 'Dane CVE'; Opt = @{ Dir = $Config.CacheDir; Products = $prods; Months = [int]$Config.CveMonths; RefreshHours = [int]$Config.CveRefreshHours; Proxy = "$($Config.CveProxy)"; Force = [bool]$Force } })
     Write-Log "Dane CVE: $($want -join ', ')$(if ($Force) { ' – pobieranie wymuszone' })" 'INFO' 'CVE'
-    [void](Start-Operation -Kind 'Cve' -Name 'Dane CVE' -Items $items -Pool 'Remote' -TimeoutSec 1800 -State @{ Manual = -not $Auto } `
+    [void](Start-Operation -Kind 'Cve' -Name 'Dane CVE' -Items $items -Pool 'Remote' -TimeoutSec 1800 -State @{ Manual = -not $Auto; Want = [string[]]$want } `
         -OnResult { param($op, $r) Receive-CveResult $op $r } -OnComplete { param($op) Complete-CveUpdate $op })
 }
 
@@ -4000,11 +4036,13 @@ function Receive-CveResult($Op, $R) {
         $msg = if ($R.ErrorId -eq 'SrTimeout') { 'przekroczono limit czasu pobierania' } elseif ($R.ErrorId -eq 'SrCancelled') { 'przerwano' } else { "$($R.Error)" }
         Write-Log "Dane CVE: nie pobrano – $msg" $(if ($R.ErrorId -eq 'SrCancelled') { 'WARN' } else { 'ERROR' }) 'CVE'
         if (-not $script:CveDb) { Set-CveIssue "Nie pobrano danych CVE (Microsoft MSRC): $msg – sprawdź dostęp stacji do internetu (api.msrc.microsoft.com) i ustawienia proxy" }
+        $Op.State.Failed = $msg
         return
     }
     $db = $R.Data
     foreach ($n in $db.Notes) { Write-Log "Dane CVE: $n" 'WARN' 'CVE' }
-    if ($db.Notes.Count) { $script:CveLastFail = Get-Date }
+    # przerwa w automatycznych próbach tylko, gdy brakuje danych któregoś systemu (brak KEV albo dane z pamięci podręcznej nie blokują)
+    if (@($Op.State.Want | Where-Object { -not $db.Products.ContainsKey($_) }).Count) { $script:CveLastFail = Get-Date }
     $script:CveDb = $db
     if (-not $db.Products.Count) { Set-CveIssue "Nie pobrano danych CVE (Microsoft MSRC): $(Join-Short $db.Notes 2) – sprawdź dostęp stacji do internetu (api.msrc.microsoft.com) i ustawienia proxy" }
     elseif ($db.Notes.Count) { Set-CveIssue "Dane CVE odświeżone częściowo: $(Join-Short $db.Notes 2)" 'Info' }
@@ -4016,10 +4054,12 @@ function Receive-CveResult($Op, $R) {
 
 function Complete-CveUpdate($Op) {
     if ($Op.State.Manual) {
-        if ($script:CveIssue) { Show-Toast $script:CveIssue.Message 'warn' 8 }
+        if ($Op.State.Failed) { Show-Toast "Nie pobrano danych CVE: $($Op.State.Failed)$(if ($script:CveDb) { ' – używane są poprzednie dane' })" 'warn' 8 }
+        elseif ($script:CveIssue) { Show-Toast $script:CveIssue.Message 'warn' 8 }
         elseif ($script:CveDb) { Show-Toast 'Dane CVE są aktualne – wyniki przeliczone.' 'ok' }
     }
-    if ($script:CveRecheck) { $script:CveRecheck = $false; Start-CveUpdate -Auto }
+    if ($script:CveRestart) { $script:CveRestart = $false; $script:CveRecheck = $false; if ($Config.CveCheck) { Start-CveUpdate -Force } }
+    elseif ($script:CveRecheck) { $script:CveRecheck = $false; Start-CveUpdate -Auto }
 }
 
 function Split-ServerIssues([string]$Name, $D) {
@@ -6900,6 +6940,7 @@ function Start-Operation {
         [void]$ps.AddScript($script:WorkerScript).AddArgument($Kind).AddArgument($x.Target).AddArgument($x.Opt).AddArgument($op.Sync)
         [void]$op.Items.Add(@{ Target = $x.Target; PS = $ps; Handle = $ps.BeginInvoke(); Finished = $false; Stopping = $false; StopAt = $null; TimedOut = $false })
     }
+    if (-not $script:Ops.Count -and -not $script:Headless -and $ui) { $script:IdleStatus = "$($ui.txtStatus.Text)" }
     [void]$script:Ops.Add($op)
     if ($script:EngineTimer) { $script:EngineTimer.Start() }
     Update-StatusBar
@@ -7015,6 +7056,7 @@ function Invoke-UiRefresh {
         if ($script:UiDirty.Detail -and $ui.viewServer.Visibility -eq 'Visible') { Show-ServerDetail $script:CurrentServer; $script:UiDirty.Detail = $false }
     } catch { Write-Log "Błąd odświeżania widoku: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program' }
 }
+$script:IdleStatus = ''   # komunikat paska stanu przywracany, gdy nie ma już żadnej operacji (Update-StatusBar)
 function Update-StatusBar {
     if ($script:Headless -or -not $ui) { return }
     $ops = @($script:Ops)
@@ -7022,6 +7064,7 @@ function Update-StatusBar {
         $ui.statusDot.Fill = Brush '#5EE3AE'
         $ui.prg.Visibility = 'Collapsed'
         $ui.btnCancelOps.Visibility = 'Collapsed'
+        if ($script:IdleStatus) { $ui.txtStatus.Text = $script:IdleStatus }   # ostatni komunikat sprzed operacji albo podsumowanie skanu/wczytania
         Set-ScanUi $false
         return
     }
@@ -7213,7 +7256,7 @@ function Complete-Scan($Op) {
     }
     Write-Log $msg $(if ($st.Offline -or $st.Timeout -or $Op.Cancelled) { 'WARN' } else { 'OK' }) 'Skan'
     if (-not $script:Headless) {
-        $ui.txtStatus.Text = $msg
+        $ui.txtStatus.Text = $msg; $script:IdleStatus = $msg
         $ui.txtLastScan.Text = "Ostatni skan: $(Get-NowText)"
         Show-Toast $msg $(if ($Op.Cancelled) { 'warn' } elseif ($st.Offline) { 'warn' } else { 'ok' }) 6
         Request-UiRefresh -All
@@ -7273,7 +7316,7 @@ function Complete-Load($Op) {
     Write-Log ("{0}: {1} serwerów w {2} s{3}{4}" -f $Op.Name, ($Op.Done - $Op.State.Bad), $el, $(if ($off) { ", bez połączenia przy ostatniej próbie: $off" }), $(if ($Op.State.Bad) { ", nieczytelne: $($Op.State.Bad)" })) 'INFO' 'Migawki'
     if (-not $script:Headless) {
         if ($Op.State.Last) { $ui.txtLastScan.Text = "Wyniki z ostatniego skanu: $($Op.State.Last)" }
-        $ui.txtStatus.Text = "Wczytano wyniki $($Op.Done - $Op.State.Bad) serwerów"
+        $ui.txtStatus.Text = "Wczytano wyniki $($Op.Done - $Op.State.Bad) serwerów"; $script:IdleStatus = $ui.txtStatus.Text
         Request-UiRefresh -All
     }
     Start-CveUpdate -Auto   # dane CVE dla systemów z floty (pierwsze pobranie albo odświeżenie)
@@ -7655,7 +7698,7 @@ function Show-SettingsDialog {
         } else { Show-Toast 'Zapisano ustawienia.' 'ok' }
         # inny okres, proxy albo ponowne włączenie: dane CVE od nowa (wyłączenie: problemy CVE znikają przy ponownej analizie)
         if (-not $Config.CveCheck) { Set-CveIssue '' }
-        elseif ("$($Config.CveCheck)|$($Config.CveMonths)|$($Config.CveProxy)" -ne $cveBefore) { Start-CveUpdate -Force }
+        elseif ("$($Config.CveCheck)|$($Config.CveMonths)|$($Config.CveProxy)" -ne $cveBefore) { Start-CveUpdate -Force -Restart }
     }
     $script:SetDlg = $null
 }
@@ -7751,7 +7794,10 @@ function Invoke-HeadlessScan {
         [void](Import-ServerFile $Config.ServerListFile)
         if (-not $script:Servers.Count) { Write-Log 'Lista serwerów jest pusta.' 'ERROR' 'Lista'; return 2 }
         Initialize-AvailabilityStats
-        Start-SnapshotLoad; Wait-Operations       # poprzednie wyniki: hosty Hyper-V (Linux, wyjaśnienie niedostępności), kolejność skanu
+        # poprzednie wyniki: hosty Hyper-V (Linux, wyjaśnienie niedostępności), kolejność skanu; czekamy tylko na wczytanie migawek –
+        # pobieranie danych CVE (Complete-Load) trwa równolegle ze skanem, a raport powstaje po zakończeniu obu (Wait-Operations niżej)
+        Start-SnapshotLoad
+        while (Get-Operation 'Load') { Update-Operations; if (Get-Operation 'Load') { Start-Sleep -Milliseconds 300 } }
         $script:LastScanState = $null
         Start-Scan @($script:Servers | ForEach-Object { $_.Name }); Wait-Operations
         $st = $script:LastScanState
@@ -8148,7 +8194,7 @@ $window.Dispatcher.Add_UnhandledException({
 $window.Add_Closing({
     param($s, $e)
     try {
-        if ($script:Ops.Count -and -not $script:UnlockState.Emergency) {
+        if (@($script:Ops | Where-Object { $_.Kind -ne 'Cve' }).Count -and -not $script:UnlockState.Emergency) {   # samo pobieranie CVE – bez pytania
             # zamknięcie awaryjne z ekranu blokady w trakcie tego pytania też zamyka program
             if (-not (Confirm-Action -Text 'Trwa skan lub wczytywanie wyników. Zamknięcie programu je przerwie. Zamknąć mimo to?' -Title 'Zamknięcie programu' -ConfirmText 'Zamknij' -Danger) -and -not $script:UnlockState.Emergency) { $e.Cancel = $true; return }
         }
