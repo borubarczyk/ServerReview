@@ -16,6 +16,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Niedostępne serwery](#niedostępne-serwery)
 - [Hyper-V i klastry](#hyper-v-i-klastry)
 - [Bezpieczeństwo: utwardzenie, Active Directory](#bezpieczeństwo-utwardzenie-active-directory)
+- [Podatności (CVE)](#podatności-cve)
 - [Wykrywane problemy](#wykrywane-problemy)
 - [Wyciszanie problemów](#wyciszanie-problemów)
 - [Porównanie z poprzednim skanem](#porównanie-z-poprzednim-skanem)
@@ -35,6 +36,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 | **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, host Hyper-V, na którym działa maszyna |
 | **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
 | **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-active-directory)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
+| **Podatności (CVE)** | brakujące poprawki Windows: CVE, dla których Microsoft wydał poprawkę nowszą niż zainstalowana, z wyróżnieniem krytycznych i aktywnie wykorzystywanych (Microsoft, CISA KEV) – wylicza stacja z danych pobranych z internetu, [szczegóły](#podatności-cve) |
 | **Usługi, sieć i pliki** | usługi (spoza Microsoft, zatrzymane automatyczne, działające na kontach użytkowników, z niecytowaną ścieżką), zadania harmonogramu spoza `\Microsoft\` z wynikiem ostatniego uruchomienia, karty sieciowe i adresacja, porty nasłuchujące i aktywne połączenia (z procesem i usługą), sesje użytkowników, zawartość wskazanych folderów |
 | **Oprogramowanie** | zainstalowane programy, ostatnie aktualizacje (KB) |
 | **Kontroler domeny** | SYSVOL/DFSR, replikacja AD, podpisywanie LDAP i channel binding, wyjątki bezpiecznego kanału Netlogon, konta i usługi wymagające Kerberos RC4 (zdarzenia KDCSVC 201–209) |
@@ -49,6 +51,7 @@ Sekcje kontrolera domeny, Active Directory i Hyper-V pokazują się tylko na ser
 
 - Windows z Windows PowerShell 5.1 (interfejs korzysta z WPF). Uruchomienie z PowerShell 7 też działa, bo skrypt sam przełącza się wtedy na `powershell.exe`.
 - Dostęp do Active Directory, jeśli chcesz pobierać listę serwerów przyciskiem **AD** i sprawdzać konta komputerów w diagnozie niedostępności.
+- Dostęp HTTPS do `api.msrc.microsoft.com` oraz `www.cisa.gov` albo `raw.githubusercontent.com` (bezpośrednio albo przez proxy), jeśli chcesz sprawdzać [brakujące poprawki (CVE)](#podatności-cve). Bez dostępu program działa normalnie, tylko bez tej oceny.
 
 **Serwery**
 
@@ -207,6 +210,39 @@ Każdy kontroler domeny zbiera sekcję **Active Directory: bezpieczeństwo domen
 
 Sprawdzane są m.in.: wiek hasła krbtgt, delegowanie nieograniczone, delegowanie do usług kontrolera domeny i RBCD na kontrolerach, prawa replikacji (DCSync) i pełna kontrola nad obiektem domeny poza grupami administracyjnymi (konto synchronizacji Entra Connect jest rozpoznawane jako oczekiwane), konta bez wstępnego uwierzytelniania Kerberos, konta uprzywilejowane z SPN, hasła zapisywane odwracalnie, konta z `PASSWD_NOTREQD`, konta bez AES, słowo „hasło” w opisie konta, liczność i nieużywane konta grup uprzywilejowanych, sIDHistory z SID-em uprzywilejowanym albo z tej samej domeny, `MachineAccountQuota`, zasady haseł i blokady kont, poziom funkcjonalny, Kosz AD, anonimowy dostęp do katalogu, zaufania bez filtrowania SID, pokrycie i rotacja LAPS, nieaktywne konta komputerów, hasła w SYSVOL (GPP `cpassword` i skrypty logowania).
 
+## Podatności (CVE)
+
+Program wylicza, których poprawek bezpieczeństwa Windows brakuje na każdym serwerze. Nie instaluje niczego na serwerach i niczego dodatkowego na nich nie zbiera, poza pełną listą zainstalowanych KB. Dane o podatnościach pobiera stacja.
+
+**Skąd dane.**
+- Microsoft Security Update Guide (`api.msrc.microsoft.com`): dla każdej CVE kompilacja Windows, w której ją naprawiono, numer KB, ważność, skutek i CVSS. Program pobiera tylko wersje Windows Server obecne w flocie.
+- Lista CVE, które Microsoft oznaczył jako wykorzystywane.
+- Katalog CISA KEV, czyli podatności znane z rzeczywistych ataków. Pobierany z `www.cisa.gov`, a gdy ten adres jest niedostępny, z oficjalnej kopii CISA na GitHubie.
+
+Dane są zapisywane w folderze `Cache`. Pierwsze pobranie dla kilku wersji systemu trwa kilkadziesiąt sekund. Kolejne są przyrostowe: tylko nowe i poprawione wpisy, gdy dane są starsze niż 24 godziny. Program pobiera je w tle przy starcie, po wczytaniu wyników i po skanie. Na żądanie służy przycisk **Odśwież dane CVE** w oknie ustawień.
+
+**Jak ocenia serwer.**
+- Windows Server 2016, 2019, 2022 i 2025: pełny numer kompilacji z kolektora (np. `10.0.20348.4171`) jest porównywany z kompilacją, w której Microsoft naprawił każdą CVE.
+- 2012 i 2012 R2, gdy system nie podaje numeru poprawki: liczy się najnowszy biuletyn, którego poprawka jest zainstalowana (lista KB). Brakujące są CVE z nowszych biuletynów.
+- Wersje Server Core mają te same poprawki co pełne.
+- Komputery z Windows innym niż Server są pomijane.
+
+**Wynik.**
+- Sekcja **Brakujące poprawki Windows (CVE)** w szczegółach serwera, z poziomem, CVSS, skutkiem, biuletynem, numerem KB i kompilacją z poprawką. Wykorzystywane podatności są na czerwono, krytyczne na pomarańczowo.
+- Znacznik w nagłówku serwera.
+- Kolumny w tabeli „Wszystkie serwery” i w raporcie.
+- Problemy:
+  - **Krytyczny**: brak poprawek dla podatności aktywnie wykorzystywanych;
+  - **Ostrzeżenie**: brak poprawek dla podatności krytycznych;
+  - **Info**: pozostałe brakujące poprawki.
+- Gdy danych nie udało się pobrać, problem pojawia się przy stacji.
+
+**Ograniczenia.**
+- Ocena dotyczy samego systemu Windows, nie zainstalowanych programów.
+- Serwer korzystający z aktualizacji bez ponownego uruchomienia (Hotpatch) może mieć numer kompilacji niższy niż w zwykłej aktualizacji zbiorczej i wyglądać na nieaktualny.
+- Okres danych to domyślnie 12 miesięcy. Serwer aktualizowany jeszcze dawniej ma brakujące wszystkie poprawki z tego okresu, a komunikat to zaznacza.
+- Serwery bez połączenia nie są oceniane.
+
 ## Wykrywane problemy
 
 Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości domyślne, które można zmienić w [Ustawieniach](#ustawienia).
@@ -220,6 +256,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - wyczyszczony dziennik zdarzeń;
 - różnica czasu względem stacji co najmniej 300 s (limit Kerberos);
 - system po końcu wsparcia Microsoft;
+- brak poprawek Windows dla podatności aktywnie wykorzystywanych (oznaczonych przez Microsoft albo w katalogu CISA KEV);
 - dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
 - krytyczne ustawienia bezpieczeństwa: wyłączona ochrona w czasie rzeczywistym, sygnatury antywirusa starsze niż 7 dni, włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0, Point and Print bez ostrzeżeń i uprawnień administratora, urząd certyfikacji z `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6);
 - w grupie Administratorzy jest grupa obejmująca wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy domeny i podobne);
@@ -233,6 +270,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - skan serwera przekroczył limit czasu (pokazane są poprzednie dane); serwer odpowiada, ale kolektor zakończył się błędem; maszyna wirtualna serwera wyłączona (do 30 dni) lub zapisana; niedostępny gość niedostępnego hosta Hyper-V;
 - mniej niż 20% wolnego miejsca na dysku;
 - uptime powyżej 45 dni, oczekujący restart, brak aktualizacji od ponad 45 dni;
+- brak poprawek Windows dla podatności krytycznych;
 - użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci (na hoście Hyper-V zamiast progu RAM liczy się zapas wolnej pamięci: mniej niż 8 GB);
 - zatrzymane usługi automatyczne, niecytowane ścieżki usług, nieudane zadania harmonogramu;
 - zdarzenia krytyczne w dziennikach, nieoczekiwane wyłączenia (z odesłaniem do sekcji Przestoje), pojedyncza awaria BSOD, pliki zrzutów pamięci;
@@ -265,6 +303,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - wyłączone maszyny wirtualne, stara wersja konfiguracji maszyny (Windows Server 2022/2025 jej nie uruchomi), przestoje z ostatnich dni z inicjatorem ostatniego restartu;
 - rozłączone sesje, połączenia przychodzące z adresów publicznych, wykluczenia Defendera;
 - zbliżający się koniec wsparcia systemu (365 dni);
+- pozostałe brakujące poprawki Windows (CVE); nie udało się pobrać danych CVE (problem stacji);
 - skan serwera trwał co najmniej 70% limitu czasu (z trzema najwolniejszymi sekcjami);
 - ta sama maszyna na liście pod dwiema nazwami (alias DNS, adres IP, nazwa klastra);
 - zbiorcze zalecenia utwardzenia serwera („Do utwardzenia (N): …”) i domeny („Do utwardzenia w domenie (N): …”);
@@ -413,6 +452,15 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | Przechowuj dziennik operacji i dostępności [dni] | 90 |
 | Blokada programu po bezczynności [min] (0 = wyłączona; wymaga PIN-u) | 10 |
 
+**Podatności (CVE)**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Sprawdzaj brakujące poprawki Windows (CVE) – stacja pobiera dane Microsoft i katalog CISA KEV | tak |
+| Dane CVE z ostatnich [miesięcy] | 12 |
+| Pobieraj dane CVE ponownie po [godzinach] | 24 |
+| Serwer proxy dla pobierania danych CVE (puste = ustawienia systemowe) | (puste) |
+
 **Listy**
 
 | Ustawienie | Domyślnie |
@@ -439,6 +487,7 @@ Snapshots\RRRRMMDD_GGMMSS\<serwer>.offline.json   nieudana próba: błąd i wyni
 Reports\Przeglad_serwerow_RRRRMMDD_GGMM.html      raporty HTML
 Logs\ServerReview_RRRRMMDD.log                    dziennik operacji
 Logs\Availability_RRRRMM.csv                      dziennik dostępności
+Cache\cve_*.json.gz                               dane CVE pobrane przez stację (Microsoft, CISA KEV)
 ```
 
 Jeśli skrypt uruchomiono bez pliku (np. wklejony do konsoli), zamiast folderu skryptu używany jest `%USERPROFILE%\Documents\ServerReview`. Jeśli folder skryptu jest tylko do odczytu (np. udział sieciowy), dane trafiają do `%LOCALAPPDATA%\ServerReview`, a lista serwerów i ustawienia są tam kopiowane przy pierwszym uruchomieniu.
