@@ -4008,7 +4008,8 @@ function Set-CveIssue([string]$Text, [string]$Severity = 'Info') {
 function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     <#
         Pobranie/odświeżenie danych CVE w tle (pula Remote – przy starcie Local jest zajęta wczytywaniem migawek).
-        -Auto: tylko gdy brakuje danych dla systemu z floty albo są starsze niż CveRefreshHours; po nieudanej próbie przerwa 30 min.
+        -Auto: tylko gdy brakuje danych dla systemu z floty albo są starsze niż CveRefreshHours; po nieudanej próbie (brak danych systemu
+        albo źródło nieodświeżone) kolejna najwcześniej po 30 min.
     #>
     if (-not $Config.CveCheck) { return }
     if (Get-Operation 'Cve') {
@@ -4020,7 +4021,12 @@ function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     if (-not $want.Count) { if (-not $Auto) { Show-Toast 'Brak danych serwerów Windows Server – najpierw wykonaj skan.' 'info' }; return }
     if ($Auto -and -not $Force) {
         $db = $script:CveDb
-        $stale = (-not $db) -or (([double]$db.AgeH + ([DateTime]::UtcNow - $db.Done).TotalHours) -ge $Config.CveRefreshHours) -or [bool]@($want | Where-Object { -not $db.Products.ContainsKey($_) }).Count
+        $stale = (-not $db) -or [bool]@($want | Where-Object { -not $db.Products.ContainsKey($_) }).Count
+        if (-not $stale) {
+            $h = ([DateTime]::UtcNow - $db.Done).TotalHours
+            # źródło, którego nie udało się odświeżyć (notatki), ponawiamy najwcześniej po 30 min od poprzedniej próby – nie po każdym skanie
+            $stale = (([double]$db.AgeH + $h) -ge $Config.CveRefreshHours) -and (-not @($db.Notes).Count -or $h -ge 0.5)
+        }
         if (-not $stale -or ((Get-Date) - $script:CveLastFail).TotalMinutes -lt 30) { return }
     }
     $prods = [object[]]@($want | ForEach-Object { @{ Name = $_; Path = (Get-CveCacheFile $_) } })
@@ -4128,6 +4134,7 @@ function Update-VmIndex {
     $addX = {
         param($key, $sev, $msg, $sec, $srvText, $cat, [string[]]$altKeys)
         $i = New-Issue $key $sev $(if ($cat) { $cat } elseif ($sec -eq 'Cluster') { 'Klaster' } else { 'Hyper-V' }) $msg $sec
+        if ($cat -eq 'System' -and $sec -eq 'System') { $i.IssueKey = Get-IssueKey 'Hyper-V' $sec $msg }   # duplikat nazwy: klucz wyciszenia sprzed zmiany kategorii
         if ($srvText) { $i.Server = $srvText; $i._Search = ("$srvText $($i.Category) $msg").ToLowerInvariant() }
         $ign = Test-IssueIgnored $key $i.IssueKey
         foreach ($ak in @($altKeys)) { if (-not $ign -and $ak -and $ak -ne $key) { $ign = Test-IssueIgnored $ak $i.IssueKey } }   # np. inne kontrolery tej samej domeny
@@ -6809,7 +6816,7 @@ function Show-ServerDetail([string]$Name) {
         if ($s.LastHotfixDays -ge 0) { Add-Chip "Aktualizacja $($s.LastHotfixDays) dni temu" $(if ($s.LastHotfixDays -gt $Config.PatchWarnDays) { 'warn' } else { 'ok' }) }
         $cs = $d.PSObject.Properties['_CveSum'].Value
         if ($cs -and $cs.State -eq 'Ok') {
-            Add-Chip $(if ($cs.Missing) { "CVE: brak $($cs.Missing) poprawek$(if ($cs.Expl) { ", wykorzystywane: $($cs.Expl)" })" } else { 'CVE: poprawki aktualne' }) $(if ($cs.Expl) { 'crit' } elseif ($cs.Crit) { 'warn' } elseif ($cs.Missing) { 'info' } else { 'ok' }) "$($cs.Product), dane Microsoft od $($cs.From)$(if ($cs.Method -ne 'Build') { ' – ocena według zainstalowanych KB' })"
+            Add-Chip $(if ($cs.Missing) { "CVE: brak $($cs.Missing) poprawek$(if ($cs.Expl) { ", wykorzystywane: $($cs.Expl)" })" } else { 'CVE: poprawki aktualne' }) $(if ($cs.Expl) { 'crit' } elseif ($cs.Crit) { 'warn' } elseif ($cs.Missing) { 'info' } else { 'ok' }) "$($cs.Product), dane Microsoft od $($cs.From)$(if ($cs.Method -like 'KB*') { ' – ocena według zainstalowanych KB' } elseif ($cs.Method -eq 'Hotpatch') { ' – według kompilacji Hotpatch' })"
         }
         if ($s.PendingReboot) { Add-Chip 'Wymaga restartu' 'warn' }
         if ($s.IsDC) { Add-Chip 'Kontroler domeny' }
@@ -7014,6 +7021,7 @@ function Update-Operations {
             }
             if ($op.Done -ge $op.Total) {
                 [void]$script:Ops.Remove($op)
+                if (-not $script:Ops.Count) { Update-StatusBar }   # komunikat sprzed operacji, zanim OnComplete uruchomi kolejną (Start-Operation zapamiętuje pasek)
                 if ($op.OnComplete) {
                     try { $null = & $op.OnComplete $op }
                     catch { Write-Log "Błąd po zakończeniu operacji: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' $op.Name }

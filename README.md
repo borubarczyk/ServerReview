@@ -219,11 +219,12 @@ Program wylicza, których poprawek bezpieczeństwa Windows brakuje na każdym se
 - Lista CVE, które Microsoft oznaczył jako wykorzystywane.
 - Katalog CISA KEV, czyli podatności znane z rzeczywistych ataków. Pobierany z `www.cisa.gov`, a gdy ten adres jest niedostępny, z oficjalnej kopii CISA na GitHubie.
 
-Dane są zapisywane w folderze `Cache`. Pierwsze pobranie dla kilku wersji systemu trwa kilkadziesiąt sekund. Kolejne są przyrostowe: tylko nowe i poprawione wpisy, gdy dane są starsze niż 24 godziny. Program pobiera je w tle przy starcie, po wczytaniu wyników i po skanie. Na żądanie służy przycisk **Odśwież dane CVE** w oknie ustawień.
+Dane są zapisywane w folderze `Cache`. Pierwsze pobranie dla kilku wersji systemu trwa kilkadziesiąt sekund. Kolejne są przyrostowe (nowe wpisy), gdy dane są starsze niż 24 godziny, a raz na 7 dni program pobiera cały okres, bo poprawione CVE zachowują datę wydania. Gdy któregoś źródła nie da się odświeżyć, używane są dane zapisane, a kolejna próba następuje najwcześniej po 30 minutach. Program pobiera je w tle przy starcie, po wczytaniu wyników i po skanie. Na żądanie służy przycisk **Odśwież dane CVE** w oknie ustawień.
 
 **Jak ocenia serwer.**
 - Windows Server 2016, 2019, 2022 i 2025: pełny numer kompilacji z kolektora (np. `10.0.20348.4171`) jest porównywany z kompilacją, w której Microsoft naprawił każdą CVE.
-- 2012 i 2012 R2, gdy system nie podaje numeru poprawki: liczy się najnowszy biuletyn, którego poprawka jest zainstalowana (lista KB). Brakujące są CVE z nowszych biuletynów.
+- 2012 i 2012 R2, gdy system nie podaje numeru poprawki: aktualizacje miesięczne są kumulatywne, więc najnowsza zainstalowana (lista KB) wyznacza numer poprawki serwera, porównywany jak wyżej.
+- Serwery z aktualizacjami bez ponownego uruchomienia (Hotpatch) są oceniane według kompilacji aktualizacji Hotpatch, która jest niższa niż w zwykłej aktualizacji zbiorczej z tego samego miesiąca.
 - Wersje Server Core mają te same poprawki co pełne.
 - Komputery z Windows innym niż Server są pomijane.
 
@@ -239,7 +240,6 @@ Dane są zapisywane w folderze `Cache`. Pierwsze pobranie dla kilku wersji syste
 
 **Ograniczenia.**
 - Ocena dotyczy samego systemu Windows, nie zainstalowanych programów.
-- Serwer korzystający z aktualizacji bez ponownego uruchomienia (Hotpatch) może mieć numer kompilacji niższy niż w zwykłej aktualizacji zbiorczej i wyglądać na nieaktualny.
 - Okres danych to domyślnie 12 miesięcy. Serwer aktualizowany jeszcze dawniej ma brakujące wszystkie poprawki z tego okresu, a komunikat to zaznacza.
 - Serwery bez połączenia nie są oceniane.
 
