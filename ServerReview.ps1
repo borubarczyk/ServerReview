@@ -2193,8 +2193,11 @@ function Invoke-ConnectionDiagnostics {
     if ($ip) {
         $pinger = $null; $pingTask = $null; $tcp = @()
         try { $pinger = New-Object Net.NetworkInformation.Ping; $pingTask = $pinger.SendPingAsync($ip, $TimeoutMs) } catch {}
+        # gniazdo w rodzinie adresu: domyślny TcpClient w .NET Framework obsługuje tylko IPv4 (adres IPv6 = żadna próba portu)
+        $fam = [Net.Sockets.AddressFamily]::InterNetwork; $pa = $null
+        if ([Net.IPAddress]::TryParse("$ip", [ref]$pa)) { $fam = $pa.AddressFamily }
         foreach ($port in $Ports) {
-            $cl = New-Object Net.Sockets.TcpClient
+            $cl = New-Object Net.Sockets.TcpClient($fam)
             $task = $null; try { $task = $cl.ConnectAsync($ip, [int]$port) } catch {}
             $tcp += , @{ Port = [int]$port; Client = $cl; Task = $task }
         }
@@ -4165,7 +4168,7 @@ function Update-VmIndex {
         $d = $script:Data[$it.Name]
         if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['System'] -or -not $d.System -or -not $d.System.ComputerName) { continue }
         $cnm = "$($d.System.ComputerName)".ToUpperInvariant()
-        if ($byComp.ContainsKey($cnm)) { & $addX $it.Name 'Info' "Nazwa $($it.Name) wskazuje na ten sam serwer co $($byComp[$cnm]) (alias, nazwa klastra albo adres IP) – usuń duplikat z listy" 'System' '' }
+        if ($byComp.ContainsKey($cnm)) { & $addX $it.Name 'Info' "Nazwa $($it.Name) wskazuje na ten sam serwer co $($byComp[$cnm]) (alias, nazwa klastra albo adres IP) – usuń duplikat z listy" 'System' '' 'System' }
         else { $byComp[$cnm] = $it.Name }
     }
     # Awarie zbiorcze: wiele niedostępnych serwerów z jednego hosta Hyper-V albo z jednej podsieci to zwykle jedna przyczyna
@@ -5935,11 +5938,13 @@ function Confirm-Pin([string]$Hint) {
     if (-not (Test-PinConfigured)) { return $true }
     Invoke-Dialog (New-UnlockWindow -Mode 'Verify' -Hint $Hint)
 }
+# Funkcje blokady używają okna głównego z zakresu skryptu: $window i $Window to w PowerShell ta sama nazwa, a parametr $Window
+# funkcji wywołującej (Invoke-Dialog, Add-UnlockKey) zasłaniałby okno główne w funkcjach wołanych z ich wnętrza
 function Restore-AfterLock {
     # Koniec blokady: zawartość okna głównego i otwartych okien z powrotem (wywołanie wielokrotne bez skutków)
     $script:UnlockState.Locked = $false
     $script:IdleLock.Last = [datetime]::UtcNow
-    if ($window -and $window.Content) { $window.Content.Visibility = 'Visible' }
+    if ($script:window -and $script:window.Content) { $script:window.Content.Visibility = 'Visible' }
     foreach ($c in @($script:UnlockState.Hidden)) { try { $c.Visibility = 'Visible' } catch { } }
     $script:UnlockState.Hidden = @()
 }
@@ -5950,11 +5955,11 @@ function Lock-Program {
         Skan w tle trwa; okna, które chcą się pokazać w tym czasie, czekają na odblokowanie (Invoke-Dialog).
     #>
     param([int]$IdleMinutes = 0)
-    if (-not (Test-PinConfigured) -or $script:UnlockState.Locked -or $script:UnlockState.Emergency -or -not $window) { return }
+    if (-not (Test-PinConfigured) -or $script:UnlockState.Locked -or $script:UnlockState.Emergency -or -not $script:window) { return }
     $script:UnlockState.Locked = $true
     Write-Log $(if ($IdleMinutes) { "Program zablokowany po $IdleMinutes min bez aktywności." } else { 'Program zablokowany.' }) 'INFO' 'Blokada'
-    if ($window.Content) { $window.Content.Visibility = 'Hidden' }
-    $script:UnlockState.Hidden = @(foreach ($ow in @($window.OwnedWindows)) {
+    if ($script:window.Content) { $script:window.Content.Visibility = 'Hidden' }
+    $script:UnlockState.Hidden = @(foreach ($ow in @($script:window.OwnedWindows)) {
         $c = $ow.Content
         if ($c -is [System.Windows.UIElement] -and $c.Visibility -eq 'Visible') { $c.Visibility = 'Hidden'; $c }
     })
@@ -5972,9 +5977,9 @@ function Close-ProgramEmergency {
     # Zamknięcie awaryjne z ekranu blokady: okna zamykane bez pytań, skan przerywany przy zamykaniu okna głównego
     $busy = @($script:Ops).Count
     Write-Log ('Zamknięcie awaryjne z ekranu blokady (bez PIN-u){0}.' -f $(if ($busy) { ' – przerwano skan' } else { '' })) 'WARN' 'Blokada'
-    if (-not $window) { return }
-    foreach ($ow in @($window.OwnedWindows)) { try { $ow.Close() } catch { } }
-    try { $window.Close() } catch { }
+    if (-not $script:window) { return }
+    foreach ($ow in @($script:window.OwnedWindows)) { try { $ow.Close() } catch { } }
+    try { $script:window.Close() } catch { }
 }
 function Wait-Unlocked {
     # Okno otwierane w czasie blokady czeka na odblokowanie; okno programu dalej reaguje (zagnieżdżona pętla komunikatów)
@@ -5993,9 +5998,9 @@ function Register-IdleActivity([System.Windows.Window]$Window) {
 }
 function Test-ProgramActive {
     # Czy któreś okno programu jest aktywne – ruch myszy w innym programie się nie liczy
-    if (-not $window) { return $false }
-    if ($window.IsActive) { return $true }
-    foreach ($ow in @($window.OwnedWindows)) { if ($ow.IsActive) { return $true } }
+    if (-not $script:window) { return $false }
+    if ($script:window.IsActive) { return $true }
+    foreach ($ow in @($script:window.OwnedWindows)) { if ($ow.IsActive) { return $true } }
     $false
 }
 function Test-IdleLock {
@@ -6003,7 +6008,7 @@ function Test-IdleLock {
     $st = $script:IdleLock
     $now = [datetime]::UtcNow
     $limit = 0; try { $limit = [int]$Config.LockIdleMinutes } catch { }
-    if (-not (Test-PinConfigured) -or $limit -le 0 -or $script:UnlockState.Locked -or -not $window -or -not $window.IsVisible) { $st.Last = $now; return }
+    if (-not (Test-PinConfigured) -or $limit -le 0 -or $script:UnlockState.Locked -or -not $script:window -or -not $script:window.IsVisible) { $st.Last = $now; return }
     $pos = $null; try { $pos = [System.Windows.Forms.Control]::MousePosition } catch { }
     if ($null -ne $pos -and $null -ne $st.Pos -and $pos -ne $st.Pos -and (Test-ProgramActive)) { $st.Last = $now }
     $st.Pos = $pos
