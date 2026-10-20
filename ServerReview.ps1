@@ -133,8 +133,6 @@ $Config = [ordered]@{
     )
     # Porty uznawane za wrażliwe przy przeglądzie reguł zapory (sekcja Ekspozycja)
     ExposedPorts           = @(21, 22, 23, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 5985, 5986)
-    # Narzędzia zdalnego dostępu używane w firmie (RMM) – zgłaszane jako informacja zamiast ostrzeżenia (sekcja Podejrzane)
-    ApprovedRemoteTools    = @()
     # Subskrypcje WMI obecne w czystym systemie – nie są zgłaszane (sekcja Trwałość)
     IgnoredWmiConsumers    = @('SCM Event Log Filter', 'SCM Event Log Consumer', 'BVTFilter', 'BVTConsumer')
     # Wymagane podkategorie audytu. GUID jest niezależny od języka systemu. Need: 1 = sukces, 2 = niepowodzenie, 3 = oba
@@ -1791,331 +1789,6 @@ $Collector = {
         }
     })
 
-    # ── Podejrzane: wskaźniki naruszenia i nietypowe mechanizmy trwałości (tylko odczyt, lekkie sprawdzenia) ──
-    # Level: Krytyczne / Uwaga / Info – wstępna ocena; stacja może ją zmienić (zatwierdzone narzędzia, ochrona innego producenta).
-    # Uwaga przy edycji: ten kod jest wykonywany na serwerach – nie używaj słów, które PowerShell 5.1 uznaje za podejrzane
-    # (zdarzenie 4104 i alerty SIEM), np. odwołań przez refleksję, dynamicznych nazw właściwości (test: t_suspicious_kw.ps1).
-    $suspicious = @(S 'Suspicious' 'Podejrzane' {
-        $sus = New-Object System.Collections.Generic.List[object]
-        function Add-Sus($type, $name, $detail, $level, [int]$Max = 400) { $sus.Add([pscustomobject]@{ Type = $type; Name = "$name"; Detail = (Short (Hide-Secret "$detail") $Max); Level = $level }) }
-        $sys32 = Join-Path $env:SystemRoot 'System32'
-        $wow64 = Join-Path $env:SystemRoot 'SysWOW64'
-        $userDirs = '(?i)\\(Users\\Public|AppData|Temp|ProgramData\\[^\\]+\.(exe|dll)|\$Recycle\.Bin|PerfLogs)\\?'
-        $canSig = $PSVersionTable.PSVersion.Major -ge 5   # PS 4.0 nie sprawdza podpisów katalogowych – plik systemowy wyglądałby na niepodpisany
-        function Resolve-ModulePath([string]$n) {
-            $p = [Environment]::ExpandEnvironmentVariables("$n".Trim().Trim('"'))
-            if (-not $p) { return '' }
-            if (-not [IO.Path]::IsPathRooted($p)) {
-                $c = Join-Path $sys32 $p
-                if (-not (Test-Path -LiteralPath $c) -and -not $c.EndsWith('.dll', [StringComparison]::OrdinalIgnoreCase)) { $c += '.dll' }
-                $p = $c
-            }
-            $p
-        }
-        function Get-SignInfo([string]$path) {
-            # @{ Exists; InSystem; Signer ('' gdy brak podpisu albo nie sprawdzano); Valid }
-            $r = @{ Exists = $false; InSystem = $false; Signer = ''; Valid = $null }
-            if (-not $path) { return $r }
-            $r.Exists = Test-Path -LiteralPath $path
-            $r.InSystem = $path.StartsWith($sys32 + '\', [StringComparison]::OrdinalIgnoreCase) -or $path.StartsWith($wow64 + '\', [StringComparison]::OrdinalIgnoreCase)
-            if ($r.Exists -and $canSig) {
-                try {
-                    $sg = Get-AuthenticodeSignature -FilePath $path -ErrorAction Stop
-                    $r.Valid = ("$($sg.Status)" -eq 'Valid')
-                    if ($sg.SignerCertificate) { $r.Signer = (("$($sg.SignerCertificate.Subject)" -split ',')[0] -replace '^CN=', '') }
-                } catch { }
-            }
-            $r
-        }
-        function Get-ModuleLevel($si, [string]$path) {
-            # DLL ładowany przez system: spoza System32 albo niepodpisany = podejrzany; w katalogach użytkownika/tymczasowych = krytyczny
-            if (-not $si.Exists) { return 'Info' }
-            if ($path -match $userDirs) { return 'Krytyczne' }
-            if ($si.Valid -eq $false) { return 'Krytyczne' }
-            if (-not $si.InSystem) { return 'Uwaga' }
-            if ($si.Valid -and $si.Signer -notmatch 'Microsoft') { return 'Uwaga' }
-            ''
-        }
-
-        # 1) Przekierowanie uruchamiania (IFEO Debugger, SilentProcessExit) – m.in. backdoor „sticky keys” na ekranie logowania
-        $acc = 'sethc.exe', 'utilman.exe', 'osk.exe', 'magnify.exe', 'narrator.exe', 'displayswitch.exe', 'atbroker.exe'
-        foreach ($root in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options') {
-            foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-                $exe = "$($k.PSChildName)".ToLowerInvariant()
-                $dbg = "$($k.GetValue('Debugger'))".Trim()
-                if ($dbg) {
-                    $lvl = if ($acc -contains $exe) { 'Krytyczne' } elseif ($exe -eq 'taskmgr.exe' -and $dbg -match '(?i)procexp') { 'Info' } else { 'Uwaga' }
-                    Add-Sus 'Przekierowanie uruchamiania (IFEO Debugger)' $k.PSChildName $dbg $lvl
-                }
-                $gf = $k.GetValue('GlobalFlag')
-                if ($null -ne $gf) { try { if (([int64]"$gf") -band 0x200) { Add-Sus 'Monitorowanie zakończenia procesu (IFEO GlobalFlag 0x200)' $k.PSChildName "GlobalFlag=$gf" 'Info' } } catch { } }
-            }
-        }
-        foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit' -ErrorAction SilentlyContinue)) {
-            $mon = "$($k.GetValue('MonitorProcess'))".Trim()
-            if ($mon) { Add-Sus 'Uruchamianie po zakończeniu procesu (SilentProcessExit)' $k.PSChildName $mon $(if ($acc -contains "$($k.PSChildName)".ToLowerInvariant()) { 'Krytyczne' } else { 'Uwaga' }) }
-        }
-        foreach ($b in $acc) {
-            $f = Join-Path $sys32 $b
-            if (-not (Test-Path -LiteralPath $f)) { continue }
-            $o = ''; try { $o = "$((Get-Item -LiteralPath $f).VersionInfo.OriginalFilename)" } catch { }
-            if ($o -match '(?i)^(cmd|powershell|pwsh|conhost|explorer|taskmgr)\.') { Add-Sus 'Podmienione narzędzie ułatwień dostępu' $b "plik jest kopią $o (dostęp do konsoli z ekranu logowania bez hasła)" 'Krytyczne' }
-        }
-
-        # 2) Pakiety LSA ładowane do procesu lsass (podsłuch haseł: własne SSP, filtry haseł)
-        $lsaKey = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -ErrorAction SilentlyContinue
-        $okPkg = @{
-            'Security Packages'       = @('kerberos', 'msv1_0', 'schannel', 'wdigest', 'tspkg', 'pku2u', 'cloudap', 'negoexts', 'livessp', 'credssp', 'negotiate')
-            'Authentication Packages' = @('msv1_0')
-            'Notification Packages'   = @('scecli', 'rassfm')
-        }
-        $lsaKeys = @($lsaKey) + @(Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig' -ErrorAction SilentlyContinue) | Where-Object { $_ }
-        $seenPkg = @{}
-        foreach ($lk in $lsaKeys) {
-            foreach ($vn in $okPkg.Keys) {
-                foreach ($v in @($lk.GetValue($vn))) {
-                    $n = ("$v".Trim().Trim('"') -replace '\.dll$', '').ToLowerInvariant()
-                    if (-not $n -or $okPkg[$vn] -contains $n -or $seenPkg.ContainsKey("$vn|$n")) { continue }
-                    $seenPkg["$vn|$n"] = 1
-                    $path = Resolve-ModulePath $n
-                    $si = Get-SignInfo $path
-                    $lvl = if (-not $si.Exists) { 'Uwaga' } elseif ($si.Valid -eq $false) { 'Krytyczne' } elseif ($si.Signer -match 'Microsoft') { 'Info' } else { 'Uwaga' }
-                    Add-Sus "Pakiet LSA ($vn)" $n "$path$(if (-not $si.Exists) { ' – plik nie istnieje' } elseif ($si.Signer) { " – podpis: $($si.Signer)" } elseif ($si.Valid -eq $false) { ' – brak ważnego podpisu' })" $lvl
-                }
-            }
-        }
-
-        # 3) AppInit_DLLs – DLL wstrzykiwany do każdego procesu z user32
-        foreach ($wk in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
-            $w = Get-Item -LiteralPath $wk -ErrorAction SilentlyContinue
-            if (-not $w) { continue }
-            $dl = "$($w.GetValue('AppInit_DLLs'))".Trim()
-            if (-not $dl) { continue }
-            $load = "$($w.GetValue('LoadAppInit_DLLs'))"; $req = "$($w.GetValue('RequireSignedAppInit_DLLs'))"
-            $lvl = if ($load -ne '1') { 'Info' } elseif ($req -ne '1') { 'Krytyczne' } else { 'Uwaga' }
-            Add-Sus 'AppInit_DLLs (DLL ładowany do każdego procesu)' $dl "LoadAppInit_DLLs=$load; RequireSignedAppInit_DLLs=$req ($wk)" $lvl
-        }
-
-        # 4) Punkty rozszerzeń ładujące DLL: pomocnicy netsh, monitory wydruku, dostawcy czasu – oceniane po lokalizacji i podpisie
-        $nk = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\NetSh' -ErrorAction SilentlyContinue
-        $mods = New-Object System.Collections.Generic.List[object]
-        if ($nk) { foreach ($vn in @($nk.GetValueNames())) { if ($vn) { $mods.Add(@{ T = 'Pomocnik netsh'; N = $vn; D = "$($nk.GetValue($vn))" }) } } }
-        foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Monitors' -ErrorAction SilentlyContinue)) { $d = "$($k.GetValue('Driver'))"; if ($d) { $mods.Add(@{ T = 'Monitor wydruku'; N = $k.PSChildName; D = $d }) } }
-        foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders' -ErrorAction SilentlyContinue)) { $d = "$($k.GetValue('DllName'))"; if ($d) { $mods.Add(@{ T = 'Dostawca czasu'; N = $k.PSChildName; D = $d }) } }
-        foreach ($x in $mods) {
-            $path = Resolve-ModulePath $x.D
-            $si = Get-SignInfo $path
-            $lvl = Get-ModuleLevel $si $path
-            if ($lvl) { Add-Sus $x.T $x.N "$path$(if (-not $si.Exists) { ' – plik nie istnieje' } elseif ($si.Valid -eq $false) { ' – brak ważnego podpisu' } elseif ($si.Signer) { " – podpis: $($si.Signer)" })" $lvl }
-        }
-
-        # 5) Rzadkie wpisy Winlogon (Userinit/Shell są w sekcji Autostart)
-        $wl = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue
-        if ($wl) {
-            foreach ($vn in 'Taskman', 'AppSetup') { $v = "$($wl.GetValue($vn))".Trim(); if ($v) { Add-Sus "Winlogon – $vn" $vn $v 'Uwaga' } }
-            $gina = "$($wl.GetValue('GinaDLL'))".Trim(); if ($gina) { Add-Sus 'Winlogon – GinaDLL (nieużywany od Windows Vista)' 'GinaDLL' $gina 'Krytyczne' }
-            foreach ($k in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify' -ErrorAction SilentlyContinue)) {
-                $d = "$($k.GetValue('DLLName'))"; if ($d) { Add-Sus 'Winlogon – Notify (nieużywany od Windows Vista)' $k.PSChildName $d 'Uwaga' }
-            }
-        }
-
-        # 6) Ukryte konta lokalne (nazwa z „$” – nie widać ich w „net user”); na kontrolerze domeny nie ma kont lokalnych
-        if (-not $sys.IsDC) {
-            $admNames = @($admins | Where-Object { $_.Group -and $_.Member } | ForEach-Object { ("$($_.Member)" -split '\\')[-1] })
-            foreach ($u in @(Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction SilentlyContinue)) {
-                if ("$($u.Name)".EndsWith('$')) {
-                    Add-Sus 'Ukryte konto lokalne (nazwa kończy się na $)' $u.Name "włączone: $(if ($u.Disabled) { 'nie' } else { 'tak' }); SID $($u.SID)$(if ($admNames -contains $u.Name) { '; w grupie uprzywilejowanej' })" $(if ($admNames -contains $u.Name -and -not $u.Disabled) { 'Krytyczne' } else { 'Uwaga' })
-                }
-            }
-        }
-
-        # 7) Narzędzia zdalnego dostępu i narzędzia ofensywne (usługi, procesy, wybrane foldery)
-        $allSvc = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue)
-        $procs  = @($procNames.Values | Sort-Object -Unique)
-        $rat = @(
-            @{ N = 'AnyDesk'; R = '^anydesk' }, @{ N = 'TeamViewer'; R = '^teamviewer' }, @{ N = 'ScreenConnect / ConnectWise Control'; R = '^screenconnect' }
-            @{ N = 'RustDesk'; R = '^rustdesk' }, @{ N = 'Splashtop'; R = '^(splashtop|srservice|srmanager)' }, @{ N = 'Atera'; R = '^atera' }
-            @{ N = 'NinjaOne'; R = '^ninjarmm' }, @{ N = 'Kaseya'; R = '^(kaseya|agentmon)' }, @{ N = 'LogMeIn'; R = '^(logmein|lmiguardian|lmi_)' }
-            @{ N = 'GoTo / GoToAssist'; R = '^(gotoassist|g2a)' }, @{ N = 'Chrome Remote Desktop'; R = '^(chromoting|remoting_host)' }, @{ N = 'ngrok'; R = '^ngrok' }
-            @{ N = 'Tailscale'; R = '^tailscale' }, @{ N = 'ZeroTier'; R = '^zerotier' }, @{ N = 'Radmin'; R = '^(rserver3|radmin)' }
-            @{ N = 'VNC'; R = '^(tvnserver|uvnc_service|winvnc|vncserver)' }, @{ N = 'MeshCentral'; R = '^(mesh ?agent|meshagent)' }, @{ N = 'SimpleHelp'; R = '^(simplehelp|simple-help)' }
-            @{ N = 'Action1'; R = '^action1' }, @{ N = 'Level'; R = '^level-?(remote|agent)' }, @{ N = 'Supremo'; R = '^supremo' }, @{ N = 'DWService'; R = '^dwagent' }
-        )
-        foreach ($t in $rat) {
-            $sv = @($allSvc | Where-Object { "$($_.Name)" -match $t.R -or "$($_.DisplayName)" -match $t.R })
-            $pr = @($procs | Where-Object { "$_" -match $t.R })
-            if ($sv.Count -or $pr.Count) {
-                Add-Sus 'Narzędzie zdalnego dostępu' $t.N ((@($sv | ForEach-Object { "usługa $($_.Name) ($($_.State))" }) + @($pr | ForEach-Object { "proces $_" })) -join '; ') 'Uwaga'
-            }
-        }
-        $offRx = '^(mimikatz|mimilib|rubeus|seatbelt|sharphound|bloodhound|lazagne|nanodump|pwdump|gsecdump|secretsdump|wce|winpeas|kerbrute|certify|whisker|sharpup|sharpview|powerview|adfind|procdump(64)?|psexec(64)?|paexec|rclone|megasync|megacmd|nc|nc64|ncat|socat|plink|chisel|ligolo|frpc|frps|ngrok|netscan|advanced_ip_scanner|nmap|masscan)$'
-        $hardTools = '^(mimikatz|mimilib|rubeus|lazagne|nanodump|pwdump|gsecdump|secretsdump|wce|kerbrute|certify|whisker)$'
-        foreach ($p in $procs) { if ("$p" -match $offRx) { Add-Sus 'Uruchomione narzędzie ofensywne / podwójnego zastosowania' $p 'proces działa w chwili skanu' $(if ("$p" -match $hardTools) { 'Krytyczne' } else { 'Uwaga' }) } }
-        foreach ($s in @($allSvc | Where-Object { "$($_.Name)" -match '^(PSEXESVC|PAExec.*|csexecsvc|RemComSvc|BTOBTO)$' })) {
-            Add-Sus 'Usługa zdalnego wykonywania poleceń (PsExec i podobne)' $s.Name "$($s.State); $($s.PathName)" 'Uwaga'
-        }
-        $dumpDirs = @((Join-Path $env:SystemRoot 'Temp'), 'C:\Users\Public', 'C:\PerfLogs', $env:ProgramData, 'C:\', $env:TEMP) | Where-Object { $_ } | Select-Object -Unique
-        foreach ($dd in $dumpDirs) {
-            foreach ($f in @(Get-ChildItem -LiteralPath $dd -File -Force -ErrorAction SilentlyContinue | Select-Object -First 3000)) {
-                $bn = [IO.Path]::GetFileNameWithoutExtension($f.Name).ToLowerInvariant()
-                if ($f.Extension -eq '.dmp' -and $bn -match 'lsass') { Add-Sus 'Zrzut pamięci procesu lsass (hasła i bilety Kerberos)' $f.FullName "$([math]::Round($f.Length / 1MB)) MB, $(D $f.LastWriteTime)" 'Krytyczne' }
-                elseif ($f.Extension -eq '.dmp' -and $f.Length -gt 20MB) { Add-Sus 'Duży zrzut pamięci w katalogu ogólnym' $f.FullName "$([math]::Round($f.Length / 1MB)) MB, $(D $f.LastWriteTime)" 'Uwaga' }
-                elseif ($f.Extension -match '^\.(exe|ps1|dll)$' -and $bn -match $offRx) { Add-Sus 'Plik narzędzia ofensywnego / podwójnego zastosowania' $f.FullName "$([math]::Round($f.Length / 1KB)) KB, $(D $f.LastWriteTime)" $(if ($bn -match $hardTools) { 'Krytyczne' } else { 'Uwaga' }) }
-            }
-        }
-
-        # 8) Microsoft Defender: wykrycia, wyłączenie ochrony, dodane wykluczenia (pola zdarzeń – niezależne od języka)
-        $dEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1006, 1007, 1015, 1116, 1117, 5001, 5007, 5010, 5012; StartTime = $since } -MaxEvents 500 -ErrorAction SilentlyContinue)
-        $det = @{}; $off = @{}
-        foreach ($e in $dEv) {
-            $d = EvData $e
-            if ($e.Id -in 1006, 1007, 1015, 1116, 1117) {
-                $tn = "$($d['Threat Name'])"; if (-not $tn) { $tn = "zdarzenie $($e.Id)" }
-                if (-not $det.ContainsKey($tn)) { $det[$tn] = @{ N = 0; Last = $e.TimeCreated; Sev = "$($d['Severity Name'])"; Path = "$($d['Path'])"; Act = ''; Ids = @() } }
-                $x = $det[$tn]; $x.N++; $x.Ids += $e.Id
-                if ($e.Id -in 1007, 1117) { $x.Act = "$($d['Action Name'])" }
-            }
-            elseif ($e.Id -eq 5007) {
-                $nv = "$($d['New Value'])"
-                $byPol = $nv -match '(?i)\\Policies\\'   # zmiana z zasad grupy / Intune – zamierzona konfiguracja
-                if ($nv -match '(?i)\\Exclusions\\(Paths|Processes|Extensions|IpAddresses)\\(.+?)( = |$)') { Add-Sus 'Defender: dodano wykluczenie' $Matches[2] "$(D $e.TimeCreated) – $($Matches[1])$(if ($byPol) { ' (zasady grupy)' })" $(if ($byPol) { 'Info' } else { 'Uwaga' }) }
-                elseif ($nv -match '(?i)\\(DisableRealtimeMonitoring|DisableAntiSpyware|DisableAntiVirus|DisableBehaviorMonitoring|DisableIOAVProtection|DisableOnAccessProtection|DisableScriptScanning|ForceDefenderPassiveMode) = 0x1\b|\\(TamperProtection) = 0x[04]\b') {
-                    $what = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
-                    # TamperProtection 0x0/0x4 zapisuje też instalacja platformy – liczy się tylko zmiana z włączonej (0x1/0x5)
-                    if ($what -eq 'TamperProtection' -and "$($d['Old Value'])" -notmatch '(?i)\\TamperProtection = 0x[15]\b') { continue }
-                    Add-Sus 'Defender: wyłączono ochronę w konfiguracji' $what "$(D $e.TimeCreated)$(if ($byPol) { ' (zasady grupy)' })" $(if ($byPol) { 'Info' } else { 'Uwaga' })
-                }
-            }
-            else { if (-not $off.ContainsKey($e.Id)) { $off[$e.Id] = @{ N = 0; Last = $e.TimeCreated } }; $off[$e.Id].N++ }
-        }
-        foreach ($id in $off.Keys) { Add-Sus 'Defender: ochrona lub skanowanie wyłączone' "zdarzenie $id" "$($off[$id].N)×, ostatnio $(D $off[$id].Last)" 'Uwaga' }
-        foreach ($tn in $det.Keys) {
-            $x = $det[$tn]
-            $lvl = if ($x.Sev -match '(?i)severe|high') { 'Krytyczne' } elseif ($x.Sev -match '(?i)low') { 'Info' } else { 'Uwaga' }
-            Add-Sus 'Defender: wykryte zagrożenie' $tn "$($x.N)×, ostatnio $(D $x.Last), waga: $($x.Sev)$(if ($x.Act) { ", działanie: $($x.Act)" })$(if ($x.Path) { ", $($x.Path)" })" $lvl
-        }
-
-        # 9) PowerShell sam oznacza skrypty z podejrzaną treścią (4104, poziom Ostrzeżenie) – także bez włączonego logowania skryptów
-        $psEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-PowerShell/Operational'; Id = 4104; Level = 3; StartTime = $since } -MaxEvents 1000 -ErrorAction SilentlyContinue)
-        $blocks = @{}
-        foreach ($e in $psEv) {
-            $d = EvData $e
-            $id = "$($d['ScriptBlockId'])"; $txt = "$($d['ScriptBlockText'])"
-            if (-not $blocks.ContainsKey($id)) { $blocks[$id] = @{ T = $e.TimeCreated; Text = ''; Own = $false; Path = "$($d['Path'])" } }
-            if ($txt -match 'param\(\[int\]\$Days, \[string\[\]\]\$Folders') { $blocks[$id].Own = $true }   # kolektor tego programu (starsze wersje)
-            if (-not $blocks[$id].Text -or "$($d['MessageNumber'])" -eq '1') { $blocks[$id].Text = $txt }   # długi skrypt = kilka zdarzeń; część 1 to jego początek
-        }
-        $own = @($blocks.Values | Where-Object { $_.Own }).Count
-        $foreign = @($blocks.Values | Where-Object { -not $_.Own } | Group-Object { $_.Text } | ForEach-Object { @($_.Group | Sort-Object { $_.T } -Descending)[0] } | Sort-Object { $_.T } -Descending)
-        # Wbudowana lista słów PowerShella łapie też zwykłe narzędzia administracyjne – tu tylko informacja; stacja podnosi poziom,
-        # gdy treść skryptu pasuje do wzorców ataku (pobieranie i wykonywanie kodu, zaciemnianie, obejście AMSI)
-        foreach ($f0 in @($foreign | Select-Object -First 25)) { Add-Sus 'PowerShell: skrypt oznaczony jako podejrzany (4104)' "$(D $f0.T)$(if ($f0.Path) { " $($f0.Path)" })" $f0.Text 'Info' 1500 }
-        if ($foreign.Count -gt 25) { Add-Sus 'PowerShell: skrypty oznaczone jako podejrzane (4104)' "$($foreign.Count) różnych skryptów" 'pokazano 25 najnowszych' 'Info' }
-        if ($own) { Add-Sus 'PowerShell: oznaczone skrypty poprzedniej wersji ServerReview' "$own" 'starsza wersja kolektora wywoływała ostrzeżenia 4104 – ta wersja już nie' 'Info' }
-
-        # 10) Udane logowania RDP z adresów publicznych (nieudane są w sekcji zdarzeń bezpieczeństwa)
-        $ms = [int64]($now - $since).TotalMilliseconds
-        $xp = "*[System[(EventID=4624) and TimeCreated[timediff(@SystemTime) <= $ms]]] and *[EventData[Data[@Name='LogonType']='10']]"
-        $rdp = @(Get-WinEvent -LogName Security -FilterXPath $xp -MaxEvents 2000 -ErrorAction SilentlyContinue)
-        $pub = @{}
-        foreach ($e in $rdp) {
-            $d = EvData $e
-            $ip = ("$($d['IpAddress'])" -replace '^::ffff:', '').Trim()
-            if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or $ip -match '^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)') { continue }
-            $k = "$($d['TargetDomainName'])\$($d['TargetUserName']) z $ip"
-            if (-not $pub.ContainsKey($k)) { $pub[$k] = @{ N = 0; Last = $e.TimeCreated } }
-            $pub[$k].N++
-        }
-        foreach ($k in $pub.Keys) { Add-Sus 'Udane logowanie RDP z adresu publicznego' $k "$($pub[$k].N)×, ostatnio $(D $pub[$k].Last)" 'Krytyczne' }
-
-        # 11) Serwer plików bez kopii w tle (ochrona przed skutkami ransomware) – tylko informacja
-        if (@($shares | Where-Object { $_ -and "$($_.Name)" -notmatch '^(SYSVOL|NETLOGON|CertEnroll|REMINST|WsusContent|UpdateServicesPackages|WSUSTemp)$' -and -not "$($_.Name)".EndsWith('$') }).Count) {
-            $sc = @(Get-CimInstance Win32_ShadowCopy -ErrorAction SilentlyContinue).Count
-            $vss = $allSvc | Where-Object { $_.Name -eq 'VSS' } | Select-Object -First 1
-            if (-not $sc) { Add-Sus 'Brak kopii w tle na serwerze z udziałami' 'Kopie w tle' "usługa VSS: $($vss.StartMode)$(if ($vss -and $vss.StartMode -eq 'Disabled') { ' – wyłączona' })" 'Info' }
-        }
-
-        # 12) ServiceDll usług uruchamianych w svchost: ścieżka usługi pokazuje tylko svchost.exe, a właściwy kod (SYSTEM) jest w DLL
-        try {
-            $svcRoot = Get-Item -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services' -ErrorAction Stop
-            foreach ($n in $svcRoot.GetSubKeyNames()) {
-                $k = $svcRoot.OpenSubKey($n); if (-not $k) { continue }
-                $dll = $null
-                try {
-                    $pk = $k.OpenSubKey('Parameters'); if ($pk) { $dll = $pk.GetValue('ServiceDll'); $pk.Close() }
-                    if (-not $dll) { $dll = $k.GetValue('ServiceDll') }
-                } finally { $k.Close() }
-                if (-not $dll) { continue }
-                $p = [Environment]::ExpandEnvironmentVariables("$dll".Trim().Trim('"')) -replace '^\\\?\?\\', ''
-                if ($p.StartsWith($sys32 + '\', [StringComparison]::OrdinalIgnoreCase) -or $p.StartsWith($wow64 + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
-                $si = Get-SignInfo $p
-                $lvl = Get-ModuleLevel $si $p; if (-not $lvl) { $lvl = 'Uwaga' }
-                Add-Sus 'Biblioteka usługi (ServiceDll) poza katalogiem systemowym' $n "$p$(if (-not $si.Exists) { ' – plik nie istnieje' } elseif ($si.Signer) { " – podpis: $($si.Signer)" } elseif ($si.Valid -eq $false) { ' – brak ważnego podpisu' })" $lvl
-            }
-        } catch { }
-
-        # 13) Ukryte zadania harmonogramu: wpis w TaskCache\Tree bez deskryptora zabezpieczeń (SD) działa, ale nie widać go
-        #     w schtasks ani w konsoli (technika „Tarrask”)
-        try {
-            $treeRoot = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree' -ErrorAction Stop
-            $stack = New-Object 'System.Collections.Generic.Stack[object]'
-            $stack.Push(@{ K = $treeRoot; P = ''; Own = $false })
-            $hidden = New-Object System.Collections.Generic.List[string]; $nk = 0
-            while ($stack.Count -and $nk -lt 5000) {
-                $it = $stack.Pop(); $nk++
-                try {
-                    foreach ($sn in $it.K.GetSubKeyNames()) {
-                        $sk = $it.K.OpenSubKey($sn); if (-not $sk) { continue }
-                        $tp = "$($it.P)\$sn"
-                        if ($null -ne $sk.GetValue('Id')) { if ($null -eq $sk.GetValue('SD')) { $hidden.Add($tp) }; $sk.Close() }
-                        else { $stack.Push(@{ K = $sk; P = $tp; Own = $true }) }
-                    }
-                } finally { if ($it.Own) { $it.K.Close() } }
-            }
-            foreach ($h in $hidden) { Add-Sus 'Ukryte zadanie harmonogramu (brak deskryptora SD)' $h 'zadanie działa, ale nie widać go w schtasks ani w konsoli – sposób ukrywania trwałości' 'Krytyczne' }
-        } catch { }
-
-        # 14) Plik hosts: domeny aktualizacji i producentów ochrony skierowane gdzie indziej (blokada aktualizacji, odcięcie agenta)
-        try {
-            $hf = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-            $hLines = @(); if (Test-Path -LiteralPath $hf) { $hLines = @([IO.File]::ReadAllLines($hf)) }
-            $avDom = '(?i)(windowsupdate|update\.microsoft|download\.microsoft|delivery\.mp\.microsoft|wdcp\.microsoft|wdcpalt|smartscreen|definitionupdates|securitycenter\.windows|endpoint\.security\.microsoft|sophos|\.eset\.|eset\.com|kaspersky|bitdefender|gravityzone|mcafee|trellix|symantec|broadcom|crowdstrike|sentinelone|trendmicro|avast|avg\.com|fortinet|forticlient|malwarebytes|webroot|cylance|paloaltonetworks|withsecure|f-secure)'
-            $ent = 0; $sink = New-Object System.Collections.Generic.List[string]; $redir = New-Object System.Collections.Generic.List[string]
-            foreach ($l in $hLines) {
-                $t = ($l -replace '#.*$', '').Trim(); if (-not $t) { continue }
-                $parts = @($t -split '\s+'); if ($parts.Count -lt 2) { continue }
-                $ent++
-                $ip = $parts[0]
-                foreach ($hn in $parts[1..($parts.Count - 1)]) {
-                    if ($hn -notmatch $avDom) { continue }
-                    if ($ip -match '^(0\.0\.0\.0|127\.|::1?$|::$)') { $sink.Add("$hn → $ip") } else { $redir.Add("$hn → $ip") }
-                }
-            }
-            if ($sink.Count) { Add-Sus 'Plik hosts: zablokowane domeny aktualizacji lub ochrony' (@($sink | Select-Object -First 5) -join ', ') "$($sink.Count) wpisów kieruje na adres lokalny – serwer nie pobierze aktualizacji albo agent ochrony nie połączy się z konsolą" 'Krytyczne' }
-            if ($redir.Count) { Add-Sus 'Plik hosts: przekierowane domeny aktualizacji lub ochrony' (@($redir | Select-Object -First 5) -join ', ') 'sprawdź, czy przekierowanie jest zamierzone (np. lokalny serwer pośredniczący)' 'Uwaga' }
-            if (-not ($sink.Count -or $redir.Count) -and $ent -gt 20) { Add-Sus 'Plik hosts: dużo wpisów' "$ent" 'wpisy w hosts omijają DNS – sprawdź, czy są potrzebne' 'Info' }
-        } catch { }
-
-        # 15) Zaufane główne urzędy certyfikacji: certyfikat narzędzia przechwytującego TLS albo z kluczem prywatnym (poza serwerem CA)
-        try {
-            $isCa = [bool](Get-Service CertSvc -ErrorAction SilentlyContinue)
-            foreach ($c in @(Get-ChildItem -LiteralPath 'Cert:\LocalMachine\Root' -ErrorAction Stop)) {
-                $sub = "$($c.Subject)"
-                if ($sub -match '(?i)fiddler|do_not_trust|burp|portswigger|mitmproxy|charles proxy|proxyman|http toolkit') { Add-Sus 'Zaufany certyfikat narzędzia przechwytującego ruch TLS' $sub "odcisk $($c.Thumbprint), ważny od $(D $c.NotBefore)" 'Krytyczne' }
-                elseif ($c.HasPrivateKey -and -not $isCa) { Add-Sus 'Zaufany główny certyfikat z kluczem prywatnym' $sub "odcisk $($c.Thumbprint) – kto ma ten klucz, wystawi certyfikat zaufany przez ten serwer" 'Uwaga' }
-            }
-        } catch { }
-
-        # 16) Wtyczka serwera DNS (ServerLevelPluginDll): DLL ładowany do dns.exe jako SYSTEM – znana droga od DnsAdmins do kontrolera domeny
-        $dnsPlug = "$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\DNS\Parameters' 'ServerLevelPluginDll')".Trim()
-        if ($dnsPlug) {
-            $p = Resolve-ModulePath $dnsPlug; $si = Get-SignInfo $p
-            $lvl = Get-ModuleLevel $si $p; if (-not $lvl -or $lvl -eq 'Info') { $lvl = 'Uwaga' }
-            Add-Sus 'Wtyczka serwera DNS (ServerLevelPluginDll)' $p "$(if (-not $si.Exists) { 'plik nie istnieje' } elseif ($si.Signer) { "podpis: $($si.Signer)" } else { 'bez podpisu' }) – DLL ładowany przez usługę DNS z uprawnieniami SYSTEM" $lvl
-        }
-        [object[]]$sus.ToArray()
-    })
-
     # ── Sesje użytkowników ──
     $sessions = @(S 'Sessions' 'Sesje' {
         $out = & { $ErrorActionPreference = 'SilentlyContinue'; quser.exe 2>$null }
@@ -2161,7 +1834,6 @@ $Collector = {
         ADSecurity     = $adSec
         Exposure       = $exposure
         Persistence    = $persistence
-        Suspicious     = $suspicious
         VMStorage      = $vmStorage
         Downtime       = $downtime
         Cluster        = [object[]]@($clusterRows)
@@ -2803,7 +2475,6 @@ $script:Sections = @(
     @{ Key = 'Shares';         Header = 'Udziały' }
     @{ Key = 'Autostart';      Header = 'Autostart' }
     @{ Key = 'Persistence';    Header = 'Trwałość (WMI, wykluczenia AV)' }
-    @{ Key = 'Suspicious';     Header = 'Podejrzane (wskaźniki naruszenia)' }
     @{ Key = 'Certificates';   Header = 'Certyfikaty' }
     @{ Key = 'Folders';        Header = 'Foldery' }
     @{ Key = 'DomainController'; Header = 'Kontroler domeny' }
@@ -3216,11 +2887,10 @@ $script:SettingDefs = @(
     @{ Group = 'Listy'; Key = 'IgnoredStoppedServices'; Type = 'list';    Label = 'Usługi automatyczne, których zatrzymanie jest OK (jedna na linię, wildcardy *)' }
     @{ Group = 'Listy'; Key = 'ExposedPorts';           Type = 'intlist'; Label = 'Porty wrażliwe dla sekcji Ekspozycja (jeden na linię)' }
     @{ Group = 'Listy'; Key = 'IgnoredWmiConsumers';    Type = 'list';    Label = 'Subskrypcje WMI traktowane jako systemowe (jedna na linię)' }
-    @{ Group = 'Listy'; Key = 'ApprovedRemoteTools';    Type = 'list';    Label = 'Zatwierdzone narzędzia zdalnego dostępu – tylko informacja, nie ostrzeżenie (jedno na linię, np. TeamViewer, Atera; wildcardy *)' }
 )
 $script:SectionGroups = [ordered]@{
     'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
-    'Bezpieczeństwo'       = @('Hardening', 'Suspicious', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
+    'Bezpieczeństwo'       = @('Hardening', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
     'Role serwera'         = @('DomainController', 'ADSecurity', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
 }
@@ -3752,45 +3422,6 @@ function Invoke-ServerAnalysis {
     $rest = @($exc | Where-Object { "$($_.Flag)" -ne 'warn' })
     if ($rest.Count) { AddI 'Info' 'Bezpieczeństwo' ("Wykluczenia Defendera ($($rest.Count)): " + (Join-Short ($rest | ForEach-Object { $_.Name }) 4)) 'Persistence'; foreach ($r in $rest) { SetFlag $r 'info' } }
 
-    # Podejrzane linie poleceń w usługach, zadaniach, autostarcie, konsumentach WMI i instalacjach usług (7045/4697)
-    foreach ($src in @(
-        @{ Rows = @($D.Services); Field = 'Path'; Sec = 'Services'; What = 'Usługa'; NameF = 'Name'; Svc = $true }
-        @{ Rows = @($D.Tasks); Field = 'Action'; Sec = 'Tasks'; What = 'Zadanie'; NameF = 'Path'; Svc = $false }
-        @{ Rows = @($D.Autostart); Field = 'Command'; Sec = 'Autostart'; What = 'Autostart'; NameF = 'Name'; Svc = $false }
-        @{ Rows = @($D.Persistence | Where-Object { "$($_.Type)" -like 'WMI – konsument*' }); Field = 'Detail'; Sec = 'Persistence'; What = 'Subskrypcja WMI'; NameF = 'Name'; Svc = $false }
-        @{ Rows = @($D.SecurityEvents | Where-Object { $_ -and [int]$_.Id -in 7045, 4697 }); Field = 'Detail'; Sec = 'SecurityEvents'; What = 'Instalacja usługi'; NameF = 'Time'; Svc = $true }
-    )) {
-        foreach ($r in $src.Rows) {
-            if (-not $r) { continue }
-            $hit = Get-SuspiciousCommand "$($r.($src.Field))" $src.Svc
-            if (-not $hit) { continue }
-            if ($hit.Sev -eq 'Info') { SetFlag $r 'info'; continue }   # tylko oznaczenie wiersza (np. ukryte okno PowerShella w zadaniu)
-            AddI $hit.Sev 'Podejrzane' "$($src.What) $($r.($src.NameF)): $($hit.Text) – $(Get-ShortText "$($r.($src.Field))" 160)" $src.Sec
-            SetFlag $r $(if ($hit.Sev -eq 'Krytyczny') { 'crit' } else { 'warn' })
-        }
-    }
-
-    # Wskaźniki naruszenia zebrane na serwerze (sekcja Podejrzane); zatwierdzone narzędzia zdalnego dostępu – tylko informacja
-    $approved = @($C.ApprovedRemoteTools | Where-Object { $_ })
-    foreach ($r in @($D.PSObject.Properties['Suspicious'].Value | Where-Object { $_ })) {
-        $lvl = "$($r.Level)"
-        if ("$($r.Type)" -eq 'Narzędzie zdalnego dostępu' -and @($approved | Where-Object { "$($r.Name)" -like $_ -or "$($r.Detail)" -like "*$_*" }).Count) { $lvl = 'Info' }
-        # Defender w trybie pasywnym albo EDR (migawki z wersji z sekcją Ochrona: wykryty antywirus innego producenta) – ochronę
-        # przejął inny produkt, więc wyłączenia Defendera to nie sabotaż. Wyłączony Defender bez innego antywirusa („Not running”) zostaje ostrzeżeniem.
-        if (("$($r.Type)" -like 'Defender: ochrona lub skanowanie wyłączone*' -or "$($r.Type)" -like 'Defender: wyłączono ochronę w konfiguracji*') -and $D.System -and ("$($D.System.PSObject.Properties['AV'].Value)" -match '^Defender \(tryb: .*(Passive|EDR)' -or "$($D.System.PSObject.Properties['AvThirdParty'].Value)")) { $lvl = 'Info' }
-        # PowerShell oznacza jako podejrzane także zwykłe narzędzia – ostrzegamy dopiero, gdy treść pasuje do wzorców ataku
-        if ("$($r.Type)" -like 'PowerShell: skrypt oznaczony*') {
-            $hit = Get-SuspiciousCommand "$($r.Detail)" $false
-            if ($hit -and $hit.Sev -ne 'Info') { $lvl = $(if ($hit.Sev -eq 'Krytyczny') { 'Krytyczne' } else { 'Uwaga' }) }
-            elseif ("$($r.Detail)" -match $script:Ps4104AttackRx) { $lvl = 'Uwaga' }
-        }
-        $r.Level = $lvl   # ocena stacji widoczna w kolumnie Poziom, sortowaniu i eksportach
-        $sev = switch ($lvl) { 'Krytyczne' { 'Krytyczny' } 'Uwaga' { 'Ostrzeżenie' } default { 'Info' } }
-        if ($sev -eq 'Info') { SetFlag $r 'info'; continue }   # informacja – tylko oznaczenie wiersza (jak w pozostałych sekcjach)
-        AddI $sev 'Podejrzane' "$($r.Type): $($r.Name)$(if ("$($r.Detail)") { " – $(Get-ShortText $r.Detail 220)" })" 'Suspicious'
-        SetFlag $r $(if ($sev -eq 'Krytyczny') { 'crit' } else { 'warn' })
-    }
-
     # Sesje, połączenia, błędy zbierania
     # Rozłączona sesja nie ma nazwy sesji (kolumna SESSIONNAME w quser jest pusta) – niezależne od języka systemu
     $disc = @($D.Sessions | Where-Object { (-not "$($_.Session)" -and "$($_.Id)") -or $_.State -match '^(Disc|Roz)' })
@@ -3845,38 +3476,6 @@ function Invoke-ServerAnalysis {
     $D | Add-Member -NotePropertyName _Changes -NotePropertyValue ([object[]]$changes.ToArray()) -Force
 
     return , @($list | Sort-Object Rank)
-}
-# Treść skryptu PowerShell typowa dla ataków (obejście AMSI, wstrzykiwanie do pamięci, kradzież poświadczeń) – sprawdzana na stacji
-$script:Ps4104AttackRx = '(?i)amsiutils|amsiinitfailed|amsiscanbuffer|invoke-mimikatz|sekurlsa|kerberos::|lsadump|virtualalloc|writeprocessmemory|createremotethread|reflection\.assembly\]::load\(|\[system\.convert\]::frombase64string|invoke-shellcode|powersploit|\.downloadstring\(|invoke-webrequest.+\|\s*iex'
-# Podejrzane linie poleceń (LOLBins, pobieranie i wykonywanie kodu, zdalne wykonywanie) – sprawdzane na stacji, nie na serwerze.
-# Sev: dla usług i instalacji usług (Svc) / dla zadań, autostartu i WMI (Other). Ostrożnie z fałszywymi alarmami: narzędzia wdrożeń
-# (SCCM, PDQ, skrypty GPO) używają PowerShella z -EncodedCommand i ukrytym oknem – w zadaniach to ostrzeżenie, nie alarm.
-$script:SusCmdRules = @(
-    @{ Rx = '\\\\127\.0\.0\.1\\(admin|c)\$\\|%COMSPEC%\s+/[cq]\s+.*\becho\b.*[>|]'; T = 'wzorzec zdalnego wykonywania poleceń (smbexec / PsExec / impacket)'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
-    @{ Rx = '\bmshta(\.exe)?["'']?\s+["'']?(https?:|javascript:|vbscript:)'; T = 'mshta uruchamia skrypt z sieci'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
-    @{ Rx = '\brundll32(\.exe)?["'']?\s+["'']?javascript:'; T = 'rundll32 uruchamia JavaScript'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
-    @{ Rx = '\bregsvr32(\.exe)?\b.*(/i:\s*["'']?https?:|scrobj\.dll)'; T = 'regsvr32 ładuje skrypt (Squiblydoo)'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
-    @{ Rx = '\bcertutil(\.exe)?\b.*\s[-/](urlcache|decode|decodehex)\b'; T = 'certutil pobiera lub dekoduje plik'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
-    @{ Rx = '(iex|invoke-expression)\b.*(downloadstring|downloaddata|net\.webclient|invoke-webrequest|invoke-restmethod|\biwr\b|\birm\b)|(downloadstring|downloadfile)\s*\(\s*["'']https?://'; T = 'PowerShell pobiera i wykonuje kod z sieci'; Svc = 'Krytyczny'; Other = 'Krytyczny' }
-    @{ Rx = '\b(powershell|pwsh)(\.exe)?["'']?\s(.*\s)?[-/]e(c|n|nc|nco|ncod|ncode|ncoded|ncodedcommand)?\s+[A-Za-z0-9+/=]{24,}'; T = 'PowerShell z zakodowanym poleceniem (-EncodedCommand)'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
-    @{ Rx = '\bbitsadmin(\.exe)?\b.*\s/(transfer|addfile|setnotifycmdline)\b'; T = 'bitsadmin pobiera plik albo uruchamia polecenie'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
-    @{ Rx = 'frombase64string|(\[char\]\s*\d+\s*\+\s*){3}'; T = 'zaciemniony kod (Base64 albo [char])'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
-    @{ Rx = '\b(powershell|pwsh)(\.exe)?["'']?\s(.*\s)?-w(i|in|ind|indo|indow|indows|indowst|indowsty|indowstyl|indowstyle)?\s+h(idden)?\b'; T = 'PowerShell z ukrytym oknem'; Svc = 'Ostrzeżenie'; Other = 'Info' }
-    @{ Rx = '(^|[\s"''=])[a-z]:\\(users\\public|perflogs|windows\\temp|\$recycle\.bin)\\[^"'']*\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr)\b'; T = 'program w katalogu ogólnodostępnym albo tymczasowym'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
-    @{ Rx = '\\appdata\\(local|roaming)\\[^"'']*\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr)\b'; T = 'program w profilu użytkownika (AppData)'; Svc = 'Krytyczny'; Other = 'Ostrzeżenie' }
-    @{ Rx = '(^|[\s"''=])[a-z]:\\programdata\\[^\\"'' ]+\.(exe|dll|ps1|bat|cmd|vbs|js|hta|scr)\b'; T = 'program bezpośrednio w C:\ProgramData'; Svc = 'Ostrzeżenie'; Other = 'Ostrzeżenie' }
-)
-function Get-SuspiciousCommand([string]$Text, [bool]$Service) {
-    # Najpoważniejsza pasująca reguła albo $null
-    if (-not $Text) { return $null }
-    $rank = @{ 'Krytyczny' = 0; 'Ostrzeżenie' = 1; 'Info' = 2 }
-    $best = $null
-    foreach ($r in $script:SusCmdRules) {
-        if (-not [regex]::IsMatch($Text, $r.Rx, 'IgnoreCase')) { continue }
-        $sv = if ($Service) { $r.Svc } else { $r.Other }
-        if (-not $best -or $rank[$sv] -lt $rank[$best.Sev]) { $best = @{ Text = $r.T; Sev = $sv } }
-    }
-    $best
 }
 function Get-RiskyExclusion($Row) {
     # Wykluczenie Defendera obejmujące cały dysk, katalogi systemowe/tymczasowe, interpretery skryptów albo rozszerzenia plików wykonywalnych
@@ -6681,8 +6280,8 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
     # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
-    if ($Key -in 'Downtime', 'Timings', 'Suspicious', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
-    if ($Key -in 'Downtime', 'Timings', 'Suspicious', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
     $true
 }
 function Get-WorstFlag($Rows) {

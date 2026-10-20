@@ -15,7 +15,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Interfejs](#interfejs)
 - [Niedostępne serwery](#niedostępne-serwery)
 - [Hyper-V i klastry](#hyper-v-i-klastry)
-- [Bezpieczeństwo: utwardzenie, wskaźniki naruszenia](#bezpieczeństwo-utwardzenie-wskaźniki-naruszenia)
+- [Bezpieczeństwo: utwardzenie, Active Directory](#bezpieczeństwo-utwardzenie-active-directory)
 - [Wykrywane problemy](#wykrywane-problemy)
 - [Wyciszanie problemów](#wyciszanie-problemów)
 - [Porównanie z poprzednim skanem](#porównanie-z-poprzednim-skanem)
@@ -34,8 +34,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 |---|---|
 | **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, host Hyper-V, na którym działa maszyna |
 | **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
-| **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-wskaźniki-naruszenia)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
-| **Podejrzane** | wskaźniki naruszenia i ukryte mechanizmy trwałości: przekierowanie programów ułatwień dostępu („sticky keys”), pakiety LSA, AppInit_DLLs, ukryte zadania i konta, biblioteki usług poza katalogiem systemowym, narzędzia zdalnego dostępu i narzędzia ofensywne, zrzuty pamięci lsass, wykrycia i wyłączenia Defendera, podejrzane linie poleceń, plik hosts, certyfikaty narzędzi przechwytujących TLS, udane logowania RDP z internetu |
+| **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-active-directory)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
 | **Usługi, sieć i pliki** | usługi (spoza Microsoft, zatrzymane automatyczne, działające na kontach użytkowników, z niecytowaną ścieżką), zadania harmonogramu spoza `\Microsoft\` z wynikiem ostatniego uruchomienia, karty sieciowe i adresacja, porty nasłuchujące i aktywne połączenia (z procesem i usługą), sesje użytkowników, zawartość wskazanych folderów |
 | **Oprogramowanie** | zainstalowane programy, ostatnie aktualizacje (KB) |
 | **Kontroler domeny** | SYSVOL/DFSR, replikacja AD, podpisywanie LDAP i channel binding, wyjątki bezpiecznego kanału Netlogon, konta i usługi wymagające Kerberos RC4 (zdarzenia KDCSVC 201–209) |
@@ -194,7 +193,7 @@ Niedostępność jest zapamiętywana: po ponownym uruchomieniu programu serwer n
 - **Kontrolery domeny.** Ostrzeżenie, gdy wszystkie skanowane kontrolery domeny działają na jednym hoście.
 - **Duplikaty.** Ta sama maszyna dodana pod dwiema nazwami (alias DNS, adres IP, nazwa klastra) jest wykrywana.
 
-## Bezpieczeństwo: utwardzenie, wskaźniki naruszenia
+## Bezpieczeństwo: utwardzenie, Active Directory
 
 ### Utwardzenie i status „Zalecenie”
 
@@ -207,16 +206,6 @@ Brak wpisu w rejestrze program ocenia według domyślnego zachowania danej wersj
 Każdy kontroler domeny zbiera sekcję **Active Directory: bezpieczeństwo domeny**, a problemy są zgłaszane raz na domenę (z PDC, a gdy go nie skanowano, z pierwszego kontrolera) z opisem „domena …”. Odczyt idzie przez LDAP, bez modułu ActiveDirectory. Warunki są zapisane filtrami LDAP i program odczytuje tylko nazwy obiektów, nie hasła ani atrybuty poufne. Cały blok ma limit 90 s.
 
 Sprawdzane są m.in.: wiek hasła krbtgt, delegowanie nieograniczone, delegowanie do usług kontrolera domeny i RBCD na kontrolerach, prawa replikacji (DCSync) i pełna kontrola nad obiektem domeny poza grupami administracyjnymi (konto synchronizacji Entra Connect jest rozpoznawane jako oczekiwane), konta bez wstępnego uwierzytelniania Kerberos, konta uprzywilejowane z SPN, hasła zapisywane odwracalnie, konta z `PASSWD_NOTREQD`, konta bez AES, słowo „hasło” w opisie konta, liczność i nieużywane konta grup uprzywilejowanych, sIDHistory z SID-em uprzywilejowanym albo z tej samej domeny, `MachineAccountQuota`, zasady haseł i blokady kont, poziom funkcjonalny, Kosz AD, anonimowy dostęp do katalogu, zaufania bez filtrowania SID, pokrycie i rotacja LAPS, nieaktywne konta komputerów, hasła w SYSVOL (GPP `cpassword` i skrypty logowania).
-
-### Wskaźniki naruszenia (sekcja Podejrzane)
-
-Sekcja **Podejrzane** szuka śladów, które zwykle zostawia atakujący: przekierowanie programów ułatwień dostępu na ekranie logowania, własne pakiety LSA, AppInit_DLLs, pomocników netsh, monitorów wydruku, dostawców czasu, ukryte zadania harmonogramu (bez deskryptora SD), ukryte konta lokalne, biblioteki usług svchost spoza katalogu systemowego, wtyczkę serwera DNS, narzędzia zdalnego dostępu (AnyDesk, TeamViewer, ScreenConnect, RustDesk i ok. 20 innych), narzędzia ofensywne i zrzuty pamięci lsass, wykrycia i wyłączenia Defendera, dodane wykluczenia, przekierowane w pliku hosts domeny aktualizacji i producentów ochrony, zaufane certyfikaty narzędzi przechwytujących TLS oraz udane logowania RDP z adresów publicznych. Stacja dodatkowo sprawdza linie poleceń usług, zadań, autostartu i subskrypcji WMI pod kątem typowych technik (pobieranie i wykonywanie kodu, zakodowane polecenia, programy w katalogach tymczasowych).
-
-Narzędzia zdalnego dostępu używane w firmie wpisz w **Ustawienia → Listy → Zatwierdzone narzędzia zdalnego dostępu**. Wtedy są pokazywane jako informacja, a nie ostrzeżenie.
-
-Na Windows Server 2012 R2 z PowerShell 4.0 program nie sprawdza podpisów cyfrowych bibliotek (pakiety LSA, biblioteki usług), więc biblioteka spoza listy domyślnej ma tam poziom „Uwaga”, a nie „Krytyczne”.
-
-Kolektor sam nie wywołuje ostrzeżeń PowerShella o podejrzanej treści skryptu (zdarzenie 4104 na poziomie Warning, które systemy SIEM często traktują jako alarm). Skrypty oznaczone przez PowerShella na serwerze są pokazywane jako informacja, a ostrzeżeniem stają się dopiero wtedy, gdy ich treść pasuje do wzorców ataku.
 
 ## Wykrywane problemy
 
@@ -234,7 +223,6 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
 - krytyczne ustawienia bezpieczeństwa: wyłączona ochrona w czasie rzeczywistym, sygnatury antywirusa starsze niż 7 dni, włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0, Point and Print bez ostrzeżeń i uprawnień administratora, urząd certyfikacji z `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6);
 - w grupie Administratorzy jest grupa obejmująca wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy domeny i podobne);
-- wskaźniki naruszenia: przekierowany program ułatwień dostępu, niepodpisany pakiet LSA (PowerShell 5.1), ukryte zadanie harmonogramu, ukryte konto w grupie uprzywilejowanej, biblioteka usługi w katalogu tymczasowym, zrzut pamięci lsass, poważne zagrożenie wykryte przez Defendera, zablokowane w pliku hosts domeny aktualizacji, certyfikat narzędzia przechwytującego TLS, udane logowanie RDP z internetu, linia poleceń pobierająca i wykonująca kod;
 - Active Directory: delegowanie nieograniczone, delegowanie albo RBCD wobec kontrolerów domeny, prawa replikacji (DCSync) poza grupami administracyjnymi, uprzywilejowane konta z SPN albo bez wstępnego uwierzytelniania Kerberos, hasła w preferencjach zasad grupy (`cpassword`), uprzywilejowany SID w sIDHistory;
 - kontroler domeny: błąd replikacji SYSVOL (DFSR), replikacja AD bez sukcesu od ponad doby, krytyczne zdarzenia replikacji;
 - Hyper-V: maszyna wstrzymana (zwykle brak miejsca na wolumenie z dyskami) albo w stanie krytycznym (brak dostępu do plików maszyny);
@@ -281,8 +269,6 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - ta sama maszyna na liście pod dwiema nazwami (alias DNS, adres IP, nazwa klastra);
 - zbiorcze zalecenia utwardzenia serwera („Do utwardzenia (N): …”) i domeny („Do utwardzenia w domenie (N): …”);
 - sekcje, których nie udało się zebrać na danym serwerze.
-
-Pozycje sekcji **Podejrzane** na poziomie informacji (zatwierdzone narzędzia zdalnego dostępu, skrypty oznaczone przez PowerShella bez cech ataku, zmiany Defendera wprowadzone zasadami grupy albo przy Defenderze w trybie pasywnym) są tylko wyróżnione w tej sekcji i nie trafiają na listę problemów.
 
 ## Wyciszanie problemów
 
@@ -435,7 +421,6 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | Usługi automatyczne, których zatrzymanie jest OK (jedna na linię, wildcardy `*`) | lista usług systemowych (obsługuje wildcardy `*`) |
 | Porty wrażliwe dla sekcji Ekspozycja (jeden na linię) | 21, 22, 23, 135, 139, 445, 1433, 3306, 3389, 5432, 5900, 5985, 5986 |
 | Subskrypcje WMI traktowane jako systemowe (jedna na linię) | subskrypcje obecne w czystym systemie |
-| Zatwierdzone narzędzia zdalnego dostępu – tylko informacja, nie ostrzeżenie (jedno na linię, np. TeamViewer, Atera; wildcardy `*`) | (puste) |
 
 Pole „Zdarzenia z ostatnich … dni” w głównym oknie zmienia zakres tylko dla bieżącego skanu.
 
@@ -499,7 +484,7 @@ Przy ok. 400 serwerach rozsądne wartości to 25–50 równoległych skanów i l
 
 Nie, tylko odczytuje dane. Jedyne zapisy to pliki tymczasowe w folderze `%TEMP%` serwera, usuwane zaraz po odczytaniu: wynik `auditpol /backup` oraz – tylko na kontrolerach domeny – wynik `secedit /export` z obowiązującymi zasadami haseł. Kontrole Active Directory tylko czytają katalog i nie odczytują haseł ani atrybutów poufnych (LAPS, BitLocker).
 
-Kolektor nie zawiera treści, które PowerShell uznaje za podejrzane, więc skan nie zostawia na serwerach ostrzeżeń 4104 ani alarmów SIEM. Starsze wersje programu takie ostrzeżenia wywoływały – sekcja **Podejrzane** pokazuje je osobno jako informację.
+Kolektor nie zawiera treści, które PowerShell uznaje za podejrzane, więc skan nie zostawia na serwerach ostrzeżeń 4104 ani alarmów SIEM.
 
 ## Licencja
 
