@@ -5209,9 +5209,9 @@ function New-Dialog {
     $w = New-UiElement ($script:DialogXaml.Replace('<!--BODY-->', $Body))
     $w.Title = $Title
     $w.Width = $Width
-    $tone = $script:DialogTones[$Tone]
-    $w.FindName('dlgIconTile').Background = Brush $tone.Back
-    $ib = $w.FindName('dlgIcon'); $ib.Foreground = Brush $tone.Fore; $ib.Text = Get-Glyph $(if ($Icon) { $Icon } else { $tone.Icon })
+    $toneDef = $script:DialogTones[$Tone]
+    $w.FindName('dlgIconTile').Background = Brush $toneDef.Back
+    $ib = $w.FindName('dlgIcon'); $ib.Foreground = Brush $toneDef.Fore; $ib.Text = Get-Glyph $(if ($Icon) { $Icon } else { $toneDef.Icon })
     $w.FindName('dlgTitle').Text = $Title
     $sub = $w.FindName('dlgSubtitle'); if ($Subtitle) { $sub.Text = $Subtitle } else { $sub.Visibility = 'Collapsed' }
     $ok = $w.FindName('btnOk'); $ok.Content = $OkText
@@ -5270,7 +5270,7 @@ function Show-Toast {
     param([Parameter(Mandatory)][string]$Text, [ValidateSet('info', 'ok', 'warn', 'crit')][string]$Tone = 'info', [int]$Seconds = 4)
     if ($script:Headless -or -not $ui -or -not $ui['toastHost']) { return }
     try {
-        $tone = $script:DialogTones[$Tone]
+        $toneDef = $script:DialogTones[$Tone]
         $b = New-Object System.Windows.Controls.Border
         $b.Background = Brush '#1E2530'; $b.BorderBrush = Brush '#2F3846'; $b.BorderThickness = 1
         $b.CornerRadius = New-Object System.Windows.CornerRadius 9
@@ -5278,7 +5278,7 @@ function Show-Toast {
         $fx = New-Object System.Windows.Media.Effects.DropShadowEffect; $fx.BlurRadius = 18; $fx.ShadowDepth = 3; $fx.Opacity = 0.45; $fx.Color = [System.Windows.Media.Colors]::Black
         $b.Effect = $fx
         $sp = New-Object System.Windows.Controls.StackPanel; $sp.Orientation = 'Horizontal'
-        $ic = New-GlyphBlock -Code $tone.Icon -Size 15 -Color $tone.Fore; $ic.Margin = '0,0,10,0'
+        $ic = New-GlyphBlock -Code $toneDef.Icon -Size 15 -Color $toneDef.Fore; $ic.Margin = '0,0,10,0'
         $tx = New-Object System.Windows.Controls.TextBlock; $tx.Text = $Text; $tx.TextWrapping = 'Wrap'; $tx.MaxWidth = 380; $tx.Foreground = Brush '#E4E8EF'; $tx.VerticalAlignment = 'Center'
         [void]$sp.Children.Add($ic); [void]$sp.Children.Add($tx); $b.Child = $sp
         $hostPanel = $ui.toastHost
@@ -5891,9 +5891,9 @@ function Get-SortedRows($Rows, $Sort) {
     if ($script:NativeOk) {
         # Sortowanie w kodzie natywnym (kilkadziesiąt razy szybciej przy tysiącach wierszy); te same klucze i reguły
         $n = $Sort.Count
-        $E = New-Object 'int[][]' $n; $Cc = New-Object 'int[][]' $n; $N = New-Object 'double[][]' $n; $T = New-Object 'string[][]' $n; $desc = New-Object 'bool[]' $n
-        for ($j = 0; $j -lt $n; $j++) { $E[$j] = $keys[$j].E; $Cc[$j] = $keys[$j].C; $N[$j] = $keys[$j].N; $T[$j] = $keys[$j].T; $desc[$j] = [bool]$Sort[$j].Desc }
-        $idx = [ServerReviewNative.Sorter]::Order($E, $Cc, $N, $T, $desc)
+        $E = New-Object 'int[][]' $n; $Cc = New-Object 'int[][]' $n; $Nums = New-Object 'double[][]' $n; $T = New-Object 'string[][]' $n; $desc = New-Object 'bool[]' $n
+        for ($j = 0; $j -lt $n; $j++) { $E[$j] = $keys[$j].E; $Cc[$j] = $keys[$j].C; $Nums[$j] = $keys[$j].N; $T[$j] = $keys[$j].T; $desc[$j] = [bool]$Sort[$j].Desc }
+        $idx = [ServerReviewNative.Sorter]::Order($E, $Cc, $Nums, $T, $desc)
         $out = New-Object 'object[]' $Rows.Count
         for ($i = 0; $i -lt $idx.Length; $i++) { $out[$i] = $Rows[$idx[$i]] }
         return , $out
