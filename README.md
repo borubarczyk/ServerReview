@@ -292,6 +292,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - klaster: węzeł w innym stanie niż Up/Down (np. Paused), rola częściowo online, kworum nie Online, klaster nie przetrwa awarii największego węzła (N+1);
 - wszystkie skanowane kontrolery domeny działają na jednym hoście;
 - zegar stacji różni się od większości serwerów (wtedy różnice czasu serwerów są liczone względem mediany, zamiast ostrzeżenia na każdym serwerze);
+- sprawdzenia, których nie udało się wykonać na danym serwerze (połączenie działa, padło jedno sprawdzenie);
 - nowe pozycje od poprzedniego skanu.
 
 **Info**
@@ -306,8 +307,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - pozostałe brakujące poprawki Windows (CVE); nie udało się pobrać danych CVE (problem stacji);
 - skan serwera trwał co najmniej 70% limitu czasu (z trzema najwolniejszymi sekcjami);
 - ta sama maszyna na liście pod dwiema nazwami (alias DNS, adres IP, nazwa klastra);
-- zbiorcze zalecenia utwardzenia serwera („Do utwardzenia (N): …”) i domeny („Do utwardzenia w domenie (N): …”);
-- sekcje, których nie udało się zebrać na danym serwerze.
+- zbiorcze zalecenia utwardzenia serwera („Do utwardzenia (N): …”) i domeny („Do utwardzenia w domenie (N): …”).
 
 ## Wyciszanie problemów
 
@@ -525,7 +525,8 @@ Przy ok. 400 serwerach rozsądne wartości to 25–50 równoległych skanów i l
 - **„Kolektor przerwał pracę” / „kolektor nie kompiluje się”.** Serwer odpowiada, ale skrypt zbierający dane zakończył się błędem. Treść błędu (z numerem linii i wersją PowerShell serwera) jest w diagnozie i w dzienniku operacji.
 - **„Proces WinRM przerwał pracę”.** Najczęściej limit pamięci powłoki WinRM na serwerze: `winrm set winrm/config/winrs @{MaxMemoryPerShellMB="2048"}` albo odznacz duże sekcje.
 - **Puste zdarzenia bezpieczeństwa.** Konto musi mieć uprawnienia administratora na serwerze. Sekcja **Polityka audytu** pokazuje, których zdarzeń system w ogóle nie rejestruje.
-- **Informacja „Nie udało się zebrać: …”.** Jedna sekcja nie zadziałała na danym serwerze, np. brak modułu w starszym systemie. Pozostałe dane są kompletne.
+- **Ostrzeżenie „Nie udało się zebrać: …”.** Jedno sprawdzenie nie zadziałało na danym serwerze, np. brak modułu w starszym systemie. Treść podaje nazwę sprawdzenia, komunikat i typ wyjątku, a pozostałe sprawdzenia wykonują się dalej. „Błąd połączenia” program zgłasza tylko wtedy, gdy WinRM nie zestawi sesji albo ją zerwie; błąd zgłoszony na serwerze (np. przez moduł PowerShell) nie oznacza serwera jako niedostępnego.
+- **Brak pliku lokalizacji modułu na serwerze** (np. `Cannot find the Windows PowerShell data file 'SmbLocalization.psd1' in directory '…\pl-PL\'`). Dotyczy serwerów, na których moduł ma tylko tłumaczenie en-US. Udziały i konfigurację SMB program czyta przez CIM (`root\Microsoft\Windows\SMB`), bez modułu SmbShare, więc ten błąd nie wpływa na skan.
 - **Coś poszło nie tak.** Zajrzyj do dziennika operacji (Ctrl+L) – błędy programu i serwerów są tam opisane, także w pliku `Logs\ServerReview_RRRRMMDD.log`.
 - **Popsute polskie znaki po edycji skryptu.** Zapisuj plik jako UTF-8 z BOM, bo Windows PowerShell 5.1 bez BOM odczytuje go w złym kodowaniu.
 
