@@ -1082,11 +1082,19 @@ $Collector = {
     try { $everyone = (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')).Translate([System.Security.Principal.NTAccount]).Value } catch {}
     $shares = @(S 'Shares' 'Udziały' {
         # CIM zamiast Get-SmbShare/Get-SmbShareAccess (moduł SmbShare zgłasza błąd, gdy brak jego pliku lokalizacji w języku sesji)
+        # GetAccessControlEntries – ta sama metoda, której używa Get-SmbShareAccess (tylko odczyt); błędy zbiorczo, jeden wpis na serwer
         $acTxt = @{ 0 = 'Allow'; 1 = 'Deny' }; $arTxt = @{ 0 = 'Full'; 1 = 'Change'; 2 = 'Read'; 3 = 'Custom' }
+        $accFail = New-Object System.Collections.Generic.List[string]; $accWhy = New-Object System.Collections.Generic.List[string]
         Get-CimInstance -Namespace root\Microsoft\Windows\SMB -ClassName MSFT_SmbShare | Where-Object { $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|[A-Z]\$)$' } | ForEach-Object {
             $sh = $_; $acc = @()
-            try { $acc = @(@((Invoke-CimMethod -InputObject $sh -MethodName GetAccessRights -ErrorAction Stop).ShareAccessControlEntries) | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ AccountName = "$($_.AccountName)"; AccessControlType = $acTxt[[int]$_.AccessControlType]; AccessRight = $arTxt[[int]$_.AccessRight] } }) }
-            catch { $errs.Add("Udziały – uprawnienia udziału $($sh.Name): $($_.Exception.Message) ($($_.CategoryInfo.Reason))") }
+            try {
+                # Invoke-CimMethod włącza strumieniowanie wyniku: wpisy ACL przychodzą jako osobne obiekty (ItemValue) albo w całości (Output)
+                $cimr = @(Invoke-CimMethod -InputObject $sh -MethodName GetAccessControlEntries -ErrorAction Stop)
+                $rv = @($cimr | ForEach-Object { $_.ReturnValue } | Where-Object { $_ })
+                if ($rv.Count) { throw "GetAccessControlEntries zwróciła kod $($rv[0])" }
+                $acc = @(@($cimr | ForEach-Object { if ($null -ne $_.ItemValue) { $_.ItemValue } else { $_.Output } }) | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ AccountName = "$($_.AccountName)"; AccessControlType = $acTxt[[int]$_.AccessControlType]; AccessRight = $arTxt[[int]$_.AccessRight] } })
+            }
+            catch { $accFail.Add("$($sh.Name)"); $accWhy.Add("$($_.Exception.Message) ($($_.CategoryInfo.Reason))") }
             $ew  = $acc | Where-Object { $_.AccountName -eq $everyone -and "$($_.AccessControlType)" -eq 'Allow' -and "$($_.AccessRight)" -in 'Full', 'Change' }
             [pscustomobject]@{
                 Name = $sh.Name; Path = $sh.Path; Description = $sh.Description
@@ -1094,6 +1102,7 @@ $Collector = {
                 EveryoneWrite = $(if ($ew) { 'Tak' } else { '' })
             }
         }
+        if ($accFail.Count) { $errs.Add("Udziały – uprawnienia: $($accWhy[0]); nie odczytano dla $($accFail.Count) udziałów: $((@($accFail) | Select-Object -First 5) -join ', ')$(if ($accFail.Count -gt 5) { ', …' })") }
     })
 
     # ── Autostart ──
