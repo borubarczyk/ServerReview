@@ -219,13 +219,14 @@ try {
 $Collector = {
     param([int]$Days, [string[]]$Folders, [int]$MaxEvents, [bool]$IncludeWarnings, [string[]]$SkipSections = @(), [int[]]$ExposedPorts = @())
 
-    # Moduły ładujemy jawnie, ZANIM włączymy ErrorActionPreference = 'Stop'. Autoładowanie pod 'Stop' potrafi się nie udać
-    # (np. SmbShare po wcześniejszym Get-WindowsFeature: "module could not be loaded"). Brak modułu na danym systemie nie jest błędem.
-    foreach ($m in 'SmbShare', 'NetTCPIP', 'NetAdapter', 'DnsClient', 'NetSecurity', 'ScheduledTasks', 'Defender', 'Microsoft.PowerShell.LocalAccounts') {
-        Import-Module $m -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
+    # Moduły ładujemy jawnie, ZANIM włączymy ErrorActionPreference = 'Stop'. Autoładowanie pod 'Stop' potrafi się nie udać.
+    # Brak modułu na danym systemie nie jest błędem. 2>$null: błędy z wnętrza modułu (np. brak pliku lokalizacji w języku sesji,
+    # pl-PL\*.psd1) nie trafiają do strumienia błędów – moduł i tak się ładuje. SMB czytamy przez CIM (bez modułu SmbShare).
+    foreach ($m in 'NetTCPIP', 'NetAdapter', 'DnsClient', 'NetSecurity', 'ScheduledTasks', 'Defender', 'Microsoft.PowerShell.LocalAccounts') {
+        Import-Module $m -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null
     }
-    if (Get-Service vmms -ErrorAction SilentlyContinue) { Import-Module Hyper-V -ErrorAction SilentlyContinue -WarningAction SilentlyContinue }
-    if (Get-Service ClusSvc -ErrorAction SilentlyContinue) { Import-Module FailoverClusters -ErrorAction SilentlyContinue -WarningAction SilentlyContinue }
+    if (Get-Service vmms -ErrorAction SilentlyContinue) { Import-Module Hyper-V -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service ClusSvc -ErrorAction SilentlyContinue) { Import-Module FailoverClusters -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
 
     $ErrorActionPreference = 'Stop'
     $ProgressPreference    = 'SilentlyContinue'
@@ -242,7 +243,7 @@ $Collector = {
     function S([string]$Key, [string]$Section, [scriptblock]$Block) {
         if (-not (Want $Key)) { return }
         $t0 = $sw.Elapsed.TotalSeconds
-        try { & $Block } catch { if ($Key) { $failedKeys.Add($Key) }; $errs.Add("$Section`: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim())]") }
+        try { & $Block } catch { if ($Key) { $failedKeys.Add($Key) }; $errs.Add("$Section`: $($_.Exception.Message) ($($_.CategoryInfo.Reason)) [linia $($_.InvocationInfo.ScriptLineNumber): $("$($_.InvocationInfo.Line)".Trim())]") }
         finally { $timings[$Section] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1) }
     }
     function D($dt) { if ($dt) { try { ([datetime]$dt).ToString('yyyy-MM-dd HH:mm') } catch { "$dt" } } else { '' } }
@@ -397,10 +398,11 @@ $Collector = {
         }
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
-        $smb = Get-SmbServerConfiguration
+        # CIM zamiast Get-SmbServerConfiguration – moduł SmbShare zgłasza błąd, gdy brak jego pliku lokalizacji w języku sesji
+        $smb = Get-CimInstance -Namespace root\Microsoft\Windows\SMB -ClassName MSFT_SmbServerConfiguration
         Add-Check 'SMBv1 (serwer)' $(if ($smb.EnableSMB1Protocol) { 'włączony' } else { 'wyłączony' }) $(if ($smb.EnableSMB1Protocol) { 'Uwaga' } else { 'OK' })
         Add-Check 'Wymagane podpisywanie SMB (serwer)' $(if ($smb.RequireSecuritySignature) { 'tak' } else { 'nie – możliwe przekazanie (relay) uwierzytelnienia NTLM do tego serwera' }) $(if ($smb.RequireSecuritySignature) { 'OK' } elseif ($sys.IsDC) { 'Uwaga' } else { 'Zalecenie' })
-    } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
+    } catch { $errs.Add("Konfiguracja bezpieczeństwa – SMB: $($_.Exception.Message) ($($_.CategoryInfo.Reason)) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $ts    = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
         $rdp   = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
@@ -1079,11 +1081,15 @@ $Collector = {
     $everyone = 'Everyone'
     try { $everyone = (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')).Translate([System.Security.Principal.NTAccount]).Value } catch {}
     $shares = @(S 'Shares' 'Udziały' {
-        Get-SmbShare | Where-Object { $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|[A-Z]\$)$' } | ForEach-Object {
-            $acc = @(Get-SmbShareAccess -Name $_.Name -ErrorAction SilentlyContinue)
+        # CIM zamiast Get-SmbShare/Get-SmbShareAccess (moduł SmbShare zgłasza błąd, gdy brak jego pliku lokalizacji w języku sesji)
+        $acTxt = @{ 0 = 'Allow'; 1 = 'Deny' }; $arTxt = @{ 0 = 'Full'; 1 = 'Change'; 2 = 'Read'; 3 = 'Custom' }
+        Get-CimInstance -Namespace root\Microsoft\Windows\SMB -ClassName MSFT_SmbShare | Where-Object { $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|[A-Z]\$)$' } | ForEach-Object {
+            $sh = $_; $acc = @()
+            try { $acc = @(@((Invoke-CimMethod -InputObject $sh -MethodName GetAccessRights -ErrorAction Stop).ShareAccessControlEntries) | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ AccountName = "$($_.AccountName)"; AccessControlType = $acTxt[[int]$_.AccessControlType]; AccessRight = $arTxt[[int]$_.AccessRight] } }) }
+            catch { $errs.Add("Udziały – uprawnienia udziału $($sh.Name): $($_.Exception.Message) ($($_.CategoryInfo.Reason))") }
             $ew  = $acc | Where-Object { $_.AccountName -eq $everyone -and "$($_.AccessControlType)" -eq 'Allow' -and "$($_.AccessRight)" -in 'Full', 'Change' }
             [pscustomobject]@{
-                Name = $_.Name; Path = $_.Path; Description = $_.Description
+                Name = $sh.Name; Path = $sh.Path; Description = $sh.Description
                 Access = (@($acc | ForEach-Object { "$($_.AccountName): $($_.AccessControlType) $($_.AccessRight)" }) -join '; ')
                 EveryoneWrite = $(if ($ew) { 'Tak' } else { '' })
             }
@@ -1963,6 +1969,21 @@ function Get-SnapshotSummary([string]$Path) {
     }
 }
 
+function Test-RemotingTransportError($Err) {
+    # Błąd połączenia WinRM (sesja nie powstała albo zerwała się) – a nie błąd zgłoszony przez polecenie wykonane na serwerze
+    if (-not $Err) { return $false }
+    ($Err.Exception -is [System.Management.Automation.Remoting.PSRemotingTransportException]) -or ("$($Err.FullyQualifiedErrorId)" -match 'PSSessionStateBroken|PSSessionOpenFailed')
+}
+
+function Add-SnapshotErrors([string]$Json, [string[]]$Errors) {
+    # Dopisanie błędów do tablicy Errors wyniku kolektora (ostatnia tablica „Errors” w JSON – pola za nią są liczbami)
+    $i = $Json.LastIndexOf('"Errors":[')
+    if ($i -lt 0 -or -not @($Errors).Count) { return $Json }
+    $p = $i + 10
+    $items = (@($Errors | ForEach-Object { ConvertTo-Json "$_" -Compress })) -join ','
+    $Json.Substring(0, $p) + $items + $(if ($Json[$p] -ne ']') { ',' } else { '' }) + $Json.Substring($p)
+}
+
 function Get-WinRmErrorInfo {
     <#
         Klasyfikacja błędu połączenia WinRM. Najpierw kody (HRESULT / kod błędu WinRM / FullyQualifiedErrorId) – są niezależne
@@ -2288,7 +2309,7 @@ function Invoke-ConnectionDiagnostics {
         # diagnoza na żądanie działającego serwera – bez błędu połączenia do wyjaśnienia
         $class = 'OK'; $cause = 'WinRM jest osiągalny ze stacji (port 5985 otwarty)'; $remedy = ''
     }
-    elseif ($w -eq 'open' -and $class -in 'Network', 'Unknown', 'Dns') {
+    elseif ($w -eq 'open' -and $class -in 'Network', 'Unknown', 'Dns' -and $ErrorId -notmatch '^(CollectorFatal|ParseError|NoData)') {
         $class = 'WinRM'; $cause = 'WinRM nasłuchuje (port 5985 otwarty), ale sesja nie powstała'
         $remedy = 'Szczegóły w wierszu „Błąd połączenia”. Na serwerze: Test-WSMan, dziennik Microsoft-Windows-WinRM/Operational.'
     }
@@ -2586,16 +2607,39 @@ try {
                 $sb = $null
                 try { $sb = [scriptblock]::Create($Text) }
                 catch { return ('{"Fatal":' + (ConvertTo-Json ("kolektor nie kompiluje się w PowerShell $($PSVersionTable.PSVersion): $($_.Exception.Message)") -Compress) + '}') }
-                & $sb @CArgs
+                # błąd nieterminujący wypisany poza sekcjami kolektora (np. przez moduł) wraca jako tekst – w strumieniu błędów sesji stacja wzięłaby go za błąd połączenia
+                & $sb @CArgs 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { '@@SRERR@@' + "$($_.CategoryInfo.Reason): $($_.Exception.Message)" } else { $_ } }
             }
-            $ic = @{ ComputerName = $Target; ScriptBlock = $boot; ArgumentList = @($Opt.CollectorText, [object[]]$Opt.CollectorArgs); SessionOption = $so; ErrorAction = 'Stop' }
+            # bez ErrorAction Stop: błąd wypisany na serwerze nie przerywa odbioru danych; błędy połączenia rozpoznajemy po typie (Test-RemotingTransportError)
+            $icErr = $null
+            $ic = @{ ComputerName = $Target; ScriptBlock = $boot; ArgumentList = @($Opt.CollectorText, [object[]]$Opt.CollectorArgs); SessionOption = $so; ErrorAction = 'SilentlyContinue'; ErrorVariable = 'icErr' }
             if ($Opt.Credential) { $ic.Credential = $Opt.Credential }
             $out = @(Invoke-Command @ic)
             $res.ReceivedUtc = [DateTime]::UtcNow
             $strs = @($out | Where-Object { $_ -is [string] })
             $json = $strs | Where-Object { $_.StartsWith('{') } | Select-Object -Last 1
             $mark = $strs | Where-Object { $_.StartsWith('@@SRTIME@@') } | Select-Object -Last 1
-            if (-not $json) { $res.Error = 'Serwer nie zwrócił danych.'; $res.ErrorId = 'NoData' }
+            # błędy z serwera: wypisane poza sekcjami kolektora (@@SRERR@@) i błędy sesji inne niż błąd połączenia
+            $remote = New-Object System.Collections.Generic.List[string]
+            foreach ($s in @($strs | Where-Object { $_.StartsWith('@@SRERR@@') })) { $remote.Add("Kolektor (poza sprawdzeniami): $($s.Substring(9))") }
+            $transport = $null
+            foreach ($e in @($icErr)) {
+                if (-not $e) { continue }
+                if (Test-RemotingTransportError $e) { if (-not $transport) { $transport = $e } }
+                else { $remote.Add("Sesja PowerShell na serwerze: $($e.CategoryInfo.Reason): $($e.Exception.Message)") }
+            }
+            if ($json) {
+                # dane są: błędy sprawdzeń trafiają do Errors migawki (problem Ostrzeżenie), skan jest udany
+                if ($transport) { $remote.Add("Połączenie po odebraniu danych: $($transport.Exception.Message)") }
+                if ($remote.Count) { $json = Add-SnapshotErrors $json ([string[]]$remote.ToArray()) }
+            }
+            elseif ($transport) {
+                $res.Error = "$($transport.Exception.Message)"; $res.ErrorId = "$($transport.FullyQualifiedErrorId)"
+                $tx = $transport.Exception
+                if ($tx -and $tx.PSObject.Properties['ErrorCode'] -and $tx.ErrorCode) { try { $res.ErrorCode = '0x{0:X8}' -f [int]$tx.ErrorCode } catch {} }
+            }
+            elseif ($remote.Count) { $res.Error = "Kolektor przerwał pracę na serwerze: $($remote[0])"; $res.ErrorId = 'CollectorFatal' }
+            else { $res.Error = 'Serwer nie zwrócił danych.'; $res.ErrorId = 'NoData' }
         } catch {
             $res.Error = "$($_.Exception.Message)"
             $res.ErrorId = "$($_.FullyQualifiedErrorId)"
@@ -2689,7 +2733,7 @@ try {
 $res.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 [pscustomobject]$res
 '@
-$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics',
+$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics', 'Test-RemotingTransportError', 'Add-SnapshotErrors',
     'ConvertTo-CveDate', 'Get-CveAgeHours', 'Invoke-CveApi', 'ConvertTo-CveRow', 'Sync-CveProduct', 'Sync-CveExploited', 'Sync-CveKev', 'New-CveIndex', 'Set-CveIndexFlags', 'Sync-CveData'
 # Pełna definicja funkcji z drzewa składni (razem z deklaracją parametrów)
 $script:WorkerScript = $script:WorkerParams + "`n" + ((@($script:WorkerFunctionNames | ForEach-Object { (Get-Item "function:$_").ScriptBlock.Ast.Extent.Text })) -join "`n`n") + "`n" + $script:WorkerBody
@@ -3694,7 +3738,7 @@ function Invoke-ServerAnalysis {
         AddI 'Info' 'Sieć' ("Połączenia przychodzące z adresów publicznych: " + (Join-Short ($pub | ForEach-Object { "$($_.Remote) na port $($_.LocalPort) ($($_.Process))" }) 4)) 'Connections'
         foreach ($r in $pub) { SetFlag $r 'warn' }
     }
-    foreach ($e in @($D.Errors | Where-Object { $_ })) { AddI 'Info' 'Zbieranie danych' "Nie udało się zebrać: $e" 'System' }
+    foreach ($e in @($D.Errors | Where-Object { $_ })) { AddI 'Ostrzeżenie' 'Zbieranie danych' "Nie udało się zebrać: $e" 'System' }   # sesja działa, padło jedno sprawdzenie
 
     # Porównanie z poprzednim skanem
     $changes = New-Object System.Collections.Generic.List[object]
