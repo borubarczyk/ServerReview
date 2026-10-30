@@ -96,7 +96,10 @@ $Config = [ordered]@{
     DiskForecastDays       = 30       # prognoza: dysk spadnie poniżej progu krytycznego w ciągu tylu dni = ostrzeżenie
     DiskForecastCritDays   = 7        # prognoza: dysk zapełni się w ciągu tylu dni = problem krytyczny
     BackupWarnDays         = 2        # ostatnia udana kopia zapasowa starsza niż tyle dni = ostrzeżenie
-    BackupCritDays         = 7        # ... = problem krytyczny
+    BackupCritDays         = 7        # ... = problem krytyczny (także bazy SQL bez kopii danych)
+    SqlLogBackupHours      = 24       # baza SQL w modelu FULL/BULK_LOGGED bez kopii dziennika od tylu godzin = ostrzeżenie (dziennik rośnie)
+    DhcpWarnPct            = 85       # zajętość zakresu DHCP: ostrzeżenie od [%]
+    DhcpCritPct            = 95       # ... krytyczne od [%]
     ThrottleLimit          = 25       # ile serwerów skanować równolegle
     ServerTimeoutSec       = 300      # limit czasu zbierania danych z JEDNEGO serwera (liczony od chwili, gdy jego skan ruszył)
     ConnectTimeoutSec      = 30       # limit nawiązania połączenia WinRM
@@ -241,6 +244,9 @@ $Collector = {
         Import-Module $m -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null
     }
     if (Get-Service vmms -ErrorAction SilentlyContinue) { Import-Module Hyper-V -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service W3SVC -ErrorAction SilentlyContinue) { Import-Module WebAdministration -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service DHCPServer -ErrorAction SilentlyContinue) { Import-Module DhcpServer -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service DNS -ErrorAction SilentlyContinue) { Import-Module DnsServer -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
     if (Get-Service wbengine -ErrorAction SilentlyContinue) { Import-Module WindowsServerBackup -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
     if (Get-Service ClusSvc -ErrorAction SilentlyContinue) { Import-Module FailoverClusters -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
 
@@ -1555,6 +1561,112 @@ $Collector = {
         })
     }
 
+    # ── Role aplikacyjne: SQL Server, IIS, DHCP, DNS (tylko gdy rola jest zainstalowana) ──
+    # _Kind: Check = sprawdzenie ze statusem; SqlDb = baza SQL (status ustala stacja wg progów kopii); DhcpScope = zakres DHCP (zajętość, progi na stacji)
+    $appRoles = @(S 'AppRoles' 'Role aplikacyjne' {
+        $ar = { param($role, $c, $v, $st, $kind = 'Check', $pct = $null, $bd = $null, $lh = $null, $rec = '', $state = '')
+                [pscustomobject]@{ Role = $role; Check = $c; Value = "$v"; Status = $st; _Kind = $kind; _Pct = $pct; _BackupDays = $bd; _LogHours = $lh; _Recovery = $rec; _DbState = $state } }
+
+        # SQL Server: instancje z rejestru, wersja i koniec wsparcia, usługi; bazy i kopie z msdb, jeśli konto skanujące ma login w SQL
+        $sqlEnd = @{ 10 = '2019-07-09'; 11 = '2022-07-12'; 12 = '2024-07-09'; 13 = '2026-07-14'; 14 = '2027-10-12'; 15 = '2030-01-08'; 16 = '2033-01-11' }
+        $sqlNames = @{ 10 = '2008/2008 R2'; 11 = '2012'; 12 = '2014'; 13 = '2016'; 14 = '2017'; 15 = '2019'; 16 = '2022'; 17 = '2025' }
+        $inst = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction SilentlyContinue
+        foreach ($p in @($inst.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) {
+            $in = $p.Name; $id = "$($p.Value)"
+            $setup = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$id\Setup" -ErrorAction SilentlyContinue
+            $ver = "$($setup.PatchLevel)"; if (-not $ver) { $ver = "$($setup.Version)" }
+            $maj = 0; [void][int]::TryParse(("$ver" -split '\.')[0], [ref]$maj)
+            $label = if ($in -eq 'MSSQLSERVER') { 'SQL (domyślna)' } else { "SQL\$in" }
+            $endTxt = ''; $st = 'OK'
+            if ($sqlEnd.ContainsKey($maj)) {
+                $end = [datetime]::ParseExact($sqlEnd[$maj], 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+                $dl = [int]($end - $now).TotalDays
+                $endTxt = if ($dl -lt 0) { "; wsparcie zakończone $($sqlEnd[$maj])" } else { "; wsparcie do $($sqlEnd[$maj])" }
+                $st = if ($dl -lt 0) { 'Krytyczne' } elseif ($dl -le 365) { 'Uwaga' } else { 'OK' }
+            }
+            & $ar 'SQL Server' "$label – wersja" "SQL Server $($sqlNames[$maj]) $($setup.Edition), $ver$endTxt" $st
+            $svc = if ($in -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$in" }
+            $agt = if ($in -eq 'MSSQLSERVER') { 'SQLSERVERAGENT' } else { "SQLAgent`$$in" }
+            foreach ($sn in $svc, $agt) {
+                $sv = Get-CimInstance Win32_Service -Filter "Name='$($sn -replace "'", "''")'" -ErrorAction SilentlyContinue
+                if (-not $sv) { continue }
+                $bad = "$($sv.StartMode)" -eq 'Auto' -and "$($sv.State)" -ne 'Running'
+                $exp = "$($setup.Edition)" -like 'Express*' -and $sn -eq $agt
+                & $ar 'SQL Server' "$label – usługa $sn" "$($sv.State), uruchamianie $($sv.StartMode), konto $($sv.StartName)" $(if ($bad -and -not $exp) { if ($sn -eq $svc) { 'Krytyczne' } else { 'Uwaga' } } else { 'OK' })
+            }
+            $dbs = $null
+            try {
+                $srvName = if ($in -eq 'MSSQLSERVER') { '.' } else { ".\$in" }
+                $cn = New-Object System.Data.SqlClient.SqlConnection "Server=$srvName;Integrated Security=SSPI;Connect Timeout=5;Application Name=ServerReview"
+                try {
+                    $cn.Open()
+                    $cmd = $cn.CreateCommand(); $cmd.CommandTimeout = 30
+                    $cmd.CommandText = "SELECT d.name, d.state_desc, d.recovery_model_desc, " +
+                        "(SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type IN ('D','I')) AS last_data, " +
+                        "(SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type = 'L') AS last_log " +
+                        "FROM sys.databases d WHERE d.name <> 'tempdb' AND d.source_database_id IS NULL"
+                    $dbs = New-Object System.Data.DataTable
+                    [void](New-Object System.Data.SqlClient.SqlDataAdapter $cmd).Fill($dbs)
+                } finally { $cn.Dispose() }
+            } catch { & $ar 'SQL Server' "$label – bazy danych" "nie odczytano (konto skanujące bez loginu w SQL albo instancja zatrzymana): $(Short $_.Exception.Message 160)" 'Info' }
+            foreach ($r in @($dbs.Rows)) {
+                if (-not $r) { continue }
+                $ld = if ($r['last_data'] -is [DBNull]) { $null } else { [datetime]$r['last_data'] }
+                $ll = if ($r['last_log'] -is [DBNull]) { $null } else { [datetime]$r['last_log'] }
+                $rec = "$($r['recovery_model_desc'])"
+                $val = "stan $($r['state_desc']), model $rec, kopia danych: $(if ($ld) { D $ld } else { 'nigdy' })$(if ($rec -ne 'SIMPLE') { ", kopia dziennika: $(if ($ll) { D $ll } else { 'nigdy' })" })"
+                & $ar 'SQL Server' "$label – baza $($r['name'])" $val '' 'SqlDb' $null $(if ($ld) { [math]::Round(($now - $ld).TotalDays, 1) } else { $null }) $(if ($ll) { [math]::Round(($now - $ll).TotalHours, 1) } else { $null }) $rec "$($r['state_desc'])"
+            }
+        }
+
+        # IIS: witryny i pule aplikacji (stan), certyfikaty powiązań HTTPS
+        if ((Get-Service W3SVC -ErrorAction SilentlyContinue) -and (Get-Command Get-Website -ErrorAction SilentlyContinue)) {
+            foreach ($ws in @(Get-Website)) {
+                $auto = $true; try { $auto = [bool]$ws.serverAutoStart } catch {}
+                $bs = @($ws.bindings.Collection | ForEach-Object { "$($_.protocol) $($_.bindingInformation)" })
+                & $ar 'IIS' "Witryna $($ws.name)" "$($ws.state); $(Short ($bs -join ', ') 160)" $(if ("$($ws.state)" -ne 'Started' -and $auto) { 'Uwaga' } else { 'OK' })
+                foreach ($b in @($ws.bindings.Collection | Where-Object { $_.protocol -eq 'https' -and $_.certificateHash })) {
+                    $store = if ($b.certificateStoreName) { "$($b.certificateStoreName)" } else { 'My' }
+                    $cert = Get-Item -LiteralPath "Cert:\LocalMachine\$store\$($b.certificateHash)" -ErrorAction SilentlyContinue
+                    if (-not $cert) { & $ar 'IIS' "Witryna $($ws.name) – certyfikat $($b.bindingInformation)" "brak certyfikatu $($b.certificateHash) w magazynie $store" 'Krytyczne'; continue }
+                    $dl = [int]($cert.NotAfter - $now).TotalDays
+                    & $ar 'IIS' "Witryna $($ws.name) – certyfikat $($b.bindingInformation)" "$(Short $cert.Subject 100), ważny do $(D $cert.NotAfter) ($dl dni)" $(if ($dl -lt 0) { 'Krytyczne' } elseif ($dl -le 30) { 'Uwaga' } else { 'OK' })
+                }
+            }
+            foreach ($ap in @(Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue)) {
+                $auto = $true; try { $auto = [bool]$ap.autoStart } catch {}
+                & $ar 'IIS' "Pula aplikacji $($ap.Name)" "$($ap.State), .NET $($ap.managedRuntimeVersion), tożsamość $($ap.processModel.identityType)" $(if ("$($ap.State)" -ne 'Started' -and $auto) { 'Uwaga' } else { 'OK' })
+            }
+        }
+
+        # DHCP: zajętość zakresów (progi na stacji) i stan przełączania awaryjnego
+        if ((Get-Service DHCPServer -ErrorAction SilentlyContinue) -and (Get-Command Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
+            $stats = @{}; foreach ($x in @(Get-DhcpServerv4ScopeStatistics -ErrorAction SilentlyContinue)) { $stats["$($x.ScopeId)"] = $x }
+            foreach ($sc in @(Get-DhcpServerv4Scope)) {
+                $x = $stats["$($sc.ScopeId)"]
+                $pct = if ($x) { [math]::Round([double]$x.PercentageInUse, 1) } else { $null }
+                $act = "$($sc.State)" -eq 'Active'
+                & $ar 'DHCP' "Zakres $($sc.ScopeId) $($sc.Name)" "$(if (-not $act) { 'nieaktywny; ' })zajęte $(if ($x) { "$pct% ($($x.InUse) z $([int64]$x.InUse + [int64]$x.Free)), wolne $($x.Free)" } else { '?' })" $(if ($act) { '' } else { 'Info' }) $(if ($act) { 'DhcpScope' } else { 'Check' }) $pct
+            }
+            foreach ($fo in @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)) {
+                & $ar 'DHCP' "Przełączanie awaryjne $($fo.Name)" "partner $($fo.PartnerServer), tryb $($fo.Mode), stan $($fo.State)" $(if ("$($fo.State)" -eq 'Normal') { 'OK' } else { 'Uwaga' })
+            }
+        }
+
+        # DNS: przekierowania, oczyszczanie (scavenging), strefy z niezabezpieczoną aktualizacją dynamiczną
+        if ((Get-Service DNS -ErrorAction SilentlyContinue) -and (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue)) {
+            $fw = $null; try { $fw = Get-DnsServerForwarder -ErrorAction Stop } catch {}
+            if ($fw) { & $ar 'DNS' 'Przekierowania (forwarders)' $(if (@($fw.IPAddress).Count) { (@($fw.IPAddress | ForEach-Object { "$_" }) -join ', ') } else { 'brak – rozwiązywanie przez serwery główne (root hints)' }) 'OK' }
+            $scv = $null; try { $scv = Get-DnsServerScavenging -ErrorAction Stop } catch {}
+            if ($scv) { & $ar 'DNS' 'Oczyszczanie przestarzałych rekordów (scavenging)' $(if ($scv.ScavengingState) { "włączone, co $($scv.ScavengingInterval)" } else { 'wyłączone – stare rekordy dynamiczne nie są usuwane' }) $(if ($scv.ScavengingState) { 'OK' } else { 'Info' }) }
+            foreach ($z in @(Get-DnsServerZone | Where-Object { -not $_.IsAutoCreated -and "$($_.ZoneType)" -eq 'Primary' -and $_.ZoneName -ne 'TrustAnchors' })) {
+                $du = "$($z.DynamicUpdate)"
+                $ag = $null; try { $ag = (Get-DnsServerZoneAging -Name $z.ZoneName -ErrorAction Stop).AgingEnabled } catch {}
+                & $ar 'DNS' "Strefa $($z.ZoneName)" "aktualizacje dynamiczne: $du$(if ($z.IsDsIntegrated) { ', zintegrowana z AD' }), starzenie rekordów: $(if ($ag) { 'tak' } elseif ($null -eq $ag) { '?' } else { 'nie' })" $(if ($du -eq 'NonsecureAndSecure') { 'Uwaga' } else { 'OK' })
+            }
+        }
+    })
+
     # ── Active Directory: bezpieczeństwo domeny (zbiera każdy kontroler domeny; stacja ocenia raz na domenę – PDC albo pierwszy DC) ──
     # Tylko odczyt LDAP przez ADSI, bez modułu ActiveDirectory. Warunki są zapisane filtrami LDAP, a z wyników bierzemy samą ścieżkę
     # obiektu (nazwę CN) – narzędzie nie odczytuje haseł ani atrybutów poufnych. Limit czasu całego bloku: 90 s.
@@ -1927,6 +2039,7 @@ $Collector = {
         AuditPolicy    = $auditPolicy
         Crashes        = $crashes
         Backup         = $backups
+        AppRoles       = $appRoles
         DiskHealth     = $diskHealth
         DomainController = $dcRows
         ADSecurity     = $adSec
@@ -2894,6 +3007,7 @@ $script:Sections = @(
     @{ Key = 'Folders';        Header = 'Foldery' }
     @{ Key = 'DomainController'; Header = 'Kontroler domeny' }
     @{ Key = 'ADSecurity';     Header = 'Active Directory: bezpieczeństwo domeny' }
+    @{ Key = 'AppRoles';       Header = 'Role: SQL Server, IIS, DHCP, DNS' }
     @{ Key = 'HvHost';         Header = 'Hyper-V: host i pojemność'; Computed = $true }
     @{ Key = 'Cluster';        Header = 'Klaster Hyper-V' }
     @{ Key = 'HyperV';         Header = 'Hyper-V: maszyny' }
@@ -2978,7 +3092,7 @@ $script:Headers = @{
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
     Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
-    Product = 'Produkt'; Job = 'Zadanie'; LastResult = 'Ostatni wynik'; LastSuccess = 'Ostatnia udana'; SuccessAgeDays = 'Dni od udanej'
+    Role = 'Rola'; Product = 'Produkt'; Job = 'Zadanie'; LastResult = 'Ostatni wynik'; LastSuccess = 'Ostatnia udana'; SuccessAgeDays = 'Dni od udanej'
     GrowthGBDay = 'Ubywa [GB/dzień]'; FullInDays = 'Pełny za [dni]'; RunAgeDays = 'Dni od uruchomienia'; Runs = 'Uruchomienia'; Failures = 'Nieudane'; Target = 'Miejsce docelowe'
     # pola ze starszych migawek (wersja z sekcją Ochrona)
     AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'; FirewallManagedBy = 'Zapora zarządzana przez'; PartOfDomain = 'W domenie'
@@ -3291,6 +3405,9 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: system i dyski'; Key = 'BugCheckCritCount'; Type = 'int'; Min = 1; Max = 1000;   Label = 'BSOD: krytyczne od [liczba w okresie]' }
     @{ Group = 'Progi: system i dyski'; Key = 'BackupWarnDays';    Type = 'int'; Min = 1; Max = 365;    Label = 'Kopia zapasowa: ostrzeżenie, gdy ostatnia udana starsza niż [dni]' }
     @{ Group = 'Progi: system i dyski'; Key = 'BackupCritDays';    Type = 'int'; Min = 1; Max = 365;    Label = 'Kopia zapasowa: krytyczne, gdy ostatnia udana starsza niż [dni]' }
+    @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'SqlLogBackupHours'; Type = 'int'; Min = 1; Max = 8760; Label = 'SQL: baza w modelu FULL bez kopii dziennika – ostrzeżenie po [godzinach]' }
+    @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'DhcpWarnPct';       Type = 'int'; Min = 1; Max = 100;  Label = 'DHCP: zajętość zakresu – ostrzeżenie od [%]' }
+    @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'DhcpCritPct';       Type = 'int'; Min = 1; Max = 100;  Label = 'DHCP: zajętość zakresu – krytyczne od [%]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'CertWarnDays';       Type = 'int'; Min = 1; Max = 3650;    Label = 'Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'RecentSoftwareDays'; Type = 'int'; Min = 1; Max = 3650;    Label = 'Nowe oprogramowanie: z ostatnich [dni]' }
@@ -3330,7 +3447,7 @@ $script:SectionGroups = [ordered]@{
     'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Backup', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
     'Bezpieczeństwo'       = @('Hardening', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
-    'Role serwera'         = @('DomainController', 'ADSecurity', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
+    'Role serwera'         = @('DomainController', 'ADSecurity', 'AppRoles', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
 }
 # Stan okna i blokady – zapisywane razem z ustawieniami, ale nie są „ustawieniami skanu”
 $script:UiState = [ordered]@{ WindowWidth = 1540; WindowHeight = 940; WindowMaximized = $false; LogVisible = $false; LogHeight = 200 }
@@ -3748,6 +3865,35 @@ function Invoke-ServerAnalysis {
         if (-not $r) { continue }
         switch ("$($r.Status)") { 'Krytyczne' { SetFlag $r 'crit' } 'Uwaga' { SetFlag $r 'warn' } 'Zalecenie' { SetFlag $r 'info' } 'Info' { SetFlag $r 'info' } }
     }
+
+    # Role aplikacyjne: sprawdzenia ze statusem z kolektora; zakresy DHCP i bazy SQL oceniane wg progów z Ustawień (jeden problem na instancję)
+    $sqlNoBak = @{}; $sqlNoLog = @{}
+    foreach ($r in $D.AppRoles) {
+        $kind = "$($r.PSObject.Properties['_Kind'].Value)"
+        if ($kind -eq 'DhcpScope') {
+            if ("$($r._Pct)" -eq '') { continue }
+            $pct = [double]$r._Pct
+            if ($pct -ge $C.DhcpCritPct) { AddI 'Krytyczny' 'DHCP' "$($r.Check): $($r.Value) – nowe urządzenia nie dostaną adresu" 'AppRoles'; SetFlag $r 'crit' }
+            elseif ($pct -ge $C.DhcpWarnPct) { AddI 'Ostrzeżenie' 'DHCP' "$($r.Check): $($r.Value)" 'AppRoles'; SetFlag $r 'warn' }
+        } elseif ($kind -eq 'SqlDb') {
+            $inst = ("$($r.Check)" -split ' – baza ', 2)[0]; $db = ("$($r.Check)" -split ' – baza ', 2)[-1]
+            $dst = "$($r._DbState)"
+            if ($dst -in 'SUSPECT', 'RECOVERY_PENDING', 'EMERGENCY') { AddI 'Krytyczny' 'SQL Server' "$($r.Check): stan $dst – baza niedostępna" 'AppRoles'; SetFlag $r 'crit'; continue }
+            if ($dst -ne 'ONLINE') { SetFlag $r 'info'; continue }   # OFFLINE, RESTORING (log shipping, AG) – zwykle celowo
+            if ($db -in 'model') { continue }
+            if ("$($r._BackupDays)" -eq '' -or [double]$r._BackupDays -gt $C.BackupCritDays) { if (-not $sqlNoBak.ContainsKey($inst)) { $sqlNoBak[$inst] = New-Object System.Collections.Generic.List[string] }; $sqlNoBak[$inst].Add($db); SetFlag $r 'warn' }
+            elseif ("$($r._Recovery)" -ne 'SIMPLE' -and ("$($r._LogHours)" -eq '' -or [double]$r._LogHours -gt $C.SqlLogBackupHours)) { if (-not $sqlNoLog.ContainsKey($inst)) { $sqlNoLog[$inst] = New-Object System.Collections.Generic.List[string] }; $sqlNoLog[$inst].Add($db); SetFlag $r 'warn' }
+        } else {
+            $cat = if ("$($r.Role)") { "$($r.Role)" } else { 'Role' }
+            switch ($r.Status) {
+                'Krytyczne' { AddI 'Krytyczny' $cat "$($r.Check): $($r.Value)" 'AppRoles'; SetFlag $r 'crit' }
+                'Uwaga'     { AddI 'Ostrzeżenie' $cat "$($r.Check): $($r.Value)" 'AppRoles'; SetFlag $r 'warn' }
+                'Info'      { SetFlag $r 'info' }
+            }
+        }
+    }
+    foreach ($k in $sqlNoBak.Keys) { AddI 'Ostrzeżenie' 'SQL Server' "$k – bazy bez kopii danych od ponad $($C.BackupCritDays) dni ($($sqlNoBak[$k].Count)): $(Join-Short $sqlNoBak[$k] 8)" 'AppRoles' }
+    foreach ($k in $sqlNoLog.Keys) { AddI 'Ostrzeżenie' 'SQL Server' "$k – bazy w modelu FULL bez kopii dziennika od ponad $($C.SqlLogBackupHours) h, dziennik transakcji rośnie ($($sqlNoLog[$k].Count)): $(Join-Short $sqlNoLog[$k] 8)" 'AppRoles' }
 
     # Kontroler domeny (ten sam układ co konfiguracja bezpieczeństwa)
     foreach ($r in $D.DomainController) {
@@ -7008,9 +7154,9 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
     # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup' -and -not $D.PSObject.Properties[$Key]) { return $false }
-    if ($Key -eq 'Backup' -and -not @($D.Backup | Where-Object { $_ }).Count) { return $false }   # brak oprogramowania kopii na serwerze
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Backup', 'AppRoles' -and -not @($D.$Key | Where-Object { $_ }).Count) { return $false }   # brak oprogramowania kopii / ról na serwerze
     $true
 }
 function Get-WorstFlag($Rows) {

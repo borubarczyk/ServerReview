@@ -16,6 +16,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Niedostępne serwery](#niedostępne-serwery)
 - [Hyper-V i klastry](#hyper-v-i-klastry)
 - [Kopie zapasowe](#kopie-zapasowe)
+- [Role aplikacyjne: SQL Server, IIS, DHCP, DNS](#role-aplikacyjne-sql-server-iis-dhcp-dns)
 - [Bezpieczeństwo: utwardzenie, Active Directory](#bezpieczeństwo-utwardzenie-active-directory)
 - [Podatności (CVE)](#podatności-cve)
 - [Wykrywane problemy](#wykrywane-problemy)
@@ -42,9 +43,10 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 | **Oprogramowanie** | zainstalowane programy, ostatnie aktualizacje (KB) |
 | **Kontroler domeny** | SYSVOL/DFSR, replikacja AD, podpisywanie LDAP i channel binding, wyjątki bezpiecznego kanału Netlogon, konta i usługi wymagające Kerberos RC4 (zdarzenia KDCSVC 201–209) |
 | **Active Directory** | ocena raz na domenę: krbtgt, delegowanie, prawa replikacji (DCSync), AS-REP roasting i Kerberoasting kont uprzywilejowanych, grupy uprzywilejowane, LAPS, zaufania, hasła w SYSVOL (GPP cpassword i skrypty), zasady haseł, sIDHistory i inne |
+| **Role aplikacyjne** | SQL Server (wersja i koniec wsparcia, usługi, bazy danych: stan, model odzyskiwania, ostatnia kopia danych i dziennika), IIS (witryny, pule aplikacji, certyfikaty powiązań HTTPS), DHCP (zajętość zakresów, przełączanie awaryjne), DNS (przekierowania, oczyszczanie rekordów, strefy z niezabezpieczoną aktualizacją dynamiczną) – [szczegóły](#role-aplikacyjne-sql-server-iis-dhcp-dns) |
 | **Hyper-V** | pojemność hosta (vCPU na procesor logiczny, RAM przydzielony maszynom, wolna pamięć), maszyny wirtualne ze stanem, heartbeatem, systemem gościa i adresami IP (z usług integracji), checkpointy, dyski VM i zapas miejsca na ich wzrost, replikacja, ustawienia startu, klaster pracy awaryjnej (węzły, wolumeny CSV, role maszyn, kworum) |
 
-Sekcje kontrolera domeny, Active Directory i Hyper-V pokazują się tylko na serwerach z tą rolą. Hasła wpisane w linię poleceń usług, zadań, autostartu i subskrypcji WMI (np. `-P haslo`, `password=…`) są maskowane już na serwerze i nie trafiają do migawek, raportów ani plików CSV.
+Sekcje kontrolera domeny, Active Directory, ról aplikacyjnych i Hyper-V pokazują się tylko na serwerach z tą rolą. Hasła wpisane w linię poleceń usług, zadań, autostartu i subskrypcji WMI (np. `-P haslo`, `password=…`) są maskowane już na serwerze i nie trafiają do migawek, raportów ani plików CSV.
 
 ## Wymagania
 
@@ -226,6 +228,25 @@ Wynik zadania Veeam program odczytuje z poziomu zdarzenia (informacja, ostrzeże
 
 Maszyny wirtualne kopiowane na poziomie hosta (np. przez Veeam B&R albo kopię Hyper-V) nie mają w sobie śladu kopii i sekcji nie pokazują – brak sekcji nie jest problemem. Kopii migawkowych woluminów (VSS) program celowo nie odczytuje: takie zapytania są typowe dla złośliwego oprogramowania i bywają blokowane przez antywirusy.
 
+## Role aplikacyjne: SQL Server, IIS, DHCP, DNS
+
+Sekcja **Role: SQL Server, IIS, DHCP, DNS** zbiera dane tylko z ról zainstalowanych na serwerze.
+
+**SQL Server.** Instancje i wersje program odczytuje z rejestru, a stan usług (silnik i SQL Server Agent) z WMI. Wersja po końcu wsparcia Microsoft to problem krytyczny, mniej niż rok do końca – ostrzeżenie. Listę baz i historię kopii (`msdb.dbo.backupset`) program pobiera zapytaniem tylko do odczytu, z uwierzytelnianiem Windows konta skanującego. Gdy to konto nie ma loginu w SQL Server, sekcja pokazuje tylko instancje i usługi z adnotacją „nie odczytano”. Wykrywane problemy:
+
+- baza w stanie `SUSPECT`, `RECOVERY_PENDING` albo `EMERGENCY` – krytyczny;
+- bazy bez kopii danych (pełnej albo różnicowej) od ponad 7 dni (próg kopii zapasowych z Ustawień) – jedno ostrzeżenie na instancję z listą baz;
+- bazy w modelu `FULL`/`BULK_LOGGED` bez kopii dziennika od ponad 24 h – dziennik transakcji rośnie bez końca;
+- zatrzymana usługa silnika (krytyczny) albo SQL Server Agent (ostrzeżenie) z uruchamianiem automatycznym.
+
+Bazy `OFFLINE` i `RESTORING` (np. log shipping) są tylko oznaczane. Kopie robione narzędziami zgodnymi z VSS (np. Veeam) są zapisywane w `msdb`, więc się liczą. Na replikach pomocniczych grup dostępności kopie mogą być robione na innym węźle – takie ostrzeżenia można wyciszyć.
+
+**IIS.** Witryny i pule aplikacji, które powinny startować automatycznie, a są zatrzymane – ostrzeżenie. Certyfikat powiązania HTTPS wygasły albo brakujący w magazynie – krytyczny, wygasający w ciągu 30 dni – ostrzeżenie.
+
+**DHCP.** Zajętość każdego aktywnego zakresu IPv4: od 85% ostrzeżenie, od 95% krytyczny (progi w Ustawieniach). Relacja przełączania awaryjnego w stanie innym niż `Normal` – ostrzeżenie.
+
+**DNS.** Strefa podstawowa przyjmująca niezabezpieczone aktualizacje dynamiczne (`NonsecureAndSecure`) – ostrzeżenie, bo każdy komputer w sieci może podmienić w niej rekordy. Wyłączone oczyszczanie przestarzałych rekordów jest oznaczane informacyjnie; przekierowania i starzenie rekordów w strefach są widoczne w tabeli.
+
 ## Bezpieczeństwo: utwardzenie, Active Directory
 
 ### Utwardzenie i status „Zalecenie”
@@ -289,6 +310,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - Windows nieaktywowany z okresem prolongaty krótszym niż 7 dni; aktywacja KMS wygasa za mniej niż 30 dni;
 - brak poprawek Windows dla podatności aktywnie wykorzystywanych (oznaczonych przez Microsoft albo w katalogu CISA KEV);
 - dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
+- role: baza SQL niedostępna (SUSPECT, RECOVERY_PENDING), zatrzymany silnik SQL Server, SQL Server po końcu wsparcia, certyfikat HTTPS witryny IIS wygasły albo brakujący, zakres DHCP zajęty w co najmniej 95%;
 - brak udanej kopii zapasowej (Windows Server Backup, zadanie Veeam) od co najmniej 7 dni albo w ogóle w dostępnej historii;
 - krytyczne ustawienia bezpieczeństwa: wyłączona ochrona w czasie rzeczywistym, sygnatury antywirusa starsze niż 7 dni, włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0, Point and Print bez ostrzeżeń i uprawnień administratora, urząd certyfikacji z `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6);
 - w grupie Administratorzy jest grupa obejmująca wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy domeny i podobne);
@@ -310,6 +332,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - zdarzenia krytyczne w dziennikach, nieoczekiwane wyłączenia (z odesłaniem do sekcji Przestoje), pojedyncza awaria BSOD, pliki zrzutów pamięci;
 - co najmniej 25 nieudanych logowań, utworzenie lub usunięcie konta, dodanie do grupy, włączone konto Gość;
 - certyfikaty wygasające w ciągu 30 dni;
+- role: bazy SQL bez kopii danych od tygodnia albo bez kopii dziennika od doby, zatrzymany SQL Server Agent, SQL Server z końcem wsparcia w ciągu roku, zatrzymana witryna lub pula aplikacji IIS, certyfikat HTTPS witryny wygasający w 30 dni, zakres DHCP zajęty w co najmniej 85%, przełączanie awaryjne DHCP poza stanem Normal, strefa DNS z niezabezpieczoną aktualizacją dynamiczną;
 - pełny dziennik zdarzeń, dziennik Security obejmujący krótszy okres niż analiza, niepełna polityka audytu;
 - zużycie SSD co najmniej 90%, nieskorygowane błędy dysków, błędy dysku i NTFS, co najmniej 10 ponowień lub resetów operacji dyskowych;
 - porty wrażliwe otwarte z dowolnego adresu, gdy karta sieciowa jest w profilu Publicznym;
@@ -460,6 +483,14 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | BSOD: krytyczne od [liczba w okresie] | 2 |
 | Kopia zapasowa: ostrzeżenie, gdy ostatnia udana starsza niż [dni] | 2 |
 | Kopia zapasowa: krytyczne, gdy ostatnia udana starsza niż [dni] | 7 |
+
+**Progi: role (SQL, DHCP)**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| SQL: baza w modelu FULL bez kopii dziennika – ostrzeżenie po [godzinach] | 24 |
+| DHCP: zajętość zakresu – ostrzeżenie od [%] | 85 |
+| DHCP: zajętość zakresu – krytyczne od [%] | 95 |
 
 **Progi: bezpieczeństwo**
 
