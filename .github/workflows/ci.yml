@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Kontrola skryptu
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kodowanie (UTF-8 z BOM, CRLF)
+        shell: powershell
+        run: |
+          $b = [IO.File]::ReadAllBytes("$PWD\ServerReview.ps1")
+          if ($b.Length -lt 3 -or $b[0] -ne 0xEF -or $b[1] -ne 0xBB -or $b[2] -ne 0xBF) {
+            Write-Output '::error file=ServerReview.ps1::Plik musi być zapisany jako UTF-8 z BOM (polskie znaki w Windows PowerShell 5.1)'; exit 1
+          }
+          $t = [Text.Encoding]::UTF8.GetString($b)
+          $lf = ([regex]::Matches($t, '(?<!\r)\n')).Count
+          if ($lf) { Write-Output "::error file=ServerReview.ps1::$lf linii kończy się samym LF zamiast CRLF"; exit 1 }
+
+      - name: Składnia (parser Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          $tokens = $null; $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\ServerReview.ps1", [ref]$tokens, [ref]$errs)
+          foreach ($e in $errs) { Write-Output "::error file=ServerReview.ps1,line=$($e.Extent.StartLineNumber),col=$($e.Extent.StartColumnNumber)::$($e.Message)" }
+          if ($errs) { exit 1 }
+          "Wersja: $($PSVersionTable.PSVersion) – bez błędów składni"
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.23.0 -Scope CurrentUser -Force
+          # Błędy plus reguły wykrywające realne pomyłki (nie styl): przypisanie do zmiennej automatycznej ($input, $args, $_ …),
+          # '=' zamiast '-eq' w warunku, '>' zamiast '-gt', zła składnia wywołania polecenia, wiszący znak ` na końcu linii
+          $rules = 'PSAvoidAssignmentToAutomaticVariable', 'PSPossibleIncorrectUsageOfAssignmentOperator', 'PSPossibleIncorrectUsageOfRedirectionOperator',
+                   'PSUseCmdletCorrectly', 'PSMisleadingBacktick'
+          $res = @(Invoke-ScriptAnalyzer -Path .\ServerReview.ps1 -Severity Error)
+          $res += @(Invoke-ScriptAnalyzer -Path .\ServerReview.ps1 -IncludeRule $rules)
+          foreach ($r in $res) { Write-Output "::error file=ServerReview.ps1,line=$($r.Line),col=$($r.Column),title=$($r.RuleName)::$($r.Message)" }
+          if ($res.Count) { "Znaleziono: $($res.Count)"; exit 1 }
+          'PSScriptAnalyzer: bez uwag'
+
+      - name: Kolektor uruchomiony lokalnie na runnerze
+        shell: powershell
+        run: |
+          # Kolektor ($Collector) wyjęty z drzewa składni i uruchomiony na maszynie runnera (Windows Server, konto administratora)
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\ServerReview.ps1", [ref]$null, [ref]$null)
+          $as = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$Collector' }, $true)
+          if (-not $as) { Write-Output '::error::Nie znaleziono $Collector'; exit 1 }
+          $collector = & ([scriptblock]::Create($as.Right.Extent.Text))
+          $out = @(& $collector 7 @('C:\Windows\Temp') 1000 $false @() @(445, 3389, 5985))
+          $json = $out | Where-Object { $_ -is [string] -and $_.StartsWith('{') } | Select-Object -Last 1
+          if (-not $json) { Write-Output '::error::Kolektor nie zwrócił JSON'; $out | Select-Object -First 20; exit 1 }
+          $d = $json | ConvertFrom-Json
+          if ($d.PSObject.Properties['Fatal']) { Write-Output "::error::Kolektor przerwał pracę: $($d.Fatal)"; exit 1 }
+          "Czas: $($d.DurationSec) s, rozmiar JSON: $([math]::Round($json.Length / 1KB)) KB"
+          $d.Timings | Select-Object -First 10 | Format-Table -AutoSize | Out-String
+          foreach ($e in @($d.Errors)) { Write-Output "::warning::Sprawdzenie nie wykonane: $e" }
+          $sys = $d.System
+          "System: $($sys.OS) $($sys.Build); aktywacja: $($sys.LicenseStatus) ($($sys.LicenseChannel))"
+          foreach ($k in 'Backup', 'AppRoles') { "${k}: $(@($d.$k | Where-Object { $_ }).Count) wierszy" }
+          # nowe sekcje nie mogą kończyć się błędem na czystym systemie
+          $bad = @($d.Errors | Where-Object { "$_" -match '^(Kopie zapasowe|Role aplikacyjne|Aktywacja Windows):' })
+          if ($bad.Count) { exit 1 }
