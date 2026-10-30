@@ -92,6 +92,8 @@ $Config = [ordered]@{
     DiskWearWarnPct        = 90       # zużycie SSD wg licznika niezawodności [%]
     DiskRetryWarn          = 10       # tyle zdarzeń 129/153/157 (reset/ponowienie I/O) w okresie = ostrzeżenie
     BugCheckCritCount      = 2        # tyle awarii BSOD w okresie = problem krytyczny
+    DiskForecastDays       = 30       # prognoza: dysk spadnie poniżej progu krytycznego w ciągu tylu dni = ostrzeżenie
+    DiskForecastCritDays   = 7        # prognoza: dysk zapełni się w ciągu tylu dni = problem krytyczny
     BackupWarnDays         = 2        # ostatnia udana kopia zapasowa starsza niż tyle dni = ostrzeżenie
     BackupCritDays         = 7        # ... = problem krytyczny
     ThrottleLimit          = 25       # ile serwerów skanować równolegle
@@ -2005,6 +2007,32 @@ function Merge-PrevSections {
     $Prev
 }
 
+function Add-DiskHistory {
+    <#
+        Historia zajętości dysków zapisywana w każdej migawce (DiskHistory): punkty z poprzedniej migawki + bieżący pomiar.
+        Z historii stacja wylicza tempo ubywania miejsca i prognozę zapełnienia. Starsze dni: jeden (ostatni) punkt dysku na dzień.
+        Poprzednia migawka sprzed tej funkcji nie ma historii – jej dyski są pierwszym punktem (czas = data pliku).
+    #>
+    param($Cur, $Prev, [string]$PrevFile, [int]$MaxDays = 90)
+    $pts = New-Object System.Collections.Generic.List[object]
+    if ($Prev -and -not ($Prev.PSObject.Properties['Offline'] -and $Prev.Offline)) {
+        if ($Prev.PSObject.Properties['DiskHistory']) { foreach ($p in @($Prev.DiskHistory)) { if ($p -and $p.T) { $pts.Add($p) } } }
+        elseif ($PrevFile -and (Test-Path -LiteralPath $PrevFile)) {
+            $t = ([IO.File]::GetLastWriteTime($PrevFile)).ToString('yyyy-MM-dd HH:mm')
+            foreach ($r in @($Prev.Disks)) { if ($r -and $r.Drive) { $pts.Add([pscustomobject]@{ T = $t; Drive = "$($r.Drive)"; SizeGB = $r.SizeGB; FreeGB = $r.FreeGB }) } }
+        }
+    }
+    $now = Get-Date
+    if (@($Cur.PSObject.Properties['Skipped'].Value) -notcontains 'Disks' -and @($Cur.PSObject.Properties['Failed'].Value) -notcontains 'Disks') {
+        $t = $now.ToString('yyyy-MM-dd HH:mm')
+        foreach ($r in @($Cur.Disks)) { if ($r -and $r.Drive) { $pts.Add([pscustomobject]@{ T = $t; Drive = "$($r.Drive)"; SizeGB = $r.SizeGB; FreeGB = $r.FreeGB }) } }
+    }
+    $min = $now.AddDays(-$MaxDays).ToString('yyyy-MM-dd HH:mm'); $today = $now.ToString('yyyy-MM-dd')
+    # format yyyy-MM-dd HH:mm porównuje się poprawnie jako tekst
+    [object[]]@($pts | Where-Object { "$($_.T)" -ge $min } | Group-Object { if ("$($_.T)".StartsWith($today)) { "$($_.Drive)|$($_.T)" } else { "$($_.Drive)|$("$($_.T)".Substring(0, 10))" } } |
+        ForEach-Object { @($_.Group | Sort-Object T)[-1] } | Sort-Object Drive, T)
+}
+
 function Get-SnapshotSummary([string]$Path) {
     # Skrót ostatniej udanej migawki (system, adres IP, host Hyper-V) bez parsowania całego pliku – dla serwerów bez połączenia
     $t = Read-SnapshotText $Path
@@ -2713,14 +2741,22 @@ try {
                         $json = ([regex]'"System":\{').Replace($json, '"System":{"TimeOffsetSec":' + $off.ToString([Globalization.CultureInfo]::InvariantCulture) + ',', 1)
                     } catch {}
                 }
+                $res.PrevFile = "$($Opt.PrevFile)"
+                if ($Opt.PrevFile) { try { $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $Opt.PrevFile) $Opt.ArrayKeys } catch {} }
+                # historia zajętości dysków (prognoza zapełnienia) przechodzi z migawki do migawki
+                try {
+                    $hist = Add-DiskHistory $d $res.Prev $Opt.PrevFile
+                    if ($hist.Count) {
+                        $d | Add-Member -NotePropertyName DiskHistory -NotePropertyValue $hist -Force
+                        $json = '{"DiskHistory":' + (ConvertTo-Json -InputObject $hist -Depth 3 -Compress) + ',' + $json.Substring(1)
+                    }
+                } catch {}
+                if ($res.Prev) { try { $res.Prev = Merge-PrevSections $d $res.Prev $Opt.OlderFiles $Opt.DiffKeys $Opt.ArrayKeys } catch {} }
                 $file = Join-Path $Opt.SnapDir ($Opt.SafeName + $(if ($Opt.Compress) { '.json.gz' } else { '.json' }))
                 # błąd zapisu na stacji (pełny dysk, brak uprawnień) nie oznacza niedostępności serwera – dane zostają w pamięci
                 try { Write-SnapshotText $file $json; $res.SnapFile = $file } catch { $res.SnapError = "$($_.Exception.Message)" }
                 $res.Data = $d
                 $res.Ok = $true
-                $res.PrevFile = "$($Opt.PrevFile)"
-                if ($Opt.PrevFile) { try { $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $Opt.PrevFile) $Opt.ArrayKeys } catch {} }
-                if ($res.Prev) { try { $res.Prev = Merge-PrevSections $d $res.Prev $Opt.OlderFiles $Opt.DiffKeys $Opt.ArrayKeys } catch {} }
             }
         }
         if (-not $res.Ok -and $res.ErrorId -in 'CollectorFatal', 'ParseError', 'NoData') {
@@ -2783,7 +2819,7 @@ try {
 $res.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 [pscustomobject]$res
 '@
-$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics', 'Test-RemotingTransportError', 'Add-SnapshotErrors',
+$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Add-DiskHistory', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics', 'Test-RemotingTransportError', 'Add-SnapshotErrors',
     'ConvertTo-CveDate', 'Get-CveAgeHours', 'Invoke-CveApi', 'ConvertTo-CveRow', 'Sync-CveProduct', 'Sync-CveExploited', 'Sync-CveKev', 'New-CveIndex', 'Set-CveIndexFlags', 'Sync-CveData'
 # Pełna definicja funkcji z drzewa składni (razem z deklaracją parametrów)
 $script:WorkerScript = $script:WorkerParams + "`n" + ((@($script:WorkerFunctionNames | ForEach-Object { (Get-Item "function:$_").ScriptBlock.Ast.Extent.Text })) -join "`n`n") + "`n" + $script:WorkerBody
@@ -2910,7 +2946,7 @@ $script:Headers = @{
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
     Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
     Product = 'Produkt'; Job = 'Zadanie'; LastResult = 'Ostatni wynik'; LastSuccess = 'Ostatnia udana'; SuccessAgeDays = 'Dni od udanej'
-    RunAgeDays = 'Dni od uruchomienia'; Runs = 'Uruchomienia'; Failures = 'Nieudane'; Target = 'Miejsce docelowe'
+    GrowthGBDay = 'Ubywa [GB/dzień]'; FullInDays = 'Pełny za [dni]'; RunAgeDays = 'Dni od uruchomienia'; Runs = 'Uruchomienia'; Failures = 'Nieudane'; Target = 'Miejsce docelowe'
     # pola ze starszych migawek (wersja z sekcją Ochrona)
     AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'; FirewallManagedBy = 'Zapora zarządzana przez'; PartOfDomain = 'W domenie'
 }
@@ -3208,6 +3244,8 @@ $script:SettingDefs = @(
     @{ Group = 'Skan'; Key = 'RetryFailed';            Type = 'bool';                           Label = 'Po skanie ponów raz serwery z błędem, który może być chwilowy (restart, przeciążony WinRM)' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskWarnPct';       Type = 'int'; Min = 1; Max = 99;     Label = 'Dysk: ostrzeżenie poniżej [% wolnego]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskCritPct';       Type = 'int'; Min = 1; Max = 99;     Label = 'Dysk: krytyczne poniżej [% wolnego]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastDays';     Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: ostrzeżenie, gdy spadnie poniżej progu krytycznego w ciągu [dni]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastCritDays'; Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: krytyczne, gdy zapełni się w ciągu [dni]' }
     @{ Group = 'Progi: system i dyski'; Key = 'RamWarnPct';        Type = 'int'; Min = 1; Max = 100;    Label = 'RAM: ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'CommitWarnPct';     Type = 'int'; Min = 1; Max = 100;    Label = 'Pamięć wirtualna (commit): ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'UptimeWarnDays';    Type = 'int'; Min = 1; Max = 3650;   Label = 'Uptime: ostrzeżenie powyżej [dni]' }
@@ -3433,10 +3471,43 @@ function Invoke-ServerAnalysis {
     if ($D.PSObject.Properties['_ScanNote'] -and $D._ScanNote) { AddI 'Ostrzeżenie' 'Skan' "$($D._ScanNote)" 'History' }
 
     # Dyski
+    # Prognoza: regresja liniowa wolnego miejsca z historii migawek (DiskHistory) z ostatnich 30 dni, tylko przy niezmienionym rozmiarze dysku
+    $dHist = @{}
+    foreach ($p in @($D.PSObject.Properties['DiskHistory'].Value)) { if ($p -and $p.Drive) { $k = "$($p.Drive)".ToLowerInvariant(); if (-not $dHist.ContainsKey($k)) { $dHist[$k] = New-Object System.Collections.Generic.List[object] }; $dHist[$k].Add($p) } }
+    $hNow = Get-Date
     foreach ($r in $D.Disks) {
         $msg = "Dysk $($r.Drive) $($r.Label): wolne $($r.FreePct)% ($($r.FreeGB) z $($r.SizeGB) GB)"
         if ($r.FreePct -lt $C.DiskCritPct) { AddI 'Krytyczny' 'Dyski' $msg 'Disks'; SetFlag $r 'crit' }
         elseif ($r.FreePct -lt $C.DiskWarnPct) { AddI 'Ostrzeżenie' 'Dyski' $msg 'Disks'; SetFlag $r 'warn' }
+        $full = ''; $rate = ''
+        $pts = @($dHist["$($r.Drive)".ToLowerInvariant()] | Where-Object { $_ })
+        $xs = New-Object System.Collections.Generic.List[double]; $ys = New-Object System.Collections.Generic.List[double]
+        foreach ($p in $pts) {
+            $t = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact("$($p.T)", 'yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$t)) { continue }
+            $age = ($hNow - $t).TotalDays
+            if ($age -gt 30 -or "$($p.FreeGB)" -eq '' -or [math]::Abs([double]$p.SizeGB - [double]$r.SizeGB) -gt [math]::Max(1, [double]$r.SizeGB * 0.02)) { continue }
+            $xs.Add(-$age); $ys.Add([double]$p.FreeGB)
+        }
+        if ($xs.Count -ge 3 -and (($xs | Measure-Object -Maximum -Minimum) | ForEach-Object { $_.Maximum - $_.Minimum }) -ge 2) {
+            $mx = ($xs | Measure-Object -Average).Average; $my = ($ys | Measure-Object -Average).Average
+            $sxy = 0.0; $sxx = 0.0
+            for ($i = 0; $i -lt $xs.Count; $i++) { $sxy += ($xs[$i] - $mx) * ($ys[$i] - $my); $sxx += ($xs[$i] - $mx) * ($xs[$i] - $mx) }
+            $b = if ($sxx -gt 0) { $sxy / $sxx } else { 0 }   # GB na dzień (ujemne = ubywa)
+            $span = ($xs | Measure-Object -Maximum -Minimum) | ForEach-Object { $_.Maximum - $_.Minimum }
+            if ($b -lt 0 -and -$b * $span -ge 1) {
+                $free = [double]$r.FreeGB
+                $dFull = [math]::Floor($free / -$b)
+                $dCrit = [math]::Floor(($free - [double]$r.SizeGB * $C.DiskCritPct / 100) / -$b)
+                $full = [int]$dFull; $rate = [math]::Round(-$b, 2)
+                $tm = "ubywa ok. $rate GB/dzień (trend z $([math]::Round($span)) dni), wolne $free GB"
+                if ($r.FreePct -lt $C.DiskCritPct) { }
+                elseif ($dFull -le $C.DiskForecastCritDays) { AddI 'Krytyczny' 'Dyski' "Dysk $($r.Drive) $($r.Label) zapełni się za ok. $dFull dni – $tm" 'Disks'; SetFlag $r 'crit' }
+                elseif ($dCrit -le $C.DiskForecastDays) { AddI 'Ostrzeżenie' 'Dyski' "Dysk $($r.Drive) $($r.Label) spadnie poniżej $($C.DiskCritPct)% wolnego za ok. $([math]::Max(0, $dCrit)) dni, zapełni się za ok. $dFull dni – $tm" 'Disks'; SetFlag $r 'warn' }
+            }
+        }
+        $r | Add-Member -NotePropertyName GrowthGBDay -NotePropertyValue $rate -Force
+        $r | Add-Member -NotePropertyName FullInDays -NotePropertyValue $full -Force
     }
 
     # Usługi

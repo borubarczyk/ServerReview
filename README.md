@@ -263,7 +263,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 
 - serwer nie odpowiada (z przyczyną z [diagnozy](#niedostępne-serwery)); maszyna wirtualna serwera wstrzymana (Paused) albo w stanie krytycznym na hoście;
 - host Hyper-V nie odpowiada razem z co najmniej 2 maszynami z listy, które na nim działały; nie odpowiada większość serwerów jednej podsieci; żaden serwer nie odpowiedział z powodu sieci stacji;
-- mniej niż 10% wolnego miejsca na dysku (także punkty montowania i wolumeny CSV);
+- mniej niż 10% wolnego miejsca na dysku (także punkty montowania i wolumeny CSV); dysk zapełni się w ciągu 7 dni przy obecnym tempie ([prognoza](#prognoza-zapełnienia-dysków));
 - nieudane logowania z adresów publicznych, czyli logowanie (RDP/SMB) jest prawdopodobnie dostępne z internetu;
 - wyczyszczony dziennik zdarzeń;
 - różnica czasu względem stacji co najmniej 300 s (limit Kerberos);
@@ -281,7 +281,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 **Ostrzeżenie**
 
 - skan serwera przekroczył limit czasu (pokazane są poprzednie dane); serwer odpowiada, ale kolektor zakończył się błędem; maszyna wirtualna serwera wyłączona (do 30 dni) lub zapisana; niedostępny gość niedostępnego hosta Hyper-V;
-- mniej niż 20% wolnego miejsca na dysku;
+- mniej niż 20% wolnego miejsca na dysku; dysk spadnie poniżej 10% wolnego w ciągu 30 dni przy obecnym tempie;
 - uptime powyżej 45 dni, oczekujący restart, brak aktualizacji od ponad 45 dni;
 - brak poprawek Windows dla podatności krytycznych;
 - użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci (na hoście Hyper-V zamiast progu RAM liczy się zapas wolnej pamięci: mniej niż 8 GB);
@@ -355,6 +355,12 @@ Nowe pozycje są zgłaszane jako ostrzeżenia, a w przypadku oprogramowania jako
 
 Pierwszy skan po aktualizacji programu do nowej wersji kolektora nie jest porównywany – zmiany są pokazywane od kolejnego skanu.
 
+### Prognoza zapełnienia dysków
+
+Każda migawka przechowuje historię zajętości dysków z ostatnich 90 dni (jeden pomiar na dzień, a z dnia bieżącego wszystkie). Na jej podstawie program liczy tempo ubywania miejsca (regresja liniowa z ostatnich 30 dni) i w sekcji **Dyski** pokazuje kolumny „Ubywa [GB/dzień]” i „Pełny za [dni]”.
+
+Prognoza powstaje, gdy są co najmniej 3 pomiary z okresu dłuższego niż 2 dni, a miejsca ubyło łącznie co najmniej 1 GB. Pomiary sprzed zmiany rozmiaru dysku są pomijane. Historia zaczyna się od pierwszego skanu po aktualizacji programu (pierwszym punktem jest poprzednia migawka), więc pierwsze prognozy pojawiają się po kilku dniach skanowania.
+
 ## Raport HTML
 
 Menu **Raport** ma dwie wersje raportu:
@@ -420,6 +426,8 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 |---|---|
 | Dysk: ostrzeżenie poniżej [% wolnego] | 20 |
 | Dysk: krytyczne poniżej [% wolnego] | 10 |
+| Prognoza dysku: ostrzeżenie, gdy spadnie poniżej progu krytycznego w ciągu [dni] | 30 |
+| Prognoza dysku: krytyczne, gdy zapełni się w ciągu [dni] | 7 |
 | RAM: ostrzeżenie od [%] | 90 |
 | Pamięć wirtualna (commit): ostrzeżenie od [%] | 90 |
 | Uptime: ostrzeżenie powyżej [dni] | 45 |
