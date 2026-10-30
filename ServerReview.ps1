@@ -385,6 +385,24 @@ $Collector = {
     $sys.IsHyperV  = [bool](Get-Service vmms -ErrorAction SilentlyContinue)
     try { $sys.TimeZone = [TimeZoneInfo]::Local.Id } catch { $sys.TimeZone = '' }   # Get-TimeZone jest dopiero w PS 5.1
     $sys.PSVersion = $PSVersionTable.PSVersion.ToString()
+    # Aktywacja Windows (licencja systemu): stan, kanał (Retail/OEM/KMS/MAK/AVMA) i dni do końca okresu (KMS: do wygaśnięcia aktywacji)
+    $sys.LicenseStatus = ''; $sys.LicenseStatusId = $null; $sys.LicenseChannel = ''; $sys.LicenseGraceDays = $null; $sys.KmsHost = ''
+    $t0 = $sw.Elapsed.TotalSeconds
+    try {
+        $lp = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop |
+                Where-Object { "$($_.Name)" -like 'Windows*' } | Sort-Object LicenseStatus -Descending)
+        $lic = @($lp | Where-Object { [int]$_.LicenseStatus -eq 1 }) + @($lp) | Select-Object -First 1
+        if ($lic) {
+            $lsMap = @{ 0 = 'brak aktywacji'; 1 = 'aktywowany'; 2 = 'okres prolongaty (OOB)'; 3 = 'okres prolongaty (zmiana sprzętu)'; 4 = 'okres prolongaty (nieoryginalny)'; 5 = 'powiadomienia (brak aktywacji)'; 6 = 'przedłużona prolongata' }
+            $sys.LicenseStatusId = [int]$lic.LicenseStatus
+            $sys.LicenseStatus   = if ($lsMap.ContainsKey([int]$lic.LicenseStatus)) { $lsMap[[int]$lic.LicenseStatus] } else { "kod $($lic.LicenseStatus)" }
+            $m = [regex]::Match("$($lic.Description)", '([A-Z_]+) channel')
+            $sys.LicenseChannel  = if ($m.Success) { $m.Groups[1].Value } else { Short "$($lic.Description)" 80 }
+            if ([int64]$lic.GracePeriodRemaining -gt 0) { $sys.LicenseGraceDays = [math]::Round([int64]$lic.GracePeriodRemaining / 1440, 1) }
+            $sys.KmsHost = if ($lic.KeyManagementServiceMachine) { "$($lic.KeyManagementServiceMachine)" } elseif ($lic.PSObject.Properties['DiscoveredKeyManagementServiceMachineName'] -and $lic.DiscoveredKeyManagementServiceMachineName) { "$($lic.DiscoveredKeyManagementServiceMachineName)" } else { '' }
+        }
+    } catch { $errs.Add("Aktywacja Windows: $($_.Exception.Message)") }
+    $timings['Aktywacja Windows'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
 
     # ── Konfiguracja bezpieczeństwa ──
     $hard = New-Object System.Collections.Generic.List[object]
@@ -2936,6 +2954,7 @@ $script:Headers = @{
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
     LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Host Hyper-V'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
+    LicenseStatus = 'Aktywacja Windows'; LicenseStatusId = 'Aktywacja (kod)'; LicenseChannel = 'Kanał licencji'; LicenseGraceDays = 'Aktywacja: pozostało dni'; KmsHost = 'Serwer KMS'
     Subcategory = 'Podkategoria'; Guid = 'GUID'; Setting = 'Ustawienie'; Required = 'Wymagane'
     MaxSizeMB = 'Rozmiar maks. [MB]'; UsedMB = 'Zajęte [MB]'; Mode = 'Tryb'; Records = 'Liczba zdarzeń'; Full = 'Pełny'; Oldest = 'Najstarsze zdarzenie'; CoveredDays = 'Pokrycie [dni]'
     Code = 'Kod'; Health = 'Stan'; WearPct = 'Zużycie [%]'; TempC = 'Temp. [°C]'; UncorrectedErrors = 'Błędy nieskorygowane'; PowerOnHours = 'Godziny pracy'
@@ -3489,6 +3508,18 @@ function Invoke-ServerAnalysis {
             if ($freeGB -lt $C.HvHostMinFreeGB) { AddI 'Ostrzeżenie' 'Hyper-V' "Na hoście zostało $freeGB GB wolnej pamięci (maszyny: $($s.HvRamAssignedGB) GB, system hosta: ok. $rootGB GB z $($s.RamGB) GB) – kolejne maszyny i migracje się nie uruchomią" 'HvHost' }
         }
         elseif ($s.RamUsedPct -ge $C.RamWarnPct) { AddI 'Ostrzeżenie' 'Zasoby' "Wysokie użycie RAM: $($s.RamUsedPct)% z $($s.RamGB) GB" 'System' }
+        # Aktywacja Windows: brak aktywacji lub prolongata; KMS odnawia aktywację co 7 dni (180 dni ważności) – mniej niż 150 dni = odnawianie nie działa od miesiąca
+        if ($s.PSObject.Properties['LicenseStatusId'] -and "$($s.LicenseStatusId)" -ne '') {
+            $lg = if ("$($s.LicenseGraceDays)" -ne '') { [double]$s.LicenseGraceDays } else { $null }
+            $lid = [int]$s.LicenseStatusId
+            if ($lid -ne 1) {
+                $sv = if ($null -ne $lg -and $lg -le 7) { 'Krytyczny' } else { 'Ostrzeżenie' }
+                AddI $sv 'System' "Windows nie jest aktywowany: $($s.LicenseStatus)$(if ($null -ne $lg) { ", zostało $([math]::Floor($lg)) dni" }) (kanał $($s.LicenseChannel))" 'System'
+            } elseif ("$($s.LicenseChannel)" -eq 'VOLUME_KMSCLIENT' -and $null -ne $lg -and $lg -lt 150) {
+                $sv = if ($lg -lt 30) { 'Krytyczny' } else { 'Ostrzeżenie' }
+                AddI $sv 'System' "Aktywacja KMS nie odnawia się – wygaśnie za $([math]::Floor($lg)) dni$(if ($s.KmsHost) { " (serwer KMS: $($s.KmsHost))" } else { ' (serwer KMS z DNS: rekord _vlmcs._tcp)' })" 'System'
+            }
+        }
         if ($s.IsHyperV -and $s.PSObject.Properties['HvVmms'] -and "$($s.HvVmms)" -and "$($s.HvVmms)" -ne 'Running') { AddI 'Ostrzeżenie' 'Hyper-V' "Usługa zarządzania Hyper-V (vmms) nie działa ($($s.HvVmms)) – maszyny działają, ale nie da się nimi zarządzać ani ich migrować" 'HvHost' }
     }
     # Ostatni skan nie powiódł się (limit czasu), ale są wcześniejsze dane – pokazujemy je z ostrzeżeniem

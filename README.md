@@ -34,7 +34,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 
 | Obszar | Zbierane dane |
 |---|---|
-| **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, host Hyper-V, na którym działa maszyna |
+| **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, aktywacja Windows (stan, kanał licencji, serwer KMS), host Hyper-V, na którym działa maszyna |
 | **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, kopie zapasowe (Windows Server Backup, Veeam), zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
 | **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-active-directory)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
 | **Podatności (CVE)** | brakujące poprawki Windows: CVE, dla których Microsoft wydał poprawkę nowszą niż zainstalowana, z wyróżnieniem krytycznych i aktywnie wykorzystywanych (Microsoft, CISA KEV) – wylicza stacja z danych pobranych z internetu, [szczegóły](#podatności-cve) |
@@ -286,6 +286,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - wyczyszczony dziennik zdarzeń;
 - różnica czasu względem stacji co najmniej 300 s (limit Kerberos);
 - system po końcu wsparcia Microsoft;
+- Windows nieaktywowany z okresem prolongaty krótszym niż 7 dni; aktywacja KMS wygasa za mniej niż 30 dni;
 - brak poprawek Windows dla podatności aktywnie wykorzystywanych (oznaczonych przez Microsoft albo w katalogu CISA KEV);
 - dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
 - brak udanej kopii zapasowej (Windows Server Backup, zadanie Veeam) od co najmniej 7 dni albo w ogóle w dostępnej historii;
@@ -301,6 +302,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - skan serwera przekroczył limit czasu (pokazane są poprzednie dane); serwer odpowiada, ale kolektor zakończył się błędem; maszyna wirtualna serwera wyłączona (do 30 dni) lub zapisana; niedostępny gość niedostępnego hosta Hyper-V;
 - mniej niż 20% wolnego miejsca na dysku; dysk spadnie poniżej 10% wolnego w ciągu 30 dni przy obecnym tempie;
 - uptime powyżej 45 dni, oczekujący restart, brak aktualizacji od ponad 45 dni;
+- Windows nieaktywowany albo w okresie prolongaty; aktywacja KMS nie odnawia się (zostało mniej niż 150 ze 180 dni – serwer nie odnowił jej od ok. miesiąca);
 - brak poprawek Windows dla podatności krytycznych;
 - użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci (na hoście Hyper-V zamiast progu RAM liczy się zapas wolnej pamięci: mniej niż 8 GB);
 - ostatnia udana kopia zapasowa starsza niż 2 dni, ostatnie uruchomienie zadania kopii zakończone błędem;
