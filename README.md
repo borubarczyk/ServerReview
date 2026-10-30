@@ -90,8 +90,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Narzedzia\ServerRevie
 | `-ReportMode Summary` | raport podsumowujący: problemy, niedostępność, Hyper-V i wiersze wymagające uwagi (domyślnie) |
 | `-ReportMode Full` | raport pełny ze wszystkimi sekcjami każdego serwera |
 | `-NoReport` | bez raportu HTML |
+| `-TestNotify` | tylko wysyła wiadomość testową na skonfigurowane kanały powiadomień i kończy pracę (kod 0 – wysłano, 1 – błąd, 2 – brak konfiguracji) |
 
 Kod wyjścia: **0** – wszystkie serwery odpowiedziały, **1** – część serwerów bez połączenia lub z przekroczonym limitem czasu, **2** – skan się nie odbył (np. brak listy serwerów albo inny skan bez okna z tego folderu jeszcze trwa). Zadanie musi działać na koncie z uprawnieniami administratora na serwerach. Wyniki skanu bez okna widać po otwarciu programu.
+
+### Powiadomienia (e-mail, webhook)
+
+Po skanie bez okna program może wysłać powiadomienie e-mailem (SMTP) i/lub webhookiem – do Slacka, Mattermosta albo Microsoft Teams (przepływ Workflows „Post to a channel when a webhook request is received”). Konfiguracja jest w Ustawieniach, w grupie **Powiadomienia (skan bez okna)**.
+
+- Domyślnie powiadomienie dotyczy tylko **nowych** problemów krytycznych, czyli takich, których nie było w poprzednim powiadomieniu. Ten sam problem nie przychodzi po każdym skanie, a gdy zniknie i wróci, przyjdzie ponownie. Wyciszone problemy są pomijane.
+- Opcjonalnie powiadomienie obejmuje też ostrzeżenia albo wszystkie aktywne problemy przy każdym skanie (wyłącz „tylko o nowych”).
+- Wiadomość zawiera listę problemów (do 100), liczbę wszystkich aktywnych problemów krytycznych i liczbę rozwiązanych od poprzedniego powiadomienia. Do e-maila można dołączyć raport HTML (do 10 MB).
+- Stan ostatniego powiadomienia jest w pliku `Cache\notify_state.json`. Gdy wysyłka się nie uda, stan się nie zmienia i te same problemy zostaną wysłane przy następnym skanie.
+- Serwer SMTP musi przyjmować pocztę bez logowania (typowy wewnętrzny przekaźnik); szyfrowanie STARTTLS jest opcjonalne. Webhook korzysta z proxy ustawionego dla danych CVE albo z proxy systemowego.
+- Adres webhooka zawiera klucz dostępu i jest zapisany w `settings.json` – chroń ten plik jak hasło.
+
+Konfigurację sprawdzisz poleceniem:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ServerReview.ps1 -TestNotify
+```
 
 ## Pierwsze kroki
 
@@ -486,6 +504,21 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | Pobieraj dane CVE ponownie po [godzinach] | 24 |
 | Serwer proxy dla pobierania danych CVE (puste = ustawienia systemowe) | (puste) |
 
+**Powiadomienia (skan bez okna)**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Powiadamiaj tylko o nowych problemach (bez powtarzania tych samych po każdym skanie) | tak |
+| Powiadamiaj także o ostrzeżeniach (domyślnie tylko problemy krytyczne) | nie |
+| Serwer SMTP | (puste – bez e-maila) |
+| Port SMTP | 25 |
+| SMTP: szyfrowanie (STARTTLS) | nie |
+| Nadawca | (puste) |
+| Odbiorcy (jeden adres na linię) | (puste) |
+| Dołącz raport HTML do wiadomości | tak |
+| Webhook | (puste – bez webhooka) |
+| Webhook Microsoft Teams (Workflows – karta adaptacyjna) zamiast formatu Slack | nie |
+
 **Listy**
 
 | Ustawienie | Domyślnie |
@@ -513,6 +546,7 @@ Reports\Przeglad_serwerow_RRRRMMDD_GGMM.html      raporty HTML
 Logs\ServerReview_RRRRMMDD.log                    dziennik operacji
 Logs\Availability_RRRRMM.csv                      dziennik dostępności
 Cache\cve_*.json.gz                               dane CVE pobrane przez stację (Microsoft, CISA KEV)
+Cache\notify_state.json                           problemy z ostatniego powiadomienia (e-mail, webhook)
 ```
 
 Jeśli skrypt uruchomiono bez pliku (np. wklejony do konsoli), zamiast folderu skryptu używany jest `%USERPROFILE%\Documents\ServerReview`. Jeśli folder skryptu jest tylko do odczytu (np. udział sieciowy), dane trafiają do `%LOCALAPPDATA%\ServerReview`, a lista serwerów i ustawienia są tam kopiowane przy pierwszym uruchomieniu.

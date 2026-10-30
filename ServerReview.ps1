@@ -66,7 +66,8 @@ param(
     [string]$ServerListFile,
     [switch]$Scan,
     [ValidateSet('Summary', 'Full')][string]$ReportMode = 'Summary',
-    [switch]$NoReport
+    [switch]$NoReport,
+    [switch]$TestNotify
 )
 
 #region ── Konfiguracja ─────────────────────────────────────────────────────────
@@ -153,6 +154,17 @@ $Config = [ordered]@{
     CveProxy               = ''      # serwer proxy dla pobierania, np. http://proxy:8080 (puste = ustawienia systemowe)
     # Koniec rozszerzonego wsparcia Microsoft wg numeru kompilacji (bez płatnego ESU)
     OsSupportEnd           = @{ '9200' = '2023-10-10'; '9600' = '2023-10-10'; '14393' = '2027-01-12'; '17763' = '2029-01-09'; '20348' = '2031-10-14'; '26100' = '2034-10-10' }
+    # Powiadomienia po skanie bez okna (-Scan): e-mail (SMTP) i/lub webhook (Slack, Mattermost, Microsoft Teams – Workflows)
+    NotifyOnlyNew          = $true   # tylko gdy pojawiły się nowe problemy krytyczne (względem poprzedniego powiadomienia)
+    NotifyWarnings         = $false  # także nowe ostrzeżenia
+    SmtpServer             = ''      # puste = bez e-maila
+    SmtpPort               = 25
+    SmtpUseSsl             = $false
+    SmtpFrom               = ''
+    SmtpTo                 = @()
+    SmtpAttachReport       = $true   # dołącz raport HTML
+    WebhookUrl             = ''      # puste = bez webhooka
+    WebhookTeams           = $false  # format karty adaptacyjnej (Teams Workflows) zamiast {"text": …}
     # Sekcje pomijane podczas skanu – ustawiane w oknie Ustawienia (puste = skanuj wszystko)
     SkipSections           = @()
     ServerListFile         = Join-Path $Base 'servers.txt'
@@ -171,7 +183,8 @@ $script:AppVersion = '2.0'
 # Tryb bez okna (-Scan) nie potrzebuje STA, ale z PowerShell 7 też przechodzi na 5.1 (czeka na wynik i oddaje kod wyjścia).
 $isCore = $PSVersionTable.PSEdition -eq 'Core'
 $isSta  = [Threading.Thread]::CurrentThread.GetApartmentState() -eq 'STA'
-if ($isCore -or (-not $Scan -and -not $isSta)) {
+$noGui  = $Scan -or $TestNotify   # tryby bez okna nie potrzebują STA
+if ($isCore -or (-not $noGui -and -not $isSta)) {
     if (-not $PSCommandPath) { throw 'Uruchom skrypt jako plik: powershell.exe -STA -File .\ServerReview.ps1' }
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
@@ -182,13 +195,14 @@ if ($isCore -or (-not $Scan -and -not $isSta)) {
     if ($isCore) { $env:PSModulePath = $null }
     $p = $null
     try {
-        if ($Scan) {
-            $argList += @('-Scan', '-ReportMode', $ReportMode)
+        if ($noGui) {
+            if ($Scan) { $argList += @('-Scan', '-ReportMode', $ReportMode) }
             if ($NoReport) { $argList += '-NoReport' }
+            if ($TestNotify) { $argList += '-TestNotify' }
             $p = Start-Process -FilePath $exe -ArgumentList $argList -Wait -PassThru -NoNewWindow
         } else { Start-Process -FilePath $exe -ArgumentList $argList }
     } finally { if ($isCore) { $env:PSModulePath = $pmp } }
-    if ($Scan) { exit $p.ExitCode }
+    if ($noGui) { exit $p.ExitCode }
     return
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -3265,6 +3279,16 @@ $script:SettingDefs = @(
     @{ Group = 'Podatności (CVE)'; Key = 'CveMonths';       Type = 'int'; Min = 1; Max = 36;  Label = 'Dane CVE z ostatnich [miesięcy]' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveRefreshHours'; Type = 'int'; Min = 1; Max = 720; Label = 'Pobieraj dane CVE ponownie po [godzinach]' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveProxy';        Type = 'string'; Hint = 'np. http://proxy.firma.local:8080'; Label = 'Serwer proxy dla pobierania danych CVE (puste = ustawienia systemowe)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'NotifyOnlyNew';    Type = 'bool';   Label = 'Powiadamiaj tylko o nowych problemach (bez powtarzania tych samych po każdym skanie)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'NotifyWarnings';   Type = 'bool';   Label = 'Powiadamiaj także o ostrzeżeniach (domyślnie tylko problemy krytyczne)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpServer';       Type = 'string'; Hint = 'np. smtp.firma.local (puste = bez e-maila)'; Label = 'Serwer SMTP' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpPort';         Type = 'int'; Min = 1; Max = 65535; Label = 'Port SMTP' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpUseSsl';       Type = 'bool';   Label = 'SMTP: szyfrowanie (STARTTLS)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpFrom';         Type = 'string'; Hint = 'np. serverreview@firma.local'; Label = 'Nadawca' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpTo';           Type = 'list';   Label = 'Odbiorcy (jeden adres na linię)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpAttachReport'; Type = 'bool';   Label = 'Dołącz raport HTML do wiadomości' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'WebhookUrl';       Type = 'string'; Hint = 'adres webhooka Slack, Mattermost albo Teams (puste = bez webhooka)'; Label = 'Webhook' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'WebhookTeams';     Type = 'bool';   Label = 'Webhook Microsoft Teams (Workflows – karta adaptacyjna) zamiast formatu Slack' }
     @{ Group = 'Hyper-V'; Key = 'CheckpointWarnDays'; Type = 'int'; Min = 1;  Max = 3650; Label = 'Checkpoint: ostrzeżenie po [dniach]' }
     @{ Group = 'Hyper-V'; Key = 'HostRamWarnPct';     Type = 'int'; Min = 30; Max = 300;  Label = 'Host: RAM przydzielony działającym maszynom – ostrzeżenie od [% RAM hosta]' }
     @{ Group = 'Hyper-V'; Key = 'VcpuRatioWarn';      Type = 'int'; Min = 1;  Max = 64;   Label = 'Host: vCPU działających maszyn na procesor logiczny – ostrzeżenie powyżej' }
@@ -7980,6 +8004,80 @@ function Enter-InstanceMutex([string]$Kind) {
     $null
 }
 function Wait-Operations { while ($script:Ops.Count -or $script:Abandoned.Count) { Update-Operations; if (-not $script:Ops.Count) { break }; Start-Sleep -Milliseconds 300 } }
+# ── Powiadomienia po skanie bez okna: e-mail (SMTP) i webhook ──
+# Stan ostatniego powiadomienia (klucze problemów) w Cache\notify_state.json – „nowe” = nieobecne w poprzednim powiadomieniu
+function Get-NotifyFile { Join-Path $Config.CacheDir 'notify_state.json' }
+function Test-NotifyConfigured { [bool](($Config.SmtpServer -and $Config.SmtpFrom -and @($Config.SmtpTo | Where-Object { $_ }).Count) -or $Config.WebhookUrl) }
+function Send-Notification([string]$Subject, [string]$Body, [string]$Attachment = '') {
+    # Zwraca listę błędów (pusta = wysłano wszystkimi skonfigurowanymi kanałami)
+    $errs = New-Object System.Collections.Generic.List[string]
+    if ($Config.SmtpServer -and $Config.SmtpFrom -and @($Config.SmtpTo | Where-Object { $_ }).Count) {
+        try {
+            $m = @{ SmtpServer = $Config.SmtpServer; Port = $Config.SmtpPort; From = $Config.SmtpFrom; To = [string[]]@($Config.SmtpTo | Where-Object { $_ })
+                    Subject = $Subject; Body = $Body; Encoding = [Text.Encoding]::UTF8; ErrorAction = 'Stop' }
+            if ($Config.SmtpUseSsl) { $m.UseSsl = $true }
+            if ($Attachment -and (Test-Path -LiteralPath $Attachment) -and (Get-Item -LiteralPath $Attachment).Length -lt 10MB) { $m.Attachments = $Attachment }
+            Send-MailMessage @m -WarningAction SilentlyContinue
+            Write-Log "Wysłano powiadomienie e-mail do: $(@($m.To) -join ', ')" 'OK' 'Powiadomienia'
+        } catch { $errs.Add("e-mail: $($_.Exception.Message)") }
+    }
+    if ($Config.WebhookUrl) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $payload = if ($Config.WebhookTeams) {
+                $blocks = @(@{ type = 'TextBlock'; text = $Subject; weight = 'Bolder'; size = 'Medium'; wrap = $true }) +
+                          @($Body -split "`r?`n" | Where-Object { $_ } | Select-Object -First 60 | ForEach-Object { @{ type = 'TextBlock'; text = $_; wrap = $true; spacing = 'None' } })
+                @{ type = 'message'; attachments = @(@{ contentType = 'application/vnd.microsoft.card.adaptive'; content = @{ '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'; type = 'AdaptiveCard'; version = '1.4'; body = $blocks } }) }
+            } else { @{ text = "*$Subject*`n$Body" } }
+            $p = @{ Uri = $Config.WebhookUrl; Method = 'Post'; ContentType = 'application/json; charset=utf-8'; Body = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress)); UseBasicParsing = $true; TimeoutSec = 60; ErrorAction = 'Stop' }
+            if ($Config.CveProxy) { $p.Proxy = $Config.CveProxy; $p.ProxyUseDefaultCredentials = $true }
+            else { try { [Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials } catch { } }
+            [void](Invoke-WebRequest @p)
+            Write-Log 'Wysłano powiadomienie webhook' 'OK' 'Powiadomienia'
+        } catch { $errs.Add("webhook: $($_.Exception.Message)") }
+    }
+    foreach ($e in $errs) { Write-Log "Nie wysłano powiadomienia – $e" 'ERROR' 'Powiadomienia' }
+    $errs.ToArray()
+}
+function Send-ScanNotification([string]$ReportPath) {
+    if (-not (Test-NotifyConfigured)) { return }
+    $maxRank = if ($Config.NotifyWarnings) { 1 } else { 0 }
+    $cur = [ordered]@{}
+    foreach ($k in @($script:Data.Keys)) {
+        $d = $script:Data[$k]
+        foreach ($i in @($d.PSObject.Properties['_Issues'].Value)) { if ($i -and $i.Rank -le $maxRank) { $cur["$k|$($i.IssueKey)"] = $i } }
+    }
+    $old = @{}
+    $f = Get-NotifyFile
+    if (Test-Path -LiteralPath $f) { try { foreach ($x in @((Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json).Keys)) { $old["$x"] = $true } } catch { } }
+    $send = @(foreach ($key in $cur.Keys) { if (-not $Config.NotifyOnlyNew -or -not $old.ContainsKey($key)) { $cur[$key] } })
+    $gone = @($old.Keys | Where-Object { -not $cur.Contains($_) }).Count
+    if ($send.Count) {
+        $crit = @($send | Where-Object { $_.Rank -eq 0 }).Count
+        $srv  = @($send | ForEach-Object { $_.ServerKey } | Select-Object -Unique).Count
+        $what = if ($Config.NotifyOnlyNew) { 'nowe problemy' } else { 'problemy' }
+        $subject = "Przegląd serwerów: $what – krytyczne $crit$(if ($send.Count -gt $crit) { ", ostrzeżenia $($send.Count - $crit)" }) ($srv serw.)"
+        $lines = @($send | Sort-Object Rank, Server | Select-Object -First 100 | ForEach-Object { "[$($_.Severity)] $($_.Server) – $($_.Category): $($_.Message)" })
+        $body = ($lines -join "`r`n")
+        if ($send.Count -gt 100) { $body += "`r`n… i $($send.Count - 100) więcej" }
+        $tot = @($script:Data.Values | ForEach-Object { [int]$_.PSObject.Properties['_Crit'].Value } | Measure-Object -Sum).Sum
+        $body += "`r`n`r`nWszystkich serwerów: $($script:Data.Count), aktywnych problemów krytycznych: $tot$(if ($Config.NotifyOnlyNew -and $gone) { ", rozwiązanych od poprzedniego powiadomienia: $gone" })."
+        if ($ReportPath) { $body += "`r`nRaport: $ReportPath" }
+        $errs = @(Send-Notification $subject $body $(if ($Config.SmtpAttachReport) { $ReportPath } else { '' }))
+        if ($errs.Count) { return }   # stan bez zmian – przy następnym skanie powiadomienie zostanie wysłane ponownie
+    } else { Write-Log "Brak $(if ($Config.NotifyOnlyNew) { 'nowych ' })problemów do powiadomienia" 'INFO' 'Powiadomienia' }
+    try {
+        New-Item -ItemType Directory -Force -Path $Config.CacheDir | Out-Null
+        [IO.File]::WriteAllText($f, ([pscustomobject]@{ Sent = (Get-Date).ToString('s'); Keys = [string[]]@($cur.Keys) } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
+    } catch { Write-Log "Nie zapisano stanu powiadomień: $($_.Exception.Message)" 'WARN' 'Powiadomienia' }
+}
+function Invoke-TestNotification {
+    $script:Headless = $true
+    if (-not (Test-NotifyConfigured)) { Write-Log 'Powiadomienia nie są skonfigurowane (Ustawienia → Powiadomienia).' 'ERROR' 'Powiadomienia'; return 2 }
+    $errs = @(Send-Notification 'Przegląd serwerów: wiadomość testowa' "Powiadomienia działają. Wysłano z $env:COMPUTERNAME ($env:USERDOMAIN\$env:USERNAME), $(Get-NowText).")
+    if ($errs.Count) { return 1 } else { return 0 }
+}
+
 function Invoke-HeadlessScan {
     $script:Headless = $true
     $mx = Enter-InstanceMutex 'Scan'
@@ -8000,13 +8098,16 @@ function Invoke-HeadlessScan {
         Start-Scan @($script:Servers | ForEach-Object { $_.Name }); Wait-Operations
         $st = $script:LastScanState
         if (-not $st) { Write-Log 'Skan się nie odbył.' 'ERROR' 'Skan'; return 2 }
-        if (-not $NoReport) { try { [void](Export-HtmlReport -Mode $ReportMode -NoOpen) } catch { Write-Log "Nie utworzono raportu: $($_.Exception.Message)" 'ERROR' 'Raport' } }
+        $rep = ''
+        if (-not $NoReport) { try { $rep = "$(@(Export-HtmlReport -Mode $ReportMode -NoOpen)[-1])" } catch { Write-Log "Nie utworzono raportu: $($_.Exception.Message)" 'ERROR' 'Raport' } }
+        try { Send-ScanNotification $rep } catch { Write-Log "Błąd powiadomień: $($_.Exception.Message)" 'ERROR' 'Powiadomienia' }
         Remove-OldLogs
         if ($st.Offline -or $st.Timeout -or $st.Cancelled) { return 1 }   # Cancelled: limit czasu całego skanu
         return 0
     } catch { Write-Log "Błąd skanu bez okna: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program'; return 2 }
     finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
 }
+if ($TestNotify) { exit (Invoke-TestNotification) }
 if ($Scan) { exit (Invoke-HeadlessScan) }
 #endregion
 
