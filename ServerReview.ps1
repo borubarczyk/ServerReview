@@ -92,6 +92,8 @@ $Config = [ordered]@{
     DiskWearWarnPct        = 90       # zużycie SSD wg licznika niezawodności [%]
     DiskRetryWarn          = 10       # tyle zdarzeń 129/153/157 (reset/ponowienie I/O) w okresie = ostrzeżenie
     BugCheckCritCount      = 2        # tyle awarii BSOD w okresie = problem krytyczny
+    BackupWarnDays         = 2        # ostatnia udana kopia zapasowa starsza niż tyle dni = ostrzeżenie
+    BackupCritDays         = 7        # ... = problem krytyczny
     ThrottleLimit          = 25       # ile serwerów skanować równolegle
     ServerTimeoutSec       = 300      # limit czasu zbierania danych z JEDNEGO serwera (liczony od chwili, gdy jego skan ruszył)
     ConnectTimeoutSec      = 30       # limit nawiązania połączenia WinRM
@@ -223,6 +225,7 @@ $Collector = {
         Import-Module $m -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null
     }
     if (Get-Service vmms -ErrorAction SilentlyContinue) { Import-Module Hyper-V -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service wbengine -ErrorAction SilentlyContinue) { Import-Module WindowsServerBackup -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
     if (Get-Service ClusSvc -ErrorAction SilentlyContinue) { Import-Module FailoverClusters -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
 
     $ErrorActionPreference = 'Stop'
@@ -1389,6 +1392,46 @@ $Collector = {
         }
     })
 
+    # ── Kopie zapasowe: Windows Server Backup (Get-WBSummary) i zadania Veeam (zdarzenie 190 w dziennikach Veeam) ──
+    # Wynik zadania Veeam z poziomu zdarzenia (4 = sukces, 3 = ostrzeżenie, 2 = błąd) – niezależnie od języka; okres co najmniej 31 dni
+    $backups = @(S 'Backup' 'Kopie zapasowe' {
+        if (Get-Command Get-WBSummary -ErrorAction SilentlyContinue) {
+            $wb = $null; try { $wb = Get-WBSummary } catch {}   # usługa kopii nieskonfigurowana – brak danych to nie błąd sekcji
+            $pol = $null; try { $pol = Get-WBPolicy } catch {}
+            if ($wb -and ($pol -or $wb.LastBackupTime -gt [datetime]'2000-01-01')) {
+                $okT  = if ($wb.LastSuccessfulBackupTime -gt [datetime]'2000-01-01') { $wb.LastSuccessfulBackupTime } else { $null }
+                $runT = if ($wb.LastBackupTime -gt [datetime]'2000-01-01') { $wb.LastBackupTime } else { $null }
+                $nxT  = if ($wb.NextBackupTime -gt [datetime]'2000-01-01') { $wb.NextBackupTime } else { $null }
+                $hr   = [int64]$wb.LastBackupResultHR
+                [pscustomobject]@{
+                    Product = 'Windows Server Backup'; Job = $(if ($pol) { 'harmonogram' } else { 'kopia jednorazowa' })
+                    LastRun = $(D $runT); LastResult = $(if (-not $runT) { '' } elseif ($hr -eq 0) { 'Sukces' } else { 'Błąd' })
+                    LastSuccess = $(D $okT); SuccessAgeDays = $(if ($okT) { [math]::Round(($now - $okT).TotalDays, 1) } else { $null })
+                    RunAgeDays = $(if ($runT) { [math]::Round(($now - $runT).TotalDays, 1) } else { $null })
+                    Runs = $null; Failures = $null; NextRun = $(D $nxT); Target = Short "$($wb.LastBackupTarget)" 120
+                    Detail = $(if ($hr -ne 0 -and $runT) { 'kod błędu 0x{0:X8}' -f ($hr -band 0xFFFFFFFFL) } else { "wersje kopii: $($wb.NumberOfVersions)" })
+                }
+            }
+        }
+        $bSince = $now.AddDays(-[math]::Max($Days, 31))
+        foreach ($ln in 'Veeam Agent', 'Veeam Backup') {
+            if (-not (Get-WinEvent -ListLog $ln -ErrorAction SilentlyContinue)) { continue }
+            $ev = @(Get-WinEvent -FilterHashtable @{ LogName = $ln; Id = 190; StartTime = $bSince } -MaxEvents 2000 -ErrorAction SilentlyContinue)
+            $ev | Group-Object { $m = [regex]::Match("$($_.Message)", "'([^']+)'"); if ($m.Success) { $m.Groups[1].Value } else { '(zadanie)' } } | ForEach-Object {
+                $g    = @($_.Group | Sort-Object TimeCreated -Descending)
+                $ok   = @($g | Where-Object { $_.Level -eq 4 } | Select-Object -First 1)
+                $last = $g[0]
+                [pscustomobject]@{
+                    Product = $(if ($ln -eq 'Veeam Agent') { 'Veeam Agent' } else { 'Veeam Backup & Replication' }); Job = $_.Name
+                    LastRun = $(D $last.TimeCreated); LastResult = $(switch ([int]$last.Level) { 4 { 'Sukces' } 3 { 'Ostrzeżenie' } default { 'Błąd' } })
+                    LastSuccess = $(if ($ok.Count) { D $ok[0].TimeCreated } else { '' }); SuccessAgeDays = $(if ($ok.Count) { [math]::Round(($now - $ok[0].TimeCreated).TotalDays, 1) } else { $null })
+                    RunAgeDays = [math]::Round(($now - $last.TimeCreated).TotalDays, 1)
+                    Runs = $g.Count; Failures = @($g | Where-Object { $_.Level -le 2 }).Count; NextRun = ''; Target = ''; Detail = $(Short $last.Message 300)
+                }
+            }
+        }
+    })
+
     # ── Zdrowie dysków: dyski fizyczne (Storage) i zdarzenia błędów dyskowych ──
     # Moduł Storage zamienia kody na angielskie nazwy (niezależne od języka systemu); obsługujemy oba warianty
     $hsMap = @{ '0' = 'OK'; 'Healthy' = 'OK'; '1' = 'Ostrzeżenie'; 'Warning' = 'Ostrzeżenie'; '2' = 'Awaria'; 'Unhealthy' = 'Awaria'; '5' = 'Nieznany'; 'Unknown' = 'Nieznany' }
@@ -1849,6 +1892,7 @@ $Collector = {
         EventLogs      = $eventLogs
         AuditPolicy    = $auditPolicy
         Crashes        = $crashes
+        Backup         = $backups
         DiskHealth     = $diskHealth
         DomainController = $dcRows
         ADSecurity     = $adSec
@@ -2764,6 +2808,7 @@ $script:Sections = @(
     @{ Key = 'Restarts';       Header = 'Restarty' }
     @{ Key = 'Downtime';       Header = 'Przestoje (wyłączenie → start)' }
     @{ Key = 'Crashes';        Header = 'Awarie systemu (BSOD)' }
+    @{ Key = 'Backup';         Header = 'Kopie zapasowe' }
     @{ Key = 'Network';        Header = 'Adresacja i karty sieciowe' }
     @{ Key = 'Listening';      Header = 'Porty nasłuchujące' }
     @{ Key = 'Connections';    Header = 'Aktywne połączenia' }
@@ -2864,6 +2909,8 @@ $script:Headers = @{
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
     Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
+    Product = 'Produkt'; Job = 'Zadanie'; LastResult = 'Ostatni wynik'; LastSuccess = 'Ostatnia udana'; SuccessAgeDays = 'Dni od udanej'
+    RunAgeDays = 'Dni od uruchomienia'; Runs = 'Uruchomienia'; Failures = 'Nieudane'; Target = 'Miejsce docelowe'
     # pola ze starszych migawek (wersja z sekcją Ochrona)
     AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'; FirewallManagedBy = 'Zapora zarządzana przez'; PartOfDomain = 'W domenie'
 }
@@ -3171,6 +3218,8 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: system i dyski'; Key = 'DiskWearWarnPct';   Type = 'int'; Min = 1; Max = 100;    Label = 'Zużycie SSD: ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskRetryWarn';     Type = 'int'; Min = 1; Max = 100000; Label = 'Ponowienia/resety I/O dysku: ostrzeżenie od [liczba]' }
     @{ Group = 'Progi: system i dyski'; Key = 'BugCheckCritCount'; Type = 'int'; Min = 1; Max = 1000;   Label = 'BSOD: krytyczne od [liczba w okresie]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'BackupWarnDays';    Type = 'int'; Min = 1; Max = 365;    Label = 'Kopia zapasowa: ostrzeżenie, gdy ostatnia udana starsza niż [dni]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'BackupCritDays';    Type = 'int'; Min = 1; Max = 365;    Label = 'Kopia zapasowa: krytyczne, gdy ostatnia udana starsza niż [dni]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'CertWarnDays';       Type = 'int'; Min = 1; Max = 3650;    Label = 'Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'RecentSoftwareDays'; Type = 'int'; Min = 1; Max = 3650;    Label = 'Nowe oprogramowanie: z ostatnich [dni]' }
@@ -3197,7 +3246,7 @@ $script:SettingDefs = @(
     @{ Group = 'Listy'; Key = 'IgnoredWmiConsumers';    Type = 'list';    Label = 'Subskrypcje WMI traktowane jako systemowe (jedna na linię)' }
 )
 $script:SectionGroups = [ordered]@{
-    'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
+    'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Backup', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
     'Bezpieczeństwo'       = @('Hardening', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
     'Role serwera'         = @('DomainController', 'ADSecurity', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
@@ -3643,6 +3692,25 @@ function Invoke-ServerAnalysis {
     $newDumps = @($D.Crashes | Where-Object { "$($_.Type)" -notlike 'BSOD*' -and "$($_.AgeDays)" -ne '' -and [double]$_.AgeDays -le $days })
     if ($newDumps.Count -and -not $bsod.Count) { AddI 'Ostrzeżenie' 'Stabilność' "Nowe pliki zrzutu pamięci z ostatnich $days dni: $(Join-Short ($newDumps | ForEach-Object { "$($_.Type) $($_.Time)" }) 3)" 'Crashes' }
     foreach ($r in $newDumps) { SetFlag $r 'warn' }
+
+    # Kopie zapasowe (Windows Server Backup, Veeam): wiek ostatniej udanej kopii i wynik ostatniego uruchomienia
+    foreach ($r in $D.Backup) {
+        $job = "$($r.Product)$(if ("$($r.Job)" -notin '', 'harmonogram') { " – $($r.Job)" })"
+        $ok  = if ("$($r.SuccessAgeDays)" -ne '') { [double]$r.SuccessAgeDays } else { $null }
+        $run = if ("$($r.RunAgeDays)" -ne '') { [double]$r.RunAgeDays } else { $null }
+        $okTxt = if ($null -ne $ok) { "ostatnia udana $($r.LastSuccess) ($([math]::Floor($ok)) dni temu)" } else { 'brak udanej kopii w dostępnej historii' }
+        if ("$($r.Job)" -eq 'kopia jednorazowa') {
+            AddI 'Info' 'Kopie zapasowe' "$($r.Product) bez harmonogramu – kopie tylko ręczne; $okTxt" 'Backup'; SetFlag $r 'info'
+        } elseif ($r.Product -eq 'Veeam Backup & Replication' -and $null -ne $run -and $run -ge $C.BackupCritDays) {
+            AddI 'Info' 'Kopie zapasowe' "Zadanie $job nie było uruchamiane od $([math]::Floor($run)) dni (wyłączone lub usunięte?); $okTxt" 'Backup'; SetFlag $r 'info'
+        } elseif ($null -eq $ok -or $ok -ge $C.BackupCritDays) {
+            AddI 'Krytyczny' 'Kopie zapasowe' "$job`: $okTxt; ostatnie uruchomienie $($r.LastRun): $($r.LastResult)" 'Backup'; SetFlag $r 'crit'
+        } elseif ($ok -ge $C.BackupWarnDays) {
+            AddI 'Ostrzeżenie' 'Kopie zapasowe' "$job`: $okTxt; ostatnie uruchomienie $($r.LastRun): $($r.LastResult)" 'Backup'; SetFlag $r 'warn'
+        } elseif ($r.LastResult -eq 'Błąd') {
+            AddI 'Ostrzeżenie' 'Kopie zapasowe' "$job`: ostatnie uruchomienie $($r.LastRun) zakończone błędem; $okTxt" 'Backup'; SetFlag $r 'warn'
+        } elseif ($r.LastResult -eq 'Ostrzeżenie') { SetFlag $r 'info' }
+    }
 
     # Zdrowie dysków
     foreach ($r in $D.DiskHealth) {
@@ -6814,8 +6882,9 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
     # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -eq 'Backup' -and -not @($D.Backup | Where-Object { $_ }).Count) { return $false }   # brak oprogramowania kopii na serwerze
     $true
 }
 function Get-WorstFlag($Rows) {

@@ -15,6 +15,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Interfejs](#interfejs)
 - [Niedostępne serwery](#niedostępne-serwery)
 - [Hyper-V i klastry](#hyper-v-i-klastry)
+- [Kopie zapasowe](#kopie-zapasowe)
 - [Bezpieczeństwo: utwardzenie, Active Directory](#bezpieczeństwo-utwardzenie-active-directory)
 - [Podatności (CVE)](#podatności-cve)
 - [Wykrywane problemy](#wykrywane-problemy)
@@ -34,7 +35,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 | Obszar | Zbierane dane |
 |---|---|
 | **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, host Hyper-V, na którym działa maszyna |
-| **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
+| **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, kopie zapasowe (Windows Server Backup, Veeam), zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
 | **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-active-directory)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
 | **Podatności (CVE)** | brakujące poprawki Windows: CVE, dla których Microsoft wydał poprawkę nowszą niż zainstalowana, z wyróżnieniem krytycznych i aktywnie wykorzystywanych (Microsoft, CISA KEV) – wylicza stacja z danych pobranych z internetu, [szczegóły](#podatności-cve) |
 | **Usługi, sieć i pliki** | usługi (spoza Microsoft, zatrzymane automatyczne, działające na kontach użytkowników, z niecytowaną ścieżką), zadania harmonogramu spoza `\Microsoft\` z wynikiem ostatniego uruchomienia, karty sieciowe i adresacja, porty nasłuchujące i aktywne połączenia (z procesem i usługą), sesje użytkowników, zawartość wskazanych folderów |
@@ -196,6 +197,17 @@ Niedostępność jest zapamiętywana: po ponownym uruchomieniu programu serwer n
 - **Kontrolery domeny.** Ostrzeżenie, gdy wszystkie skanowane kontrolery domeny działają na jednym hoście.
 - **Duplikaty.** Ta sama maszyna dodana pod dwiema nazwami (alias DNS, adres IP, nazwa klastra) jest wykrywana.
 
+## Kopie zapasowe
+
+Sekcja **Kopie zapasowe** pokazuje się tylko na serwerach, na których program znalazł oprogramowanie do kopii:
+
+- **Windows Server Backup** – stan z `Get-WBSummary`: ostatnia kopia i jej wynik, ostatnia udana kopia, następna zaplanowana, miejsce docelowe i liczba wersji;
+- **Veeam Agent for Windows** i **Veeam Backup & Replication** – zadania z dziennika zdarzeń Veeam (zdarzenie 190, zakończenie sesji zadania) z ostatnich 31 dni (albo dłużej, jeśli zakres zdarzeń jest większy): ostatni wynik, ostatnia udana kopia, liczba uruchomień i nieudanych.
+
+Wynik zadania Veeam program odczytuje z poziomu zdarzenia (informacja, ostrzeżenie, błąd), więc nie zależy od języka komunikatów. Na serwerze Veeam Backup & Replication każde zadanie ma osobny wiersz.
+
+Maszyny wirtualne kopiowane na poziomie hosta (np. przez Veeam B&R albo kopię Hyper-V) nie mają w sobie śladu kopii i sekcji nie pokazują – brak sekcji nie jest problemem. Kopii migawkowych woluminów (VSS) program celowo nie odczytuje: takie zapytania są typowe dla złośliwego oprogramowania i bywają blokowane przez antywirusy.
+
 ## Bezpieczeństwo: utwardzenie, Active Directory
 
 ### Utwardzenie i status „Zalecenie”
@@ -258,6 +270,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - system po końcu wsparcia Microsoft;
 - brak poprawek Windows dla podatności aktywnie wykorzystywanych (oznaczonych przez Microsoft albo w katalogu CISA KEV);
 - dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
+- brak udanej kopii zapasowej (Windows Server Backup, zadanie Veeam) od co najmniej 7 dni albo w ogóle w dostępnej historii;
 - krytyczne ustawienia bezpieczeństwa: wyłączona ochrona w czasie rzeczywistym, sygnatury antywirusa starsze niż 7 dni, włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0, Point and Print bez ostrzeżeń i uprawnień administratora, urząd certyfikacji z `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6);
 - w grupie Administratorzy jest grupa obejmująca wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy domeny i podobne);
 - Active Directory: delegowanie nieograniczone, delegowanie albo RBCD wobec kontrolerów domeny, prawa replikacji (DCSync) poza grupami administracyjnymi, uprzywilejowane konta z SPN albo bez wstępnego uwierzytelniania Kerberos, hasła w preferencjach zasad grupy (`cpassword`), uprzywilejowany SID w sIDHistory;
@@ -272,6 +285,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 - uptime powyżej 45 dni, oczekujący restart, brak aktualizacji od ponad 45 dni;
 - brak poprawek Windows dla podatności krytycznych;
 - użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci (na hoście Hyper-V zamiast progu RAM liczy się zapas wolnej pamięci: mniej niż 8 GB);
+- ostatnia udana kopia zapasowa starsza niż 2 dni, ostatnie uruchomienie zadania kopii zakończone błędem;
 - zatrzymane usługi automatyczne, niecytowane ścieżki usług, nieudane zadania harmonogramu;
 - zdarzenia krytyczne w dziennikach, nieoczekiwane wyłączenia (z odesłaniem do sekcji Przestoje), pojedyncza awaria BSOD, pliki zrzutów pamięci;
 - co najmniej 25 nieudanych logowań, utworzenie lub usunięcie konta, dodanie do grupy, włączone konto Gość;
@@ -297,6 +311,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 
 **Info**
 
+- Windows Server Backup bez harmonogramu (tylko kopie ręczne), zadanie Veeam Backup & Replication nieuruchamiane od tygodnia (prawdopodobnie wyłączone);
 - zalecenie naprawy dla niedostępnego serwera; maszyna wyłączona od ponad 30 dni (prawdopodobnie wycofana); serwer z Linuksem pominięty;
 - podsumowanie błędów w dziennikach, zainstalowane usługi, nowe lub zaktualizowane oprogramowanie z ostatnich 14 dni;
 - konta z hasłem bez wygasania, osierocone SID-y w grupach, wygasłe certyfikaty;
@@ -415,6 +430,8 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | Zużycie SSD: ostrzeżenie od [%] | 90 |
 | Ponowienia/resety I/O dysku: ostrzeżenie od [liczba] | 10 |
 | BSOD: krytyczne od [liczba w okresie] | 2 |
+| Kopia zapasowa: ostrzeżenie, gdy ostatnia udana starsza niż [dni] | 2 |
+| Kopia zapasowa: krytyczne, gdy ostatnia udana starsza niż [dni] | 7 |
 
 **Progi: bezpieczeństwo**
 
