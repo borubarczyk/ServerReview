@@ -538,12 +538,14 @@ Kolektor nie zawiera treści, które PowerShell uznaje za podejrzane, więc skan
 
 ## Licencja
 
-Copyright (C) 2026 Borys Kaleta
+Copyright (C) 2026 Borys Kaleta. Wszelkie prawa zastrzeżone.
 
-Program jest udostępniony na licencji [GNU General Public License v3.0](LICENSE) lub, według Twojego wyboru, dowolnej późniejszej wersji. W skrócie:
+Program jest objęty [licencją zastrzeżoną](LICENSE) - wszelkie prawa zastrzeżone. W skrócie:
 
-- możesz go używać, modyfikować i rozpowszechniać;
-- jeśli rozpowszechniasz program lub jego zmodyfikowaną wersję, musisz udostępnić kod źródłowy na tej samej licencji;
+- używanie, kopiowanie, modyfikowanie i rozpowszechnianie programu wymaga zgody autora (licencji);
+- publiczna dostępność kodu nie oznacza zgody na korzystanie z programu;
 - program dostarczany jest bez jakiejkolwiek gwarancji.
+
+Licencja obowiązuje od 1 listopada 2026 r. i zastępuje wcześniejszą licencję GNU GPL v3.0. W sprawie licencji skontaktuj się z autorem: https://github.com/borubarczyk
 
 Wiążący jest pełny tekst licencji w pliku [LICENSE](LICENSE).
