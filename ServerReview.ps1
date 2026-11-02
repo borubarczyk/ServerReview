@@ -1891,19 +1891,26 @@ function Read-SnapshotText([string]$Path) {
 }
 
 function Write-SnapshotText([string]$Path, [string]$Text) {
-    # Zapis przez plik tymczasowy: wczytywanie migawek nigdy nie trafi na plik zapisany do połowy
+    # Zapis przez plik tymczasowy: wczytywanie migawek nigdy nie trafi na plik zapisany do połowy. Po błędzie (pełny dysk) albo
+    # przerwaniu wątku plik .tmp jest usuwany – indeks migawek go nie widzi, więc porządki by go nie usunęły (a folder skanu by został).
     $bytes = (New-Object Text.UTF8Encoding $false).GetBytes($Text)
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))   # folder skanu mógł zniknąć (porządki innej instancji)
     $tmp = "$Path.tmp"
-    $fs = [IO.File]::Create($tmp)
+    $done = $false
     try {
-        if ($Path.EndsWith('.gz', [StringComparison]::OrdinalIgnoreCase)) {
-            $gz = New-Object IO.Compression.GZipStream($fs, [IO.Compression.CompressionLevel]::Optimal)
-            try { $gz.Write($bytes, 0, $bytes.Length) } finally { $gz.Dispose() }
-        } else { $fs.Write($bytes, 0, $bytes.Length) }
-    } finally { $fs.Dispose() }
-    if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
-    [IO.File]::Move($tmp, $Path)
+        $fs = [IO.File]::Create($tmp)
+        try {
+            if ($Path.EndsWith('.gz', [StringComparison]::OrdinalIgnoreCase)) {
+                $gz = New-Object IO.Compression.GZipStream($fs, [IO.Compression.CompressionLevel]::Optimal)
+                try { $gz.Write($bytes, 0, $bytes.Length) } finally { $gz.Dispose() }
+            } else { $fs.Write($bytes, 0, $bytes.Length) }
+        } finally { $fs.Dispose() }
+        # istniejący plik (pamięć podręczna CVE) podmieniany jednym wywołaniem – awaria w trakcie nie zostawia braku pliku;
+        # system plików bez ReplaceFile (część udziałów sieciowych) – jak dotąd: usunięcie i przeniesienie
+        if (-not [IO.File]::Exists($Path)) { [IO.File]::Move($tmp, $Path) }
+        else { try { [IO.File]::Replace($tmp, $Path, $null) } catch { [IO.File]::Delete($Path); [IO.File]::Move($tmp, $Path) } }
+        $done = $true
+    } finally { if (-not $done) { try { [IO.File]::Delete($tmp) } catch {} } }
 }
 
 function ConvertFrom-ServerJson([string]$Json, [string[]]$ArrayKeys) {
@@ -1938,10 +1945,23 @@ function Merge-PrevSections {
     $verC = "$($Cur.PSObject.Properties['CollectorVersion'].Value)"
     if ("$($Prev.PSObject.Properties['CollectorVersion'].Value)" -ne $verC) { return $Prev }   # i tak nie porównujemy
     $from = @{}
+    # lista nazw sekcji z tablicy najwyższego poziomu („Skipped”/„Failed” są za wszystkimi sekcjami, więc ostatnie wystąpienie)
+    $names = { param($n) $m = [regex]::Match($t, '"' + $n + '":\[([^\]]*)\]', [Text.RegularExpressions.RegexOptions]::RightToLeft); if ($m.Success) { @([regex]::Matches($m.Groups[1].Value, '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value }) } else { @() } }
     foreach ($f in @($Older)) {
         if (-not $need.Count) { break }
+        $t = $null
+        try { $t = Read-SnapshotText $f } catch { continue }
+        # Wstępnie z tekstu, bez parsowania całej migawki (sekcja nowa albo długo pominięta nie występuje w żadnej starszej):
+        # inna wersja kolektora = koniec; brak klucza potrzebnej sekcji albo sekcja pominięta/niezebrana = następna migawka.
+        # Bez numeru wersji (uszkodzony plik, bardzo stara migawka, znacznik niedostępności) – jak dotąd, pełne parsowanie.
+        $mv = [regex]::Match($t, '"CollectorVersion":\s*(\d+)', [Text.RegularExpressions.RegexOptions]::RightToLeft)
+        if ($mv.Success) {
+            if ($mv.Groups[1].Value -ne $verC) { break }
+            $skp = & $names 'Skipped'; $fld = & $names 'Failed'
+            if (-not @($need.ToArray() | Where-Object { $t.Contains('"' + $_ + '":') -and $skp -notcontains $_ -and $fld -notcontains $_ }).Count) { continue }
+        }
         $o = $null
-        try { $o = ConvertFrom-ServerJson (Read-SnapshotText $f) $ArrayKeys } catch { continue }
+        try { $o = ConvertFrom-ServerJson $t $ArrayKeys } catch { continue }
         if ($o.PSObject.Properties['Offline'] -and $o.Offline) { continue }
         if ("$($o.PSObject.Properties['CollectorVersion'].Value)" -ne $verC) { break }   # starsze migawki mają inny format wierszy
         $date = ([IO.File]::GetLastWriteTime($f)).ToString('yyyy-MM-dd HH:mm')
@@ -2064,20 +2084,46 @@ function Get-WinRmErrorInfo {
 }
 
 function Get-AdComputerInfo([string]$Name) {
-    # Konto komputera w AD (bieżąca domena stacji): istnieje? włączone? kiedy ostatnio logowało się do domeny?
-    $r = [ordered]@{ Found = $false; Enabled = $null; LastLogonDays = $null; PwdAgeDays = $null; OS = ''; DN = ''; Error = '' }
+    # Konto komputera w AD: istnieje? włączone? kiedy ostatnio logowało się do domeny? Szukamy w domenie stacji, a nazwy FQDN
+    # z innej domeny lasu – najpierw w tamtej domenie. Konto o tej samej nazwie NetBIOS, ale z inną nazwą DNS, to nie ten serwer.
+    $r = [ordered]@{ Found = $false; Enabled = $null; LastLogonDays = $null; PwdAgeDays = $null; OS = ''; DN = ''; Domain = ''; Error = '' }
     if ($Name -match '^\d{1,3}(\.\d{1,3}){3}$' -or $Name.Contains(':')) { $r.Error = 'adres IP'; return [pscustomobject]$r }
     try {
         $esc = { param($v) ($v -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29') }
         $short = $Name.Split('.')[0]
-        $ds = New-Object System.DirectoryServices.DirectorySearcher
-        $ds.Filter = "(&(objectCategory=computer)(|(sAMAccountName=$(& $esc $short)`$)(dNSHostName=$(& $esc $Name))))"
-        $ds.ClientTimeout = [TimeSpan]::FromSeconds(8)
-        $ds.ServerTimeLimit = [TimeSpan]::FromSeconds(8)
-        [void]$ds.PropertiesToLoad.AddRange([string[]]@('useraccountcontrol', 'lastlogontimestamp', 'pwdlastset', 'operatingsystem', 'distinguishedname'))
-        $hit = $ds.FindOne()
-        if ($hit) {
-            $p = $hit.Properties
+        $nb = $short.Substring(0, [Math]::Min(15, $short.Length))   # sAMAccountName komputera: nazwa NetBIOS (najwyżej 15 znaków) + $
+        $fq = $Name.Contains('.')
+        $roots = @('')
+        if ($fq -and $Name.Substring($Name.IndexOf('.') + 1) -ne "$env:USERDNSDOMAIN") {
+            # tylko domena lasu, której nazwa jest sufiksem nazwy serwera (dowolny sufiks DNS = próby połączenia LDAP z hostem spoza AD)
+            $sfx = $Name.Substring($Name.IndexOf('.') + 1)
+            try { $r.Domain = "$(@([System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest().Domains | ForEach-Object { "$($_.Name)" } | Where-Object { $_ -ne "$env:USERDNSDOMAIN" -and ($sfx -eq $_ -or $sfx.EndsWith(".$_", [StringComparison]::OrdinalIgnoreCase)) } | Sort-Object Length -Descending)[0])" } catch {}
+            if ($r.Domain) { $roots = @("LDAP://$($r.Domain)", '') }
+        }
+        $flt = if ($fq) { "(dNSHostName=$(& $esc $Name))" } else { "(dNSHostName=$(& $esc $short).*)" }
+        $p = $null; $bestSc = 0; $other = ''
+        foreach ($root in $roots) {
+            try {
+                $ds = if ($root) { New-Object System.DirectoryServices.DirectorySearcher (New-Object System.DirectoryServices.DirectoryEntry $root) } else { New-Object System.DirectoryServices.DirectorySearcher }
+                $ds.Filter = "(&(objectCategory=computer)(|(sAMAccountName=$(& $esc $nb)`$)$flt))"
+                $ds.ClientTimeout = [TimeSpan]::FromSeconds(8)
+                $ds.ServerTimeLimit = [TimeSpan]::FromSeconds(8)
+                [void]$ds.PropertiesToLoad.AddRange([string[]]@('useraccountcontrol', 'lastlogontimestamp', 'pwdlastset', 'operatingsystem', 'distinguishedname', 'dnshostname'))
+                $all = $ds.FindAll()
+                try {
+                    foreach ($h in $all) {
+                        $dns = if ($h.Properties['dnshostname'].Count) { "$($h.Properties['dnshostname'][0])" } else { '' }
+                        # 3 = nazwa DNS konta zgodna z nazwą serwera, 1 = konto bez nazwy DNS (nie da się sprawdzić), 0 = inny komputer
+                        $sc = if (-not $dns) { 1 } elseif (($fq -and $dns -eq $Name) -or (-not $fq -and $dns.Split('.')[0] -eq $short)) { 3 } else { 0 }
+                        if (-not $sc) { $other = $dns }
+                        if ($sc -gt $bestSc) { $p = $h.Properties; $bestSc = $sc }
+                    }
+                } finally { $all.Dispose() }
+            } catch { if ($root) { continue }; throw }   # domena z nazwy serwera nieosiągalna – zostaje domena stacji
+            if ($null -ne $p -or $other) { break }
+        }
+        if ($null -eq $p -and $other) { $r.Error = "konto $nb`$ należy do komputera $other (inny komputer o tej samej nazwie NetBIOS albo serwer ma inną nazwę DNS)" }
+        if ($null -ne $p) {
             $r.Found = $true
             $r.Enabled = -not ([int64]$p['useraccountcontrol'][0] -band 2)
             if ($p['lastlogontimestamp'].Count) { $r.LastLogonDays = [int]((Get-Date) - [datetime]::FromFileTime([int64]$p['lastlogontimestamp'][0])).TotalDays }
@@ -2108,7 +2154,7 @@ function Get-HttpSpnOwners([string]$Name) {
     try {
         foreach ($h in $res) {
             $sam = "$($h.Properties['samaccountname'][0])"
-            if ($sam -eq "$short`$") { continue }   # konto samego komputera – tak ma być
+            if ($sam -eq "$($short.Substring(0, [Math]::Min(15, $short.Length)))`$") { continue }   # konto samego komputera (nazwa NetBIOS: najwyżej 15 znaków) – tak ma być
             $own = @($h.Properties['serviceprincipalname'] | Where-Object { $spns -contains "$_" })
             $out.Add([pscustomobject]@{ Account = $sam; Spn = ($own -join ', ') })
         }
@@ -2164,8 +2210,8 @@ function Test-WinRmPort([string]$Target, [int]$TimeoutMs, [int]$Port = 5985) {
 
 function Invoke-ConnectionDiagnostics {
     <#
-        Diagnostyka niedostępnego serwera ze stacji: DNS (A i PTR), ping, porty TCP (równolegle, z limitem czasu),
-        TrustedHosts dla adresów IP, konto komputera w AD i klasyfikacja błędu WinRM. Trwa zwykle 2–4 s.
+        Diagnostyka niedostępnego serwera ze stacji: DNS (A i PTR), ping, porty TCP (równolegle, z limitem czasu; port 5985 także
+        pod kolejnymi adresami z DNS), TrustedHosts (adres IP albo błąd TrustedHosts), konto komputera w AD i klasyfikacja błędu WinRM. Trwa zwykle 2–4 s.
         Wynik: przyczyna i zalecenie (po polsku) + lista sprawdzeń do sekcji „Diagnoza połączenia”.
     #>
     param(
@@ -2214,9 +2260,12 @@ function Invoke-ConnectionDiagnostics {
 
     # ── Ping i porty TCP (równolegle) ──
     $ip = if ($ips.Count) { $ips[0] } else { $null }
-    $pingOk = $false; $state = @{}
+    $pingOk = $false; $state = @{}; $w = $null; $moved = $false
+    # stan próby TCP: open | refused | unreach | timeout | error; nazwa stanu do opisu
+    $tcpState = { param($x) if (-not $x.Task) { 'error' } elseif ("$($x.Task.Status)" -eq 'RanToCompletion' -and $x.Client.Connected) { 'open' } elseif ($x.Task.IsFaulted) { $se = $x.Task.Exception.InnerException; if ($se -is [Net.Sockets.SocketException] -and "$($se.SocketErrorCode)" -eq 'ConnectionRefused') { 'refused' } else { 'unreach' } } else { 'timeout' } }
+    $stName = { param($s) switch ("$s") { 'open' { 'otwarty' } 'refused' { 'zamknięty' } 'unreach' { 'nieosiągalny' } 'error' { '?' } default { 'brak odp.' } } }
     if ($ip) {
-        $pinger = $null; $pingTask = $null; $tcp = @()
+        $pinger = $null; $pingTask = $null; $tcp = @(); $alt = @()
         try { $pinger = New-Object Net.NetworkInformation.Ping; $pingTask = $pinger.SendPingAsync($ip, $TimeoutMs) } catch {}
         # gniazdo w rodzinie adresu: domyślny TcpClient w .NET Framework obsługuje tylko IPv4 (adres IPv6 = żadna próba portu)
         $fam = [Net.Sockets.AddressFamily]::InterNetwork; $pa = $null
@@ -2226,8 +2275,17 @@ function Invoke-ConnectionDiagnostics {
             $task = $null; try { $task = $cl.ConnectAsync($ip, [int]$port) } catch {}
             $tcp += , @{ Port = [int]$port; Client = $cl; Task = $task }
         }
+        # kilka adresów w DNS (karta zaplecza zarejestrowana w DNS, nieaktualny rekord A): port 5985 także pod kolejnymi (najwyżej 3),
+        # jak we wstępnym teście portu – pierwszy adres bywa martwy, choć serwer działa
+        foreach ($altIp in @($ips | Select-Object -Skip 1 -First 3)) {
+            $afam = [Net.Sockets.AddressFamily]::InterNetwork; $aa = $null
+            if ([Net.IPAddress]::TryParse("$altIp", [ref]$aa)) { $afam = $aa.AddressFamily }
+            $cl = New-Object Net.Sockets.TcpClient($afam)
+            $task = $null; try { $task = $cl.ConnectAsync("$altIp", 5985) } catch {}
+            $alt += , @{ Ip = "$altIp"; Client = $cl; Task = $task }
+        }
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs + 250)
-        foreach ($tk in @(@($pingTask) + @($tcp | ForEach-Object { $_.Task }) | Where-Object { $_ })) {
+        foreach ($tk in @(@($pingTask) + @($tcp | ForEach-Object { $_.Task }) + @($alt | ForEach-Object { $_.Task }) | Where-Object { $_ })) {
             $left = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
             try { [void]$tk.Wait($left) } catch {}
         }
@@ -2235,13 +2293,7 @@ function Invoke-ConnectionDiagnostics {
             $pingOk = $true; & $add 'Ping (ICMP)' "odpowiada ($($pingTask.Result.RoundtripTime) ms)" 'OK'
         } else { & $add 'Ping (ICMP)' 'brak odpowiedzi (ICMP bywa blokowany przez zaporę – samo w sobie nie przesądza)' 'Uwaga' }
         foreach ($x in $tcp) {
-            $st = 'timeout'
-            if (-not $x.Task) { $st = 'error' }
-            elseif ("$($x.Task.Status)" -eq 'RanToCompletion' -and $x.Client.Connected) { $st = 'open' }
-            elseif ($x.Task.IsFaulted) {
-                $se = $x.Task.Exception.InnerException
-                $st = if ($se -is [Net.Sockets.SocketException] -and "$($se.SocketErrorCode)" -eq 'ConnectionRefused') { 'refused' } else { 'unreach' }
-            }
+            $st = & $tcpState $x
             $state[$x.Port] = $st
             try { $x.Client.Close() } catch {}
             $label = "TCP $($x.Port)$(if ($portNames.ContainsKey($x.Port)) { " ($($portNames[$x.Port]))" })"
@@ -2253,15 +2305,29 @@ function Invoke-ConnectionDiagnostics {
                 default   { & $add $label 'brak odpowiedzi w limicie czasu (filtrowany przez zaporę albo host wyłączony)' $(if ($x.Port -eq 5985) { 'Błąd' } else { 'Uwaga' }) }
             }
         }
+        $w = $state[5985]
+        if ($alt.Count) {
+            # wniosek z adresu, pod którym WinRM odpowiada najlepiej (otwarty > zamknięty > brak odpowiedzi)
+            $rank = @{ open = 2; refused = 1 }
+            $lst = @("$ip $(& $stName $w) (ping i porty powyżej)")
+            foreach ($x in $alt) {
+                $st = & $tcpState $x
+                try { $x.Client.Close() } catch {}
+                $lst += "$($x.Ip) $(& $stName $st)"
+                if ([int]$rank[$st] -gt [int]$rank["$w"]) { $ip = $x.Ip; $w = $st }
+            }
+            $moved = $ip -ne $ips[0]
+            & $add 'DNS: kilka adresów (TCP 5985)' "$($lst -join '; ')$(if ($moved) { " – WinRM odpowiada pod $ip, a nie pod pierwszym adresem z DNS: nieaktualny rekord A albo zarejestrowana w DNS karta zaplecza (kopie, iSCSI, migracja)" })" $(if ($moved) { 'Uwaga' } else { 'Info' })
+        }
         if ($pinger) { try { $pinger.Dispose() } catch {} }
     }
 
-    # ── TrustedHosts (połączenia po adresie IP) ──
-    if ($isIp) {
+    # ── TrustedHosts (połączenia po adresie IP albo błąd TrustedHosts: serwer po nazwie spoza domeny, uwierzytelnianie NTLM) ──
+    $inTh = $false
+    if ($isIp -or $cls.Class -eq 'TrustedHosts') {
         $th = ''
         try { $th = "$((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Client' -ErrorAction Stop).trusted_hosts)" } catch {}
         try { $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client' -ErrorAction Stop; if ($pol.TrustedHosts -eq 1 -and $pol.TrustedHostsList) { $th = "$th,$($pol.TrustedHostsList)" } } catch {}
-        $inTh = $false
         foreach ($e in ($th -split ',')) { $e = $e.Trim(); if ($e -and ($e -eq '*' -or $Target -like $e)) { $inTh = $true } }
         & $add 'TrustedHosts (stacja)' $(if ($inTh) { "zawiera $Target" } elseif ($th.Trim(',')) { "brak $Target (lista: $($th.Trim(',')))" } else { 'lista pusta' }) $(if ($inTh) { 'OK' } else { 'Uwaga' })
     }
@@ -2271,7 +2337,7 @@ function Invoke-ConnectionDiagnostics {
     if ($CheckAd -and -not $isIp) {
         $ad = Get-AdComputerInfo $Target
         if ($ad.Error) { & $add 'Konto komputera w AD' "nie sprawdzono: $($ad.Error)" 'Info' }
-        elseif (-not $ad.Found) { & $add 'Konto komputera w AD' 'nie znaleziono w domenie stacji (serwer spoza domeny albo usunięty)' 'Uwaga' }
+        elseif (-not $ad.Found) { & $add 'Konto komputera w AD' "nie znaleziono w $(if ($ad.Domain) { "domenie $($ad.Domain) ani w domenie stacji" } else { 'domenie stacji' }) (serwer spoza domeny albo usunięty)" 'Uwaga' }
         else {
             $txt = "$(if ($ad.Enabled) { 'włączone' } else { 'WYŁĄCZONE' })$(if ($null -ne $ad.LastLogonDays) { ", ostatnie logowanie do domeny ≈ $($ad.LastLogonDays) dni temu" })$(if ($null -ne $ad.PwdAgeDays) { ", hasło konta zmienione $($ad.PwdAgeDays) dni temu" }), $($ad.OS)"
             & $add 'Konto komputera w AD' $txt $(if (-not $ad.Enabled -or $ad.LastLogonDays -gt 30 -or $ad.PwdAgeDays -gt 60) { 'Uwaga' } else { 'OK' })
@@ -2289,9 +2355,14 @@ function Invoke-ConnectionDiagnostics {
     }
 
     # ── Wniosek: najpierw sieć (czy serwer w ogóle żyje), potem WinRM, potem uwierzytelnianie ──
-    $w = $state[5985]
-    $alive = $pingOk -or @($state.Values | Where-Object { $_ -in 'open', 'refused' }).Count -gt 0
+    $alive = $pingOk -or @($state.Values | Where-Object { $_ -in 'open', 'refused' }).Count -gt 0 -or $w -in 'open', 'refused'
     $cause = $cls.Cause; $remedy = $cls.Remedy; $class = $cls.Class
+    if ($class -eq 'TrustedHosts' -and -not $isIp) {
+        # ten sam błąd WinRM dla serwera dodanego po nazwie: spoza domeny stacji (albo stacja poza domeną) – uwierzytelnianie inne niż Kerberos
+        $cause = 'Serwer spoza domeny stacji (albo bez relacji zaufania) – logowanie inne niż Kerberos (NTLM, konto lokalne serwera) wymaga wpisu nazwy serwera w TrustedHosts stacji i jawnego konta'
+        $remedy = "Na stacji (jako administrator): Set-Item WSMan:\localhost\Client\TrustedHosts -Value $Target -Concatenate i wybierz konto przyciskiem „Konto”."
+    }
+    if ($class -eq 'TrustedHosts' -and $inTh) { $remedy = "$Target jest już na liście TrustedHosts stacji – wybierz jawne konto przyciskiem „Konto” (konto lokalne serwera albo konto jego domeny)." }
     if ($class -in 'Timeout', 'Remote' -and $ErrorId -match '^(SrTimeout|CollectorFatal)' -and $alive) { }
     elseif (-not $isIp -and -not $dnsOk) {
         $class = 'Dns'; $cause = 'Nazwa serwera nie jest rozwiązywana w DNS'
@@ -2311,7 +2382,11 @@ function Invoke-ConnectionDiagnostics {
     }
     elseif ($w -eq 'open' -and -not $ErrorText) {
         # diagnoza na żądanie działającego serwera – bez błędu połączenia do wyjaśnienia
-        $class = 'OK'; $cause = 'WinRM jest osiągalny ze stacji (port 5985 otwarty)'; $remedy = ''
+        $class = 'OK'; $cause = "WinRM jest osiągalny ze stacji (port 5985 otwarty$(if ($moved) { " pod adresem $ip; pod pierwszym adresem z DNS ($($ips[0])) WinRM nie odpowiada" }))"; $remedy = ''
+    }
+    elseif ($w -eq 'open' -and $moved -and $class -in 'Network', 'Unknown', 'Dns' -and $ErrorId -notmatch '^(CollectorFatal|ParseError|NoData)') {
+        $class = 'Dns'; $cause = "WinRM odpowiada pod adresem $ip, ale nie pod pierwszym adresem z DNS ($($ips[0])) – nieaktualny rekord A albo zarejestrowana w DNS karta zaplecza (kopie, iSCSI, migracja)"
+        $remedy = 'Usuń nieaktualny rekord A albo wyłącz rejestrację w DNS na karcie zaplecza (właściwości karty: „Zarejestruj adresy tego połączenia w systemie DNS”), potem ipconfig /flushdns na stacji.'
     }
     elseif ($w -eq 'open' -and $class -in 'Network', 'Unknown', 'Dns' -and $ErrorId -notmatch '^(CollectorFatal|ParseError|NoData)') {
         $class = 'WinRM'; $cause = 'WinRM nasłuchuje (port 5985 otwarty), ale sesja nie powstała'
@@ -2328,10 +2403,10 @@ function Invoke-ConnectionDiagnostics {
     elseif ($ad -and $ad.Found -and $ad.PwdAgeDays -gt 60) { $notes.Add("hasło konta komputera nie zmieniło się od $($ad.PwdAgeDays) dni – możliwy zerwany kanał zabezpieczeń (Test-ComputerSecureChannel)") }
     elseif ($ad -and -not $ad.Found -and -not $ad.Error) { $notes.Add('brak konta komputera w AD') }
     if ($ad -and $ad.OS -and $ad.OS -notmatch 'Windows') { $notes.Add("system wg AD: $($ad.OS) – nie jest skanowany") }
-    $portTxt = (@($state.Keys | Sort-Object | ForEach-Object { "$_ $(switch ($state[$_]) { 'open' { 'otwarty' } 'refused' { 'zamknięty' } 'unreach' { 'nieosiągalny' } 'error' { '?' } default { 'brak odp.' } })" }) -join ', ')
+    $portTxt = (@($state.Keys | Sort-Object | ForEach-Object { "$_ $(& $stName $state[$_])" }) -join ', ')
     [pscustomobject]@{
         Class = $class; Cause = $cause; Remedy = $remedy; Code = $cls.Code; Notes = ($notes -join '; ')
-        Ip = "$ip"; Ptr = $ptr; Ping = $pingOk; Ports = $portTxt; Port5985 = "$($state[5985])"
+        Ip = "$ip"; Ptr = $ptr; Ping = $pingOk; Ports = $portTxt; Port5985 = "$w"
         AdFound = $(if ($ad) { $ad.Found } else { $null }); AdEnabled = $(if ($ad) { $ad.Enabled } else { $null })
         AdLastLogonDays = $(if ($ad) { $ad.LastLogonDays } else { $null }); AdOS = $(if ($ad) { $ad.OS } else { '' })
         Checks = [object[]]$checks.ToArray(); DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
@@ -2608,18 +2683,32 @@ try {
             # błąd kolektora z wersją PowerShell, a nie „brak połączenia”
             $boot = {
                 param([string]$Text, [object[]]$CArgs)
+                # PowerShell 2.0 (2008 R2 bez WMF): kolektor się nie skompiluje, a ConvertTo-Json poniżej nie istnieje – komunikat bez poleceń
+                if ($PSVersionTable.PSVersion.Major -lt 3) { return ('{"Fatal":"PowerShell ' + $PSVersionTable.PSVersion + ' na serwerze jest za stary – kolektor wymaga PowerShell 4.0 lub nowszego (WMF 5.1)"}') }
                 $sb = $null
                 try { $sb = [scriptblock]::Create($Text) }
                 catch { return ('{"Fatal":' + (ConvertTo-Json ("kolektor nie kompiluje się w PowerShell $($PSVersionTable.PSVersion): $($_.Exception.Message)") -Compress) + '}') }
-                # błąd nieterminujący wypisany poza sekcjami kolektora (np. przez moduł) wraca jako tekst – w strumieniu błędów sesji stacja wzięłaby go za błąd połączenia
-                & $sb @CArgs 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { '@@SRERR@@' + "$($_.CategoryInfo.Reason): $($_.Exception.Message)" } else { $_ } }
+                if (-not $sb) { return }
+                # błąd nieterminujący wypisany poza sekcjami kolektora (np. przez moduł) wraca jako tekst – w strumieniu błędów sesji stacja wzięłaby go za błąd połączenia;
+                # JSON czeka na znacznik czasu serwera: znacznik dociera do stacji przed wielomegabajtowym JSON-em (różnica zegarów bez czasu przesyłu danych)
+                $held = New-Object System.Collections.ArrayList
+                & $sb @CArgs 2>&1 | ForEach-Object {
+                    if ($_ -is [System.Management.Automation.ErrorRecord]) { '@@SRERR@@' + "$($_.CategoryInfo.Reason): $($_.Exception.Message)" }
+                    elseif ($_ -is [string] -and $_.StartsWith('{')) { [void]$held.Add($_) }
+                    elseif ($_ -is [string] -and $_.StartsWith('@@SRTIME@@')) { $_; $held.ToArray(); $held.Clear() }
+                    else { $_ }
+                }
+                $held.ToArray()
             }
             # bez ErrorAction Stop: błąd wypisany na serwerze nie przerywa odbioru danych; błędy połączenia rozpoznajemy po typie (Test-RemotingTransportError)
             $icErr = $null
             $ic = @{ ComputerName = $Target; ScriptBlock = $boot; ArgumentList = @($Opt.CollectorText, [object[]]$Opt.CollectorArgs); SessionOption = $so; ErrorAction = 'SilentlyContinue'; ErrorVariable = 'icErr' }
             if ($Opt.Credential) { $ic.Credential = $Opt.Credential }
-            $out = @(Invoke-Command @ic)
-            $res.ReceivedUtc = [DateTime]::UtcNow
+            # moment odbioru = przyjście znacznika czasu serwera (wyprzedza JSON, patrz $boot), nie koniec przesyłu danych i zamykania sesji
+            $out = @(Invoke-Command @ic | ForEach-Object { if (-not $res.ReceivedUtc -and $_ -is [string] -and $_.StartsWith('@@SRTIME@@')) { $res.ReceivedUtc = [DateTime]::UtcNow }; $_ })
+            if (-not $res.ReceivedUtc) { $res.ReceivedUtc = [DateTime]::UtcNow }
+            # dane odebrane (albo błąd połączenia): przetwarzanie na stacji (parsowanie, zapis, porównanie) i diagnostyka mają własny limit czasu
+            try { $Sync.Started[$Target] = [DateTime]::UtcNow } catch {}
             $strs = @($out | Where-Object { $_ -is [string] })
             $json = $strs | Where-Object { $_.StartsWith('{') } | Select-Object -Last 1
             $mark = $strs | Where-Object { $_.StartsWith('@@SRTIME@@') } | Select-Object -Last 1
