@@ -6150,6 +6150,7 @@ $script:MainXaml = @'
                 <TextBlock Text="dwuklik otwiera serwer, prawy klik – wycisz" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
               </DockPanel>
               <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <CheckBox x:Name="chkGroup" Content="Grupuj" Margin="0,0,12,0" ToolTip="Jeden wiersz na rodzaj problemu z liczbą i listą serwerów (dwuklik pokazuje pojedyncze problemy)"/>
                 <CheckBox x:Name="chkIgnored" Content="Wyciszone" Margin="0,0,12,0" ToolTip="Pokaż problemy wyciszone (prawy klik na problemie – wycisz / przywróć)"/>
                 <Border Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
                   <StackPanel Orientation="Horizontal">
@@ -7416,14 +7417,19 @@ function Refresh-ServerList {
     if (-not $ui) { return }
     $script:Refreshing = $true
     try { $ui.lstServers.Items.Refresh() } finally { $script:Refreshing = $false }
-    $ui.txtServerCount.Text = "$($script:Servers.Count)"
+    Update-ServerCount
+}
+function Update-ServerCount {
+    # nagłówek listy: przy aktywnym filtrze (chip albo wyszukiwanie) „widoczne z wszystkich”, jak w tabelach problemów i maszyn
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:Servers)
+    $ui.txtServerCount.Text = if ($view -and $view.Filter) { "$(@($view).Count) z $($script:Servers.Count)" } else { "$($script:Servers.Count)" }
 }
 function Update-ServerFilter {
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:Servers)
     if (-not $view) { return }
     $t = $ui.txtServerFilter.Text.Trim().ToLowerInvariant()
     $mode = if ($ui.sfProblems.IsChecked) { 'problems' } elseif ($ui.sfOffline.IsChecked) { 'offline' } elseif ($ui.sfHosts.IsChecked) { 'hosts' } elseif ($ui.sfVms.IsChecked) { 'vms' } elseif ($ui.sfNew.IsChecked) { 'new' } else { '' }
-    if (-not $t -and -not $mode) { $view.Filter = $null; return }
+    if (-not $t -and -not $mode) { $view.Filter = $null; Update-ServerCount; return }
     $view.Filter = [Predicate[object]]({
         param($o)
         switch ($mode) {
@@ -7436,6 +7442,7 @@ function Update-ServerFilter {
         if ($t) { return "$($o._Search)".Contains($t) }
         $true
     }.GetNewClosure())
+    Update-ServerCount
 }
 
 function New-SlimData($D) {
@@ -7507,7 +7514,8 @@ function Get-ServerFull([string]$Name, [switch]$NoCache) {
 # Sortowanie jest pamiętane osobno dla każdej tabeli i sekcji, więc przetrwa odświeżenie w trakcie skanu i zmianę serwera.
 $script:GridSort = @{}   # klucz tabeli (np. 'detail:Disks') -> lista @{ Path = właściwość; Desc = $true/$false }
 # kolumny z poziomem ważności sortujemy wg wagi, a nie alfabetycznie (rosnąco = najpierw najpoważniejsze)
-$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Krytyczna' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Ważna' = 2; 'Zalecenie' = 3; 'Info' = 3; 'Umiarkowana' = 3; 'OK' = 4; 'Niska' = 4 }
+# Status w „Stan serwerów” i w historii skanów: bez połączenia jak krytyczny, OK przed pominiętymi i nieskanowanymi
+$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Krytyczna' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Ważna' = 2; 'Zalecenie' = 3; 'Info' = 3; 'Umiarkowana' = 3; 'OK' = 4; 'Niska' = 4; 'Brak połączenia' = 0; 'Limit czasu' = 1; 'Błąd zbierania danych' = 1; 'Pominięty' = 5; 'Nie skanowano' = 5 }
 
 function Get-SortKeys($Rows, [string]$Path) {
     # Klucze sortowania całej kolumny (jedno wywołanie na kolumnę – wywołanie funkcji na każdą komórkę było za wolne):
@@ -7582,12 +7590,59 @@ function Update-GridSortGlyphs($Grid) {
     $sort = @(Get-GridSort $Grid)
     foreach ($c in @($Grid.Columns)) { $c.SortDirection = Get-SortDirection $sort $c.SortMemberPath }
 }
-function Set-GridRows($Grid, [string]$SortKey, $Rows) {
+$script:GridWidths = @{}          # klucz tabeli -> @{ właściwość = szerokość kolumny ustawiona ręcznie [px] } (kolumny są generowane od nowa)
+$script:KeepSelection = $false    # true w trakcie odtwarzania zaznaczenia – SelectionChanged nie czyści wtedy panelu szczegółów
+function Save-GridWidths($Grid) {
+    # szerokości zmienione przez użytkownika zapamiętujemy przed przebudową kolumn – $onAutoColumn nadaje je nowym kolumnom tej tabeli
+    $st = $Grid.Tag
+    if (-not ($st -is [hashtable]) -or -not $st.Key) { return }
+    $w = $script:GridWidths[$st.Key]
+    if (-not $w) { $w = @{}; $script:GridWidths[$st.Key] = $w }
+    foreach ($c in @($Grid.Columns)) {
+        $p = "$($c.SortMemberPath)"
+        if (-not $p) { continue }
+        if ($c.Width.UnitType -eq [System.Windows.Controls.DataGridLengthUnitType]::Pixel) { $w[$p] = $c.Width.Value } else { $w.Remove($p) }
+    }
+}
+function Get-RowIdPaths($Row) {
+    # właściwości identyfikujące wiersz (problem, maszyna wirtualna, serwer albo host) – do odtworzenia zaznaczenia po odświeżeniu
+    if ($null -eq $Row) { $null }
+    elseif ($Row.PSObject.Properties['IssueKey']) { 'ServerKey', 'IssueKey' }
+    elseif ($Row.PSObject.Properties['_HostKey']) { '_HostKey', 'VM' }
+    elseif ($Row.PSObject.Properties['Key']) { 'Key', 'Key' }
+    else { $null }
+}
+function Set-GridRows($Grid, [string]$SortKey, $Rows, [switch]$Keep, [switch]$NewColumns, [scriptblock]$Filter) {
     # $Rows = kolejność oryginalna; do tabeli trafia jej kopia ułożona wg zapamiętanego sortowania
     $orig  = [object[]]@($Rows)
     $items = Get-SortedRows $orig @($script:GridSort[$SortKey] | Where-Object { $_ })
+    # -Keep: odświeżenie tej samej tabeli (w trakcie skanu co ~1,5 s) – wiersze to nowe obiekty, więc zaznaczenie i przewinięcie odtwarzamy po kluczu wiersza
+    $sel = $null; $all = $false; $sv = $null; $vo = 0; $ho = 0
+    if ($Keep -and $Grid.Tag -is [hashtable] -and $Grid.Tag.Key -eq $SortKey) {
+        $old = @($Grid.SelectedItems)
+        $ip = Get-RowIdPaths $old[0]
+        if ($old.Count -and $ip) {
+            $all = $old.Count -gt 1 -and $old.Count -ge $Grid.Items.Count   # zaznaczone wszystkie widoczne (Ctrl+A)
+            $sel = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($r in $old) { [void]$sel.Add("$($r.($ip[0]))|$($r.($ip[1]))") }
+        }
+        try { if ($Grid.Template) { $sv = $Grid.Template.FindName('DG_ScrollViewer', $Grid) } } catch { $sv = $null }
+        if ($sv) { $vo = $sv.VerticalOffset; $ho = $sv.HorizontalOffset }
+    }
+    # -NewColumns: kolumny generowane od nowa (zestaw właściwości może się zmienić); szerokości ustawione ręcznie wracają w $onAutoColumn
+    if ($NewColumns) { Save-GridWidths $Grid; $Grid.Columns.Clear() }
     $Grid.Tag = @{ Key = $SortKey; Rows = $orig; Items = $items }   # przed ItemsSource – korzysta z niego AutoGeneratingColumn
-    $Grid.ItemsSource = $items
+    $script:KeepSelection = [bool]$sel
+    try {
+        $Grid.ItemsSource = $items
+        if ($Filter) { & $Filter }   # filtr przed odtworzeniem zaznaczenia – zaznaczamy tylko wiersze widoczne
+        if ($all) { $Grid.SelectAll() }
+        elseif ($sel) {
+            $n = 0
+            foreach ($r in @($Grid.Items)) { if ($sel.Contains("$($r.($ip[0]))|$($r.($ip[1]))")) { [void]$Grid.SelectedItems.Add($r); $n++; if ($n -ge 1000) { break } } }
+        }
+    } finally { $script:KeepSelection = $false }
+    if ($sv -and ($vo -or $ho)) { $sv.ScrollToVerticalOffset($vo); $sv.ScrollToHorizontalOffset($ho) }
     Update-GridSortGlyphs $Grid   # zmiana ItemsSource czyści strzałki kolumn zdefiniowanych w XAML
 }
 function Update-GridOrder($Grid) {
@@ -7635,7 +7690,8 @@ function Get-AvailabilityText([string]$Name) {
     if (-not $script:AvailStats) { return '' }
     $st = $script:AvailStats[$Name.ToLowerInvariant()]
     if (-not $st -or -not $st.Seen) { return '' }
-    '{0}/{1} ({2}%)' -f $st.Ok, $st.Seen, [math]::Round(100.0 * $st.Ok / $st.Seen)
+    # procent na początku – kolumna „Dostępność” sortuje się wg niego (tekst porównywany jest wg pierwszej liczby)
+    '{2}% ({0}/{1})' -f $st.Ok, $st.Seen, [math]::Round(100.0 * $st.Ok / $st.Seen)
 }
 function Get-OverviewData([bool]$ShowIgnored = $false) {
     # Problemy i wiersze tabeli „Stan serwerów” – wspólne dla widoku, raportu HTML i trybu bez okna
@@ -7645,12 +7701,14 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
     $online = 0; $offline = 0; $crit = 0; $warn = 0; $ign = 0
     foreach ($it in $script:Servers) {
         $d = $script:Data[$it.Name]
-        if (-not $d) { continue }
+        $st = if ($script:AvailStats) { $script:AvailStats[$it.Name.ToLowerInvariant()] } else { $null }
+        # CpuUsage = obciążenie CPU w % (nagłówek „CPU [%]” jak „RAM [%]”; „CPU” to w tabeli maszyn liczba vCPU)
+        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; UptimeDays = $null; CpuUsage = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null; CveMissing = $null; CveExpl = $null
+                            Crit = [int]$d._Crit; Warn = [int]$d._Warn; Availability = (Get-AvailabilityText $it.Name); LastOk = $(if ($st) { $st.LastOk } else { '' }); ScanSec = $null; Scanned = $d.ScannedAt; Flag = '' }
+        # serwer bez danych (nowy, bez migawek albo skan przerwany) też ma wiersz – tabela i raport obejmują całą listę
+        if (-not $d) { $base.Status = 'Nie skanowano'; $base.Flag = 'muted'; $sum.Add([pscustomobject]$base); continue }
         foreach ($i in @($(if ($showIgnored) { $d._Ignored } else { $d._Issues }))) { if ($i) { $all.Add($i) } }
         $crit += [int]$d._Crit; $warn += [int]$d._Warn; $ign += @($d._Ignored).Count
-        $st = if ($script:AvailStats) { $script:AvailStats[$it.Name.ToLowerInvariant()] } else { $null }
-        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; UptimeDays = $null; CPU = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null; CveMissing = $null; CveExpl = $null
-                            Crit = [int]$d._Crit; Warn = [int]$d._Warn; Availability = (Get-AvailabilityText $it.Name); LastOk = $(if ($st) { $st.LastOk } else { '' }); ScanSec = $null; Scanned = $d.ScannedAt; Flag = '' }
         if ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) {
             $base.Status = 'Pominięty'; $base.Flag = 'muted'; $base.OS = "$($d.Unsupported)"
         } elseif ($d.Offline) {
@@ -7663,7 +7721,7 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
             $online++
             $s = $d.System
             $base.Status = 'OK'; $base.OS = "$($s.OS)" -replace '^Microsoft ', ''
-            $base.UptimeDays = $s.UptimeDays; $base.CPU = $s.CpuLoad; $base.RAM = $s.RamUsedPct
+            $base.UptimeDays = $s.UptimeDays; $base.CpuUsage = $s.CpuLoad; $base.RAM = $s.RamUsedPct
             $base.MinDiskPct = (@($d.Disks) | Where-Object { $_ } | Measure-Object FreePct -Minimum).Minimum
             $base.PatchDays = $(if ($s.LastHotfixDays -ge 0) { $s.LastHotfixDays } else { $null })
             $cs = $d.PSObject.Properties['_CveSum'].Value
@@ -7690,16 +7748,51 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
         Online = $online; Offline = $offline; Crit = $crit; Warn = $warn; Ignored = $ign; Hosts = $hosts; VmRun = $vmRun; VmAll = $vmAll
     }
 }
+$script:Headers['ServerList'] = 'Serwery'   # zgrupowane problemy: lista serwerów (panel szczegółów, eksport CSV)
+function Group-IssueRows($Issues) {
+    # „Grupuj”: jeden wiersz na rodzaj problemu (ten sam poziom i IssueKey – liczby zastąpione '#') z liczbą i listą serwerów
+    $g = [ordered]@{}
+    foreach ($i in @($Issues)) {
+        if (-not $i) { continue }
+        $k = "$($i.Rank)|$($i.IssueKey)"
+        if (-not $g.Contains($k)) { $g[$k] = New-Object System.Collections.Generic.List[object] }
+        $g[$k].Add($i)
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $g.Keys) {
+        $l = $g[$k]; $f = $l[0]; $n = $l.Count
+        $seen = @{}; $same = $true
+        foreach ($x in $l) { $seen["$($x.Server)"] = 1; if ("$($x.Message)" -ne "$($f.Message)") { $same = $false } }
+        $srv = [string[]]@($seen.Keys); [Array]::Sort($srv, [StringComparer]::OrdinalIgnoreCase)
+        # różne liczby w treści (dni, procenty) – opis z klucza problemu, z '#' w miejscu liczb
+        $msg = if ($same) { "$($f.Message)" } else { ("$($f.IssueKey)" -split '\|', 3)[-1] }
+        $rows.Add([pscustomobject]@{ Severity = $f.Severity; Server = "$n × $(Join-Short $srv 3)"; Category = $f.Category; Message = $msg; ServerList = ($srv -join ', ')
+            ServerKey = $(if ($n -eq 1) { $f.ServerKey } else { '' }); Section = $f.Section; Rank = $f.Rank; SevColor = $f.SevColor; SevBg = $f.SevBg; Flag = $f.Flag; IssueKey = $f.IssueKey; Ignored = $f.Ignored
+            _Count = $n; _Items = [object[]]$l.ToArray(); _Search = ("$($srv -join ' ') $($f.Category) $msg $($f.Message)").ToLowerInvariant() })
+    }
+    Get-SortedRows ([object[]]$rows.ToArray()) @(@{ Path = 'Rank'; Desc = $false }, @{ Path = '_Count'; Desc = $true }, @{ Path = 'Message'; Desc = $false })
+}
+function Show-IssueGroup($Row) {
+    # dwuklik / menu na zgrupowanym problemie: pojedyncze problemy, filtr po najdłuższym fragmencie opisu bez liczb
+    $part = @("$($Row.Message)" -split '#' | ForEach-Object { $_.Trim() } | Sort-Object Length -Descending)[0]
+    $ui.chkGroup.IsChecked = $false
+    $ui.txtIssueFilter.Text = "$part".ToLowerInvariant()
+    Update-Overview
+}
 function Update-Overview {
     $showIgnored = [bool]$ui.chkIgnored.IsChecked
+    $grouped = [bool]$ui.chkGroup.IsChecked
     $o = Get-OverviewData $showIgnored
     $script:AllIssues = $o.Issues
-    Set-GridRows $ui.gridIssues 'issues' $script:AllIssues
-    Update-IssueFilter
-    $ui.txtIssuesTitle.Text = if ($showIgnored) { 'Wyciszone problemy' } else { 'Wykryte problemy' }
+    $rows = $script:AllIssues
+    if ($grouped) { $rows = Group-IssueRows $o.Issues }
+    # zaznaczenie i przewinięcie przetrwają odświeżenie w trakcie skanu; widok zgrupowany ma osobne sortowanie
+    Set-GridRows $ui.gridIssues $(if ($grouped) { 'issues:group' } else { 'issues' }) $rows -Keep -Filter { Update-IssueFilter }
+    $dt = Format-RowDetail $ui.gridIssues.SelectedItem
+    if ($ui.dIssueDetail.Text -ne $dt) { $ui.dIssueDetail.Text = $dt }
+    $ui.txtIssuesTitle.Text = "$(if ($showIgnored) { 'Wyciszone problemy' } else { 'Wykryte problemy' })$(if ($grouped) { ' – zgrupowane' })"
     $ui.chkIgnored.Content = if ($o.Ignored) { "Wyciszone ($($o.Ignored))" } else { 'Wyciszone' }
-    $ui.gridServers.Columns.Clear()
-    Set-GridRows $ui.gridServers 'servers' $o.Servers
+    Set-GridRows $ui.gridServers 'servers' $o.Servers -Keep -NewColumns
     $ui.tTotal.Text   = "$($script:Servers.Count)"
     $ui.tOnline.Text  = "$($o.Online)"
     $ui.tOffline.Text = "$($o.Offline)"
@@ -7729,15 +7822,29 @@ function Update-IssueFilter {
 #endregion
 
 #region ── Widok Hyper-V (wszystkie hosty i maszyny) ────────────────────────────
-function Get-ServerByGuest([hashtable]$ByDisplay, $Row) {
+function Get-ServerByGuest([hashtable]$ByDisplay, $Row, [hashtable]$ByVm, [string]$HostDisplay) {
+    # jak Find-VmForServer: najpierw identyfikator i nazwa VM z danych gościa (działa też dla wyłączonej maszyny bez KVP), potem nazwa gościa z KVP albo nazwa VM
+    if ($ByVm) {
+        $id = "$($Row.PSObject.Properties['Id'].Value)"
+        if ($id -and $ByVm.ContainsKey($id)) { return $ByVm[$id] }
+        $nk = "$HostDisplay|$("$($Row.Name)".ToUpperInvariant())"
+        if ($ByVm.ContainsKey($nk)) { return $ByVm[$nk] }
+    }
     $g = "$($Row.PSObject.Properties['GuestFQDN'].Value)"
     if ($g) { $it = $ByDisplay[(Get-DisplayName $g)]; if ($it) { return $it } }
     $ByDisplay["$($Row.Name)".ToUpperInvariant()]
 }
 function Get-VmData {
     if (-not $script:VmIndex) { Update-VmIndex }
-    $byDisplay = @{}
-    foreach ($it in $script:Servers) { if (-not $byDisplay.ContainsKey($it.Display)) { $byDisplay[$it.Display] = $it } }
+    $byDisplay = @{}; $byVm = @{}
+    foreach ($it in $script:Servers) {
+        if (-not $byDisplay.ContainsKey($it.Display)) { $byDisplay[$it.Display] = $it }
+        # maszyna gościa wg jego danych (także ostatnich udanych – serwer offline): identyfikator VM, a w starszych danych host + nazwa VM
+        $gs = Get-DataSystem $script:Data[$it.Name]
+        if (-not $gs) { continue }
+        if ($gs.PSObject.Properties['HvVmId'] -and $gs.HvVmId) { if (-not $byVm.ContainsKey("$($gs.HvVmId)")) { $byVm["$($gs.HvVmId)"] = $it } }
+        elseif ($gs.PSObject.Properties['HvVmName'] -and $gs.HvVmName -and $gs.PSObject.Properties['HvHost'] -and $gs.HvHost) { $nk = "$(Get-DisplayName "$($gs.HvHost)")|$("$($gs.HvVmName)".ToUpperInvariant())"; if (-not $byVm.ContainsKey($nk)) { $byVm[$nk] = $it } }
+    }
     # Hosty
     $hosts = New-Object System.Collections.Generic.List[object]
     $oldCp = 0; $cpuSum = 0; $ramSum = 0.0; $run = 0; $tot = 0
@@ -7753,7 +7860,8 @@ function Get-VmData {
         $flag = if ($d._Crit) { 'crit' } elseif (($ratio -and $ratio -gt $Config.VcpuRatioWarn) -or ($pct -and $pct -ge $Config.HostRamWarnPct)) { 'warn' } else { '' }
         $hosts.Add([pscustomobject]@{
             Key = $it.Name; Host = $it.Display; HvCluster = $(if ($s.PSObject.Properties['HvCluster']) { "$($s.HvCluster)" } else { '' })
-            Vms = "$($s.HvVmRunning) / $($s.HvVmTotal)"; VCpuRatio = $(if ($ratio) { "$vr / $lp ($ratio : 1)" } else { '' }); RamPct = $pct
+            # współczynnik na początku i zawsze z 2 miejscami po kropce – sortowanie tekstu porównuje liczby po kolei (2.50 > 2.25, 3.00 > 2.50)
+            Vms = "$($s.HvVmRunning) / $($s.HvVmTotal)"; VCpuRatio = $(if ($ratio) { "$($ratio.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)) : 1 ($vr / $lp)" } else { '' }); RamPct = $pct
             HvRamAssignedGB = $as; RamGB = $ram; Checkpoints = $cp; Crit = [int]$d._Crit; Warn = [int]$d._Warn; Scanned = $d.ScannedAt; Flag = $flag
         })
     }
@@ -7765,7 +7873,7 @@ function Get-VmData {
         $lin = "$($r.PSObject.Properties['Linux'].Value)" -eq 'Tak'
         $rpl = "$($r.PSObject.Properties['ReplicationMode'].Value)" -match 'Replica'
         if ($lin) { $linux++ }
-        $srv = if ($rpl) { $null } else { Get-ServerByGuest $byDisplay $r }
+        $srv = if ($rpl) { $null } else { Get-ServerByGuest $byDisplay $r $byVm $e.HostDisplay }
         $gst = if ($rpl) { 'replika (Hyper-V Replica)' } elseif ($lin) { 'Linux – nie skanujemy' } elseif (-not $srv) { '' } else { switch ($srv.Status) { 'ok' { "OK$(if ($srv.Crit) { ", krytyczne: $($srv.Crit)" } elseif ($srv.Warn) { ", ostrzeżenia: $($srv.Warn)" })" } 'offline' { 'Brak połączenia' } 'skipped' { 'Pominięty' } default { 'Nieskanowany' } } }
         $flag = "$($r.Flag)"
         if (-not $flag -and $srv -and $srv.Status -eq 'offline' -and "$($r.State)" -eq 'Running') { $flag = 'warn' }
@@ -7782,11 +7890,9 @@ function Get-VmData {
 }
 function Update-VmView {
     $v = Get-VmData
-    $ui.gridHosts.Columns.Clear()
-    Set-GridRows $ui.gridHosts 'vmhosts' $v.Hosts
-    $ui.gridVms.Columns.Clear()
-    Set-GridRows $ui.gridVms 'vms' $v.Vms
-    Update-VmFilter
+    # odświeżenie w trakcie skanu zachowuje zaznaczenie, przewinięcie i ręcznie zmienione szerokości kolumn
+    Set-GridRows $ui.gridHosts 'vmhosts' $v.Hosts -Keep -NewColumns
+    Set-GridRows $ui.gridVms 'vms' $v.Vms -Keep -NewColumns -Filter { Update-VmFilter }
     $ui.vHosts.Text = "$(@($v.Hosts).Count)"
     $ui.vVms.Text = "$($v.Run) / $($v.Total)"
     $ui.vCpu.Text = "$($v.Cpu)"
@@ -7817,14 +7923,23 @@ function Update-VmFilter {
     $ui.txtVmCount.Text = "$(@($view).Count) z $(@($ui.gridVms.ItemsSource).Count)"
 }
 function Add-VmsToList {
-    # Maszyny Windows spoza listy (zaznaczone albo wszystkie widoczne) → lista serwerów; Linux pomijany
+    # Maszyny Windows spoza listy (zaznaczone albo – po wyraźnym pytaniu – wszystkie widoczne) → lista serwerów; Linux pomijany
     $sel = @($ui.gridVms.SelectedItems)
-    if (-not $sel.Count) { $sel = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridVms.ItemsSource)) }
+    $visible = -not $sel.Count
+    if ($visible) { $sel = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridVms.ItemsSource)) }
     $cand = @($sel | Where-Object { $_ -and -not $_.OnList -and -not $_._Linux })
     if (-not $cand.Count) { Show-Toast 'Brak maszyn Windows spoza listy wśród wybranych.' 'info'; return }
-    $names = @($cand | ForEach-Object { if ($_.GuestFQDN) { $_.GuestFQDN } else { $_.VM } } | Sort-Object -Unique)
+    $all = @($cand | ForEach-Object { if ($_.GuestFQDN) { $_.GuestFQDN } else { $_.VM } } | Sort-Object -Unique)
+    # tylko poprawne nazwy hostów: nazwa VM z Hyper-V bywa opisem („SQL01 - produkcja”), a lista w pliku jest cięta na pierwszej spacji
+    $names = @($all | Where-Object { "$_" -match '^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}(\.[A-Za-z0-9_-]{1,63})*$' })
+    $bad = @($all | Where-Object { $names -notcontains $_ })
+    if (-not $names.Count) { Show-Message "Żadna z wybranych maszyn nie ma poprawnej nazwy hosta (np. nazwa VM z opisem, a nazwa gościa nieznana – maszyna wyłączona): $($bad -join ', ')`n`nDodaj je ręcznie pod właściwą nazwą DNS." 'Dodaj maszyny do listy' 'info'; return }
+    $txt = "$(if ($visible) { 'Nie zaznaczono maszyn – dodać do listy serwerów wszystkie widoczne maszyny Windows spoza listy' } else { 'Dodać do listy serwerów zaznaczone maszyny' }) ($($names.Count))?`n`n$($names -join ', ')"
+    if ($bad.Count) { $txt += "`n`nPominięte ($($bad.Count)) – to nie jest poprawna nazwa hosta (np. nazwa VM z opisem, a nazwa gościa nieznana); dodaj je ręcznie pod nazwą DNS: $($bad -join ', ')" }
+    $dom = "$env:USERDNSDOMAIN".ToLowerInvariant()
+    $other = @(if ($dom) { $names | Where-Object { "$_".Contains('.') -and -not "$_".ToLowerInvariant().EndsWith(".$dom") } })
+    if ($other.Count) { $txt += "`n`nSpoza domeny $dom ($($other.Count)) – nazwę zgłasza system gościa, sprawdź, czy to właściwe serwery: $($other -join ', ')" }
     $unknown = @($cand | Where-Object { -not $_.GuestOS }).Count
-    $txt = "Dodać do listy serwerów maszyny ($($names.Count)): $(Join-Short $names 12)?"
     if ($unknown) { $txt += "`n`nU $unknown maszyn system gościa jest nieznany (np. maszyna wyłączona) – jeśli to Linux, zostanie rozpoznany i pominięty po skanie hosta." }
     if (-not (Confirm-Action -Text $txt -Title 'Dodaj maszyny do listy' -ConfirmText 'Dodaj' -Tone 'info')) { return }
     $n = 0
@@ -7900,10 +8015,11 @@ function Get-SectionRows($D, [string]$Key, [string]$Name = $script:CurrentServer
                 [pscustomobject]@{ Severity = $(if ($i.Ignored) { "$($i.Severity) (wyciszony)" } else { $i.Severity }); Category = $i.Category; Message = $i.Message; Flag = $(if ($i.Ignored) { 'muted' } else { $i.Flag }); _Issue = $i }
             })
         }
-        'Changes'     { @($D._Changes | Where-Object { $_ }) }
+        # pętle foreach zamiast potoków Where-Object – sekcje liczone przy każdym otwarciu serwera mają tysiące wierszy
+        'Changes'     { @(foreach ($x in $D._Changes) { if ($x) { $x } }) }
         'Diagnostics' { @(Get-DiagnosticsRows $Name $D) }
         'History'     { @(Get-AvailabilityHistory $Name) }
-        'HvHost'      { @($D._HvHost | Where-Object { $_ }) }
+        'HvHost'      { @(foreach ($x in $D._HvHost) { if ($x) { $x } }) }
         'Cve'         { @(Get-CveRows $D) }
         'System'  {
             if ($D.System) {
@@ -7919,7 +8035,7 @@ function Get-SectionRows($D, [string]$Key, [string]$Name = $script:CurrentServer
             }
         }
         default {
-            $rows = @($D.$Key | Where-Object { $null -ne $_ })
+            $rows = @(foreach ($x in $D.$Key) { if ($null -ne $x) { $x } })
             # lekka kopia danych: z dużych sekcji zostały tylko wiersze oznaczone
             if (-not $rows.Count -and $D.PSObject.Properties['_Slim'] -and $D._Flagged -and $D._Flagged.ContainsKey($Key)) { $rows = @($D._Flagged[$Key]) }
             $rows
@@ -7944,8 +8060,10 @@ function Test-SectionShown($D, [string]$Key) {
     $true
 }
 function Get-WorstFlag($Rows) {
-    $f = @($Rows | ForEach-Object { "$($_.Flag)" })
-    if ($f -contains 'crit') { 'crit' } elseif ($f -contains 'warn') { 'warn' } elseif ($f -contains 'info') { 'info' } else { '' }
+    # jedno przejście bez potoku; pierwszy 'crit' kończy szukanie
+    $w = ''
+    foreach ($r in $Rows) { switch ("$($r.Flag)") { 'crit' { return 'crit' } 'warn' { $w = 'warn' } 'info' { if (-not $w) { $w = 'info' } } } }
+    $w
 }
 
 function Show-ServerDetail([string]$Name) {
@@ -7961,8 +8079,9 @@ function Show-ServerDetail([string]$Name) {
     $ui.dName.Text = $item.Display
     if (-not $d) { $ui.dOS.Text = "$Name – jeszcze nie skanowano. Użyj przycisku Skanuj ponownie."; & $clear; return }
     if (-not $d.Offline -and $d.PSObject.Properties['_Slim']) {
-        $old = $window.Cursor; $window.Cursor = [System.Windows.Input.Cursors]::Wait
-        try { $d = Get-ServerFull $Name } finally { $window.Cursor = $old }
+        # $script:window – z taktu silnika w pętli okna modalnego $window wskazywałby (zakres dynamiczny) parametr $Window z Invoke-Dialog
+        $old = $script:window.Cursor; $script:window.Cursor = [System.Windows.Input.Cursors]::Wait
+        try { $d = Get-ServerFull $Name } finally { $script:window.Cursor = $old }
     }
     $ui.dCrit.Text = "$($d._Crit)"; $ui.dWarn.Text = "$($d._Warn)"
     $av = if ($script:AvailStats) { $script:AvailStats[$Name.ToLowerInvariant()] } else { $null }
@@ -8034,26 +8153,34 @@ function Show-Section {
     if (-not $sel) { return }
     $script:CurrentSection = $sel.Key
     $ui.dSectionTitle.Text = $sel.Header
-    $ui.dSectionCount.Text = "$($sel.Count) pozycji"
+    Save-GridWidths $ui.gridDetail   # szerokości kolumn zapamiętane dla sekcji (przed ItemsSource = $null, które usuwa kolumny)
     $ui.gridDetail.ItemsSource = $null
     $ui.gridDetail.Columns.Clear()
     $rows = @($sel.Rows)
     Set-GridRows $ui.gridDetail "detail:$($sel.Key)" $rows   # sortowanie zapamiętane dla tej sekcji (także po zmianie serwera)
-    $ui.dEmpty.Visibility = if ($rows.Count) { 'Collapsed' } else { 'Visible' }
     $ui.dRowDetail.Text = ''
-    Update-DetailFilter
+    Update-DetailFilter   # licznik pozycji i komunikat o pustej tabeli – z uwzględnieniem filtra
 }
 function Update-DetailFilter {
     if ($null -eq $ui.gridDetail.ItemsSource) { return }
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridDetail.ItemsSource)
     if (-not $view) { return }
     $t = $ui.txtGridFilter.Text.Trim()
-    if (-not $t) { $view.Filter = $null; return }
+    if (-not $t) { $view.Filter = $null; Update-DetailCount $view ''; return }
     $view.Filter = [Predicate[object]]({
         param($o)
         foreach ($p in $o.PSObject.Properties) { if ($p.Name -notlike '_*' -and "$($p.Value)".IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
         $false
     }.GetNewClosure())
+    Update-DetailCount $view $t
+}
+function Update-DetailCount($View, [string]$Text) {
+    # filtr zostaje po zmianie sekcji i serwera – licznik „X z Y” i osobny komunikat, żeby pusta tabela nie wyglądała na pustą sekcję
+    $total = @($ui.gridDetail.ItemsSource).Count
+    $shown = if ($Text) { @($View).Count } else { $total }
+    $ui.dSectionCount.Text = if ($Text) { "$shown z $total pozycji" } else { "$total pozycji" }
+    $ui.dEmpty.Text = if ($total) { 'Brak wierszy pasujących do filtra „{0}”' -f $Text } else { 'Brak pozycji w tej sekcji' }
+    $ui.dEmpty.Visibility = if ($shown) { 'Collapsed' } else { 'Visible' }
 }
 function Select-Server([string]$Key, [string]$Section) {
     $item = Get-ServerItem $Key
@@ -9217,6 +9344,9 @@ $onAutoColumn = {
     if ($e.PropertyName -in 'Flag', 'Key', 'Rows' -or $e.PropertyName -like '_*') { $e.Cancel = $true; return }
     $e.Column.Header = Get-Header $e.PropertyName
     $e.Column.MaxWidth = 900
+    # szerokość zmieniona ręcznie przed odświeżeniem tabeli (Save-GridWidths)
+    $gw = if ($src.Tag -is [hashtable]) { $script:GridWidths[$src.Tag.Key] } else { $null }
+    if ($gw -and $gw.ContainsKey($e.PropertyName)) { $e.Column.Width = New-Object System.Windows.Controls.DataGridLength ([double]$gw[$e.PropertyName]) }
     # właściwości obiektów PowerShell mają typ object, dla którego DataGrid wyłącza sortowanie – sortuje Invoke-GridSort
     $e.Column.CanUserSort = $true
     $e.Column.SortDirection = Get-SortDirection @(Get-GridSort $src) $e.Column.SortMemberPath
@@ -9247,6 +9377,7 @@ $ui.txtGridFilter.Add_TextChanged({ Request-Filter 'detail' { Update-DetailFilte
 $ui.txtServerFilter.Add_TextChanged({ Request-Filter 'servers' { Update-ServerFilter } })
 foreach ($rb in 'sfAll', 'sfProblems', 'sfOffline', 'sfHosts', 'sfVms', 'sfNew') { $ui[$rb].Add_Checked({ Update-ServerFilter }) }
 $ui.chkIgnored.Add_Click({ Invoke-UiAction 'Widok' { Update-Overview } })
+$ui.chkGroup.Add_Click({ Invoke-UiAction 'Widok' { Update-Overview } })
 foreach ($rb in 'vfAll', 'vfRunning', 'vfOff', 'vfProblems', 'vfNotListed') { $ui[$rb].Add_Checked({ Update-VmFilter }) }
 $ui.txtVmFilter.Add_TextChanged({ Request-Filter 'vms' { Update-VmFilter } })
 foreach ($rb in 'lfAll', 'lfWarn', 'lfErr') { $ui[$rb].Add_Checked({ Update-LogFilter }) }
@@ -9279,7 +9410,7 @@ function Format-RowDetail($Row) {
     $lines -join [Environment]::NewLine
 }
 $ui.gridDetail.Add_SelectionChanged({ $ui.dRowDetail.Text = Format-RowDetail $ui.gridDetail.SelectedItem })
-$ui.gridIssues.Add_SelectionChanged({ $ui.dIssueDetail.Text = Format-RowDetail $ui.gridIssues.SelectedItem })
+$ui.gridIssues.Add_SelectionChanged({ if (-not $script:KeepSelection) { $ui.dIssueDetail.Text = Format-RowDetail $ui.gridIssues.SelectedItem } })   # odświeżenie w trakcie skanu nie czyści panelu
 
 function Remove-SelectedServers {
     $sel = @($ui.lstServers.SelectedItems)
@@ -9343,7 +9474,16 @@ $script:IssueMenuOpening = {
     $m.Items.Clear()
     $i = Get-ContextIssue $s
     if (-not $i) { $e.Handled = $true; return }
+    if ($i.PSObject.Properties['_Items'] -and $i._Count -eq 1) { $i = $i._Items[0] }   # grupa z jednego serwera = zwykły problem
     $script:MenuIssue = $i
+    if ($i.PSObject.Properties['_Items']) {
+        # zgrupowany problem z wielu serwerów: wyciszenie całej grupy albo przejście do pojedynczych problemów
+        if (-not $i.Ignored) { [void]$m.Items.Add((New-MenuItem "Wycisz na wszystkich serwerach ($($i._Count))" 'E74F' { Add-IgnoreRule $script:MenuIssue -AllServers })) }
+        [void]$m.Items.Add((New-MenuItem "Pokaż pojedyncze problemy ($($i._Count))" 'E8FD' { Show-IssueGroup $script:MenuIssue }))
+        [void]$m.Items.Add((New-MenuSeparator))
+        [void]$m.Items.Add((New-MenuItem 'Kopiuj treść i listę serwerów' 'E8C8' { [System.Windows.Clipboard]::SetText("$($script:MenuIssue.Message)$([Environment]::NewLine)Serwery: $($script:MenuIssue.ServerList)"); Show-Toast 'Skopiowano.' 'ok' 2 }))
+        return
+    }
     if ($i.Ignored) {
         [void]$m.Items.Add((New-MenuItem 'Przywróć (usuń wyciszenie)' 'E767' { Remove-IgnoreRule $script:MenuIssue }))
     } else {
@@ -9452,7 +9592,7 @@ $ui.btnIssuesCsv.Add_Click({ Invoke-UiAction 'Eksport' { Export-GridCsv $ui.grid
 $ui.btnServersCsv.Add_Click({ Invoke-UiAction 'Eksport' { Export-GridCsv $ui.gridServers 'Stan_serwerow' } })
 $ui.btnVmCsv.Add_Click({ Invoke-UiAction 'Eksport' { Export-GridCsv $ui.gridVms 'Maszyny_wirtualne' } })
 
-$ui.gridIssues.Add_MouseDoubleClick({ param($s, $e) $i = Get-ClickedRowItem $e; if ($i -and $i.ServerKey -and (Get-ServerItem $i.ServerKey)) { Invoke-UiAction 'Widok' { Select-Server $i.ServerKey $i.Section } } })
+$ui.gridIssues.Add_MouseDoubleClick({ param($s, $e) $i = Get-ClickedRowItem $e; if ($i -and $i.ServerKey -and (Get-ServerItem $i.ServerKey)) { Invoke-UiAction 'Widok' { Select-Server $i.ServerKey $i.Section } } elseif ($i -and $i.PSObject.Properties['_Items'] -and $i._Count -gt 1) { Invoke-UiAction 'Widok' { Show-IssueGroup $i } } })
 $ui.gridServers.Add_MouseDoubleClick({ param($s, $e) $r = Get-ClickedRowItem $e; if ($r) { Invoke-UiAction 'Widok' { Select-Server $r.Key 'Issues' } } })
 $ui.gridHosts.Add_MouseDoubleClick({ param($s, $e) $r = Get-ClickedRowItem $e; if ($r) { Invoke-UiAction 'Widok' { Select-Server $r.Key 'HvHost' } } })
 $ui.gridVms.Add_MouseDoubleClick({
