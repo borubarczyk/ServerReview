@@ -21,6 +21,10 @@ jobs:
         shell: powershell
         run: .\tools\ci.ps1 -Step Syntax
 
+      - name: Content (collector without suspicious content, WorkerBody syntax, XAML)
+        shell: powershell
+        run: .\tools\ci.ps1 -Step Content
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: .\tools\ci.ps1 -Step Analyzer

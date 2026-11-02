@@ -2297,7 +2297,7 @@ $Collector = {
         Errors         = $errList
         Days           = $Days
         DurationSec    = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-        CollectorVersion = 2   # zmiana formatu wierszy porównywanych sekcji = nowy numer (stacja nie porównuje migawek różnych wersji)
+        CollectorVersion = 3   # zmiana formatu wierszy porównywanych sekcji = nowy numer (stacja nie porównuje migawek różnych wersji)
     } | ConvertTo-Json -Depth 4 -Compress
     # Czas serwera PO serializacji – stacja liczy różnicę zegarów bez czasu budowania JSON (przy dużych serwerach to sekundy)
     '@@SRTIME@@' + [DateTime]::UtcNow.ToString('o')
