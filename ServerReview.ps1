@@ -1121,10 +1121,16 @@ $Collector = {
 
     # ── Certyfikaty ──
     $certs = @(S 'Certificates' 'Certyfikaty' {
-        Get-ChildItem Cert:\LocalMachine\My | ForEach-Object {
-            [pscustomobject]@{
-                Subject = $_.Subject; Issuer = $_.Issuer; NotAfter = $(D $_.NotAfter); DaysLeft = [int]($_.NotAfter - $now).TotalDays
-                PrivateKey = $(if ($_.HasPrivateKey) { 'Tak' } else { 'Nie' }); Thumbprint = $_.Thumbprint
+        # WebHosting: certyfikaty powiązań IIS (SNI, centralny magazyn certyfikatów) – magazyn istnieje tylko z IIS 8+
+        $stores = @('My'); if (Test-Path 'Cert:\LocalMachine\WebHosting') { $stores += 'WebHosting' }
+        foreach ($st in $stores) {
+            Get-ChildItem "Cert:\LocalMachine\$st" | ForEach-Object {
+                # certyfikat z samym SAN (np. ACME) ma pusty podmiot – pokazujemy nazwy DNS
+                $sub = "$($_.Subject)"; if (-not $sub) { $dn = @(foreach ($x in @($_.DnsNameList)) { if ("$x") { "$x" } }); if ($dn.Count) { $sub = "SAN: $(@($dn | Select-Object -First 3) -join ', ')$(if ($dn.Count -gt 3) { ', …' })" } }
+                [pscustomobject]@{
+                    Subject = $sub; Issuer = $_.Issuer; NotAfter = $(D $_.NotAfter); DaysLeft = [int]($_.NotAfter - $now).TotalDays
+                    PrivateKey = $(if ($_.HasPrivateKey) { 'Tak' } else { 'Nie' }); Thumbprint = $_.Thumbprint; Store = $st
+                }
             }
         }
     })
@@ -1140,23 +1146,28 @@ $Collector = {
             if (-not (Test-Path -LiteralPath $p)) { continue }
             # Wszerz, do 3 poziomów, najwyżej 20 000 plików: zaniedbany C:\Windows\Temp potrafi mieć setki tysięcy plików
             # (pełne wyliczenie przekraczało limit pamięci sesji WinRM i cały serwer wyglądał na niedostępny)
-            $cap = 20000; $count = 0; $total = [int64]0; $execCount = 0; $capped = $false
+            $cap = 20000; $count = 0; $total = [int64]0; $execCount = 0; $capped = $false; $deep = $false
             $top = New-Object System.Collections.Generic.List[object]
             $queue = New-Object System.Collections.Generic.Queue[object]
             $queue.Enqueue(@((New-Object IO.DirectoryInfo $p), 0))
             while ($queue.Count -and -not $capped) {
                 $di, $lvl = $queue.Dequeue()
-                $fi = @(); try { $fi = @($di.GetFiles()) } catch { }
-                foreach ($x in $fi) {
-                    $count++; $total += $x.Length
-                    if ($execExt -contains $x.Extension.ToLower()) { $execCount++ }
-                    $top.Add($x)
-                    if ($top.Count -ge 400) { $keep = @($top | Sort-Object LastWriteTime -Descending | Select-Object -First 50); $top.Clear(); foreach ($k in $keep) { $top.Add($k) } }
-                    if ($count -ge $cap) { $capped = $true; break }
-                }
-                if ($lvl -lt 3) { $sub = @(); try { $sub = @($di.GetDirectories()) } catch { }; foreach ($sd in $sub) { $queue.Enqueue(@($sd, ($lvl + 1))) } }
+                # EnumerateFiles/EnumerateDirectories (.NET 4) wyliczają strumieniowo – GetFiles() budował najpierw tablicę WSZYSTKICH plików katalogu,
+                # więc limit nie chronił przed płaskim katalogiem z milionem plików
+                try {
+                    foreach ($x in $di.EnumerateFiles()) {
+                        $count++; $total += $x.Length
+                        if ($execExt -contains $x.Extension.ToLower()) { $execCount++ }
+                        $top.Add($x)
+                        if ($top.Count -ge 400) { $keep = @($top | Sort-Object LastWriteTime -Descending | Select-Object -First 50); $top.Clear(); foreach ($k in $keep) { $top.Add($k) } }
+                        if ($count -ge $cap) { $capped = $true; break }
+                    }
+                } catch { }
+                if ($capped) { break }
+                if ($lvl -lt 3) { try { foreach ($sd in $di.EnumerateDirectories()) { $queue.Enqueue(@($sd, ($lvl + 1))) } } catch { } }
+                elseif (-not $deep) { try { foreach ($sd in $di.EnumerateDirectories()) { $deep = $true; break } } catch { } }
             }
-            [pscustomobject]@{ Folder = $p; File = "[podsumowanie] plików: $count$(if ($capped) { '+ (przerwano liczenie)' }), wykonywalnych/skryptów: $execCount"; SizeKB = [math]::Round($total / 1KB); Modified = ''; Executable = $(if ($execCount) { "$execCount" } else { '' }) }
+            [pscustomobject]@{ Folder = $p; File = "[podsumowanie] plików: $count$(if ($capped) { '+ (przerwano liczenie)' } elseif ($deep) { ' (bez podfolderów głębszych niż 3 poziomy)' }), wykonywalnych/skryptów: $execCount"; SizeKB = [math]::Round($total / 1KB); Modified = ''; Executable = $(if ($execCount) { "$execCount" } else { '' }) }
             $root = $p.TrimEnd('\').Length
             $top | Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object {
                 [pscustomobject]@{
@@ -1169,17 +1180,21 @@ $Collector = {
 
     # ── Hyper-V ──
     # Get-VM, dyski i informacje VHD zbierane RAZ (Get-VHD otwiera plik dysku – przy kilkudziesięciu maszynach to najwolniejsza część skanu hosta)
-    $hyperv = @(); $checkpoints = @(); $vmStorage = @(); $clusterRows = @()
-    if ($sys.IsHyperV -and ((Want 'HyperV') -or (Want 'Checkpoints') -or (Want 'VMStorage'))) {
+    # Sekcja Klaster jest w tym bloku (pojemność hosta potrzebna do testu N+1) – zbierana także przy odznaczonych sekcjach maszyn
+    $hyperv = @(); $checkpoints = @(); $vmStorage = @(); $clusterRows = @(); $csvList = $null
+    if ($sys.IsHyperV -and ((Want 'HyperV') -or (Want 'Checkpoints') -or (Want 'VMStorage') -or (Want 'Cluster'))) {
         $t0 = $sw.Elapsed.TotalSeconds
         $vms = @(); $hdAll = @(); $snaps = @(); $vhdCache = @{}; $kvp = @{}; $nics = @{}; $since2 = @{}
         $sys.HvVmms = "$((Get-Service vmms -ErrorAction SilentlyContinue).Status)"
         if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { $errs.Add('Hyper-V: brak modułu PowerShell Hyper-V na hoście (Install-WindowsFeature Hyper-V-PowerShell)') }
         else { try { $vms = @(Get-VM -ErrorAction Stop) } catch { $errs.Add("Hyper-V: $($_.Exception.Message)") } }
         if ($vms.Count) {
-            try { $hdAll = @(Get-VMHardDiskDrive -VM $vms -ErrorAction Stop) } catch { $errs.Add("Hyper-V (dyski): $($_.Exception.Message)") }
-            try { $snaps = @(Get-VMSnapshot -VM $vms -ErrorAction Stop) } catch {}
-            try { foreach ($n in @(Get-VMNetworkAdapter -VM $vms -ErrorAction Stop)) { $k = "$($n.VMId)".ToUpper(); if (-not $nics.ContainsKey($k)) { $nics[$k] = @() }; $nics[$k] += $n } } catch {}
+            # Błąd jednej maszyny (np. przeniesionej na inny węzeł albo usuniętej w trakcie skanu) nie kasuje danych pozostałych;
+            # gdy nie ma żadnych danych, sekcja jest niezebrana (stacja nie porównuje jej i nie traktuje pustej listy jako stanu)
+            function HvPart([string]$What, $E, [string]$Key, [int]$Got) { $E = @($E | Where-Object { $_ }); if ($E.Count) { $errs.Add("Hyper-V ($What): $(@($E)[0].Exception.Message)$(if (@($E).Count -gt 1) { " (+$(@($E).Count - 1))" })"); if ($Key -and -not $Got -and (Want $Key)) { $failedKeys.Add($Key) } } }
+            $hvE = $null; try { $hdAll = @(Get-VMHardDiskDrive -VM $vms -ErrorAction SilentlyContinue -ErrorVariable hvE) } catch { $hvE = @($_) }; HvPart 'dyski' $hvE 'VMStorage' $hdAll.Count
+            $hvE = $null; try { $snaps = @(Get-VMSnapshot -VM $vms -ErrorAction SilentlyContinue -ErrorVariable hvE) } catch { $hvE = @($_) }; HvPart 'checkpointy' $hvE 'Checkpoints' $snaps.Count
+            $hvE = $null; try { foreach ($n in @(Get-VMNetworkAdapter -VM $vms -ErrorAction SilentlyContinue -ErrorVariable hvE)) { $k = "$($n.VMId)".ToUpper(); if (-not $nics.ContainsKey($k)) { $nics[$k] = @() }; $nics[$k] += $n } } catch { $hvE = @($_) }; HvPart 'karty sieciowe' $hvE '' 1
             # Od kiedy maszyna jest w obecnym stanie (np. wyłączona od 40 dni = prawdopodobnie wycofana)
             try { foreach ($cs2 in @(Get-CimInstance -Namespace 'root\virtualization\v2' -ClassName Msvm_ComputerSystem -ErrorAction Stop)) { if ($cs2.TimeOfLastStateChange) { $since2["$($cs2.Name)".ToUpper()] = $cs2.TimeOfLastStateChange } } } catch {}
             # Wymiana KVP (usługi integracji): system gościa, FQDN i adresy IP – jedna kwerenda dla wszystkich maszyn
@@ -1238,13 +1253,14 @@ $Collector = {
         # RAM startowy maszyn, które działają albo same startują z hostem – czy wszystkie wstaną po restarcie hosta
         $sys.HvRamStartupGB  = [math]::Round([double](@($prim | Where-Object { "$($_.State)" -like 'Running*' -or "$($_.AutomaticStartAction)" -ne 'Nothing' } | ForEach-Object { [double]$_.MemoryStartup }) | Measure-Object -Sum).Sum / 1GB, 1)
 
-        # Klaster pracy awaryjnej: nazwa, węzły; wolumeny CSV raportuje tylko węzeł-właściciel (bez powtórzeń z każdego węzła)
-        $sys.HvCluster = ''; $sys.HvClusterNodes = ''; $sys.HvClusterNodeCount = 0
+        # Klaster pracy awaryjnej: nazwa, węzły (wolumeny CSV w sekcji Dyski – osobny blok za sekcjami Hyper-V)
+        $sys.HvCluster = ''; $sys.HvClusterNodes = ''; $sys.HvClusterNodeCount = 0; $clOk = $false
         try { $sys.HvCluster = "$((Get-ItemProperty 'HKLM:\Cluster' -ErrorAction Stop).ClusterName)" } catch {}
-        if ((Get-Command Get-ClusterNode -ErrorAction SilentlyContinue) -and "$((Get-Service ClusSvc -ErrorAction SilentlyContinue).Status)" -eq 'Running') {
+        $clSvc = "$((Get-Service ClusSvc -ErrorAction SilentlyContinue).Status)"
+        if ((Get-Command Get-ClusterNode -ErrorAction SilentlyContinue) -and $clSvc -eq 'Running') {
             try {
                 $sys.HvCluster = "$((Get-Cluster -ErrorAction Stop).Name)"
-                $cnodes = @(Get-ClusterNode -ErrorAction Stop)
+                $cnodes = @(Get-ClusterNode -ErrorAction Stop); $clOk = $true
                 $sys.HvClusterNodes = (@($cnodes | ForEach-Object { "$($_.Name) ($($_.State))" }) -join ', ')
                 $sys.HvClusterNodeCount = $cnodes.Count
                 # Sekcja Klaster: ten sam obraz z każdego węzła – stacja ocenia ją raz na klaster (węzeł reprezentujący)
@@ -1252,7 +1268,8 @@ $Collector = {
                     $t0c = $sw.Elapsed.TotalSeconds
                     try {
                         foreach ($n in $cnodes) { $clusterRows += [pscustomobject]@{ Type = 'Węzeł'; Name = "$($n.Name)"; State = "$($n.State)"; Owner = ''; Detail = $(if ("$($n.DrainStatus)") { "opróżnianie: $($n.DrainStatus)" } else { '' }) } }
-                        foreach ($csv in @(Get-ClusterSharedVolume -ErrorAction Stop)) {
+                        $csvList = @(Get-ClusterSharedVolume -ErrorAction Stop)
+                        foreach ($csv in $csvList) {
                             $vi = @($csv.SharedVolumeInfo)[0]; $pt = if ($vi) { $vi.Partition } else { $null }
                             $clusterRows += [pscustomobject]@{ Type = 'CSV'; Name = "$($csv.Name) $(if ($vi) { $vi.FriendlyVolumeName })".Trim(); State = "$($csv.State)"; Owner = "$($csv.OwnerNode.Name)"
                                 Detail = $(if ($pt -and $pt.Size) { "wolne $([math]::Round($pt.FreeSpace / 1GB, 1)) z $([math]::Round($pt.Size / 1GB, 1)) GB ($([math]::Round($pt.FreeSpace / $pt.Size * 100, 1))%)$(if ($vi.MaintenanceMode) { ', tryb konserwacji' })" } else { '' }) }
@@ -1264,21 +1281,13 @@ $Collector = {
                     } catch { $failedKeys.Add('Cluster'); $errs.Add("Klaster (sekcja): $($_.Exception.Message)") }
                     $timings['Klaster'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0c, 1)
                 }
-                if (Want 'Disks') {
-                    foreach ($csv in @(Get-ClusterSharedVolume -ErrorAction Stop)) {
-                        if ("$($csv.OwnerNode.Name)" -ne $env:COMPUTERNAME) { continue }
-                        foreach ($vi in @($csv.SharedVolumeInfo)) {
-                            $pt = $vi.Partition
-                            if (-not $pt -or -not $pt.Size) { continue }
-                            $disks += [pscustomobject]@{
-                                Drive = "$($vi.FriendlyVolumeName)"; Label = "CSV: $($csv.Name) ($($csv.State))"
-                                SizeGB = [math]::Round($pt.Size / 1GB, 1); FreeGB = [math]::Round($pt.FreeSpace / 1GB, 1)
-                                FreePct = [math]::Round($pt.FreeSpace / $pt.Size * 100, 1)
-                            }
-                        }
-                    }
-                }
             } catch { $errs.Add("Klaster: $($_.Exception.Message)") }
+        }
+        # Węzeł bez odczytanego stanu klastra (brak modułu, zatrzymana usługa, błąd odczytu) nie może reprezentować klastra na stacji
+        if ($sys.HvCluster -and -not $clOk -and (Want 'Cluster')) {
+            $failedKeys.Add('Cluster')
+            if (-not (Get-Command Get-ClusterNode -ErrorAction SilentlyContinue)) { $errs.Add("Klaster $($sys.HvCluster): brak modułu PowerShell FailoverClusters na węźle – stan klastra nieodczytany (Install-WindowsFeature RSAT-Clustering-PowerShell)") }
+            elseif ($clSvc -ne 'Running') { $errs.Add("Klaster $($sys.HvCluster): usługa klastra (ClusSvc) nie działa$(if ($clSvc) { " ($clSvc)" }) – stan klastra nieodczytany") }
         }
 
         $hyperv = @(S 'HyperV' 'Hyper-V' {
@@ -1335,6 +1344,26 @@ $Collector = {
             }
         })
         $timings['Hyper-V (razem)'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
+    }
+
+    # Wolumeny CSV klastra w sekcji Dyski (sekcja Dyski pomija CSVFS) – na każdym węźle klastra, także bez Hyper-V (Scale-Out File Server, SQL)
+    # i przy odznaczonych sekcjach Hyper-V; wolumen raportuje tylko węzeł-właściciel (bez powtórzeń z każdego węzła)
+    if ((Want 'Disks') -and (Get-Command Get-ClusterSharedVolume -ErrorAction SilentlyContinue) -and "$((Get-Service ClusSvc -ErrorAction SilentlyContinue).Status)" -eq 'Running') {
+        try {
+            if ($null -eq $csvList) { $csvList = @(Get-ClusterSharedVolume -ErrorAction Stop) }
+            foreach ($csv in $csvList) {
+                if ("$($csv.OwnerNode.Name)" -ne $env:COMPUTERNAME) { continue }
+                foreach ($vi in @($csv.SharedVolumeInfo)) {
+                    $pt = $vi.Partition
+                    if (-not $pt -or -not $pt.Size) { continue }
+                    $disks += [pscustomobject]@{
+                        Drive = "$($vi.FriendlyVolumeName)"; Label = "CSV: $($csv.Name) ($($csv.State))"
+                        SizeGB = [math]::Round($pt.Size / 1GB, 1); FreeGB = [math]::Round($pt.FreeSpace / 1GB, 1)
+                        FreePct = [math]::Round($pt.FreeSpace / $pt.Size * 100, 1)
+                    }
+                }
+            }
+        } catch { $failedKeys.Add('Disks'); $errs.Add("Dyski (wolumeny CSV klastra): $($_.Exception.Message)") }
     }
 
     # ── Dzienniki zdarzeń: rozmiar, tryb i ile dni faktycznie obejmują ──
@@ -1394,10 +1423,25 @@ $Collector = {
                 '6' = 'błąd'; 'Error' = 'błąd'; '7' = 'błąd nienaprawialny'; 'Non-Recoverable Error' = 'błąd nienaprawialny'; '10' = 'zatrzymany'; 'Stopped' = 'zatrzymany'
                 '11' = 'w serwisie'; 'In Service' = 'w serwisie'; '13' = 'utrata komunikacji'; 'Lost Communication' = 'utrata komunikacji' }
     $diskHealth = @(S 'DiskHealth' 'Zdrowie dysków' {
+        function OpText($v) { (@(@($v) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } }) -join ', ') }
+        $pools = @()
+        if (Get-Command Get-StoragePool -ErrorAction SilentlyContinue) { try { $pools = @(Get-StoragePool -IsPrimordial $false -ErrorAction SilentlyContinue) } catch { } }   # brak pul: błąd „nie znaleziono” modułu Storage
+        $clPool = @($pools | Where-Object { $_.IsClustered }).Count
         if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
-            foreach ($pd in @(Get-PhysicalDisk)) {
+            # Storage Spaces Direct: Get-PhysicalDisk na węźle z pulą klastrową widzi dyski WSZYSTKICH węzłów – bierzemy tylko podłączone do tego węzła
+            # (jeden uszkodzony dysk nie daje problemu na każdym węźle); bez węzła magazynu albo przy błędzie – wszystkie dyski jak dotąd
+            $pds = $null
+            if ($clPool -and (Get-Command Get-StorageNode -ErrorAction SilentlyContinue)) {
+                try {
+                    $stn = @(Get-StorageNode -ErrorAction Stop | Where-Object { "$($_.Name)" -eq $env:COMPUTERNAME -or "$($_.Name)" -like "$env:COMPUTERNAME.*" })
+                    $seen = @{}   # węzeł bywa widoczny w kilku podsystemach magazynu – bez powtórzeń dysków
+                    if ($stn.Count) { $pds = @($stn | Get-PhysicalDisk -PhysicallyConnected -ErrorAction Stop | Where-Object { $k = "$($_.UniqueId)|$($_.SerialNumber)"; if ($k -eq '|') { $k = "$($_.ObjectId)" }; if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true } }) }
+                } catch { $pds = $null }
+            }
+            if (-not $pds) { $pds = @(Get-PhysicalDisk) }
+            foreach ($pd in $pds) {
                 $hs  = "$($pd.HealthStatus)"
-                $ops = @(@($pd.OperationalStatus) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } })
+                $ops = OpText $pd.OperationalStatus
                 $rc  = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
                 $unc = if ($rc -and ($null -ne $rc.ReadErrorsUncorrected -or $null -ne $rc.WriteErrorsUncorrected)) { [int64]$rc.ReadErrorsUncorrected + [int64]$rc.WriteErrorsUncorrected } else { $null }
                 [pscustomobject]@{
@@ -1405,13 +1449,44 @@ $Collector = {
                     Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs })
                     WearPct = $(if ($rc -and $rc.Wear) { [int]$rc.Wear } else { $null }); TempC = $(if ($rc -and $rc.Temperature) { [int]$rc.Temperature } else { $null })
                     UncorrectedErrors = $unc; PowerOnHours = $(if ($rc -and $rc.PowerOnHours) { [int64]$rc.PowerOnHours } else { $null })
-                    Count = $null; Last = ''; Detail = "stan: $($ops -join ', ')"
+                    Count = $null; Last = ''; Detail = "stan: $ops"
+                }
+            }
+        }
+        # Pule i dyski wirtualne Storage Spaces / S2D: po awarii dysku dysk wirtualny traci odporność (Degraded, naprawa), choć dyski fizyczne są już OK.
+        # Pulę klastrową (S2D, wspólna półka JBOD) raportuje tylko właściciel zasobu puli w klastrze (bez powtórzeń z każdego węzła)
+        if ($pools.Count) {
+            $own = $true
+            if ($clPool -and (Get-Command Get-ClusterResource -ErrorAction SilentlyContinue)) { try { $own = [bool]@(Get-ClusterResource -ErrorAction Stop | Where-Object { ("$($_.ResourceType)" -eq 'Storage Pool' -or "$($_.ResourceType.Name)" -eq 'Storage Pool') -and "$($_.OwnerNode.Name)" -eq $env:COMPUTERNAME }).Count } catch { $own = $true } }
+            foreach ($sp in $pools) {
+                if ($sp.IsClustered -and -not $own) { continue }
+                $hs = "$($sp.HealthStatus)"
+                [pscustomobject]@{
+                    Source = 'Pula Storage Spaces'; Id = $null; Name = "$($sp.FriendlyName) ($([math]::Round($sp.Size / 1GB)) GB, przydzielone $([math]::Round($sp.AllocatedSize / 1GB)) GB)"
+                    Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs }); WearPct = $null; TempC = $null; UncorrectedErrors = $null; PowerOnHours = $null
+                    Count = $null; Last = ''; Detail = "stan: $(OpText $sp.OperationalStatus)$(if ($sp.IsReadOnly) { ', tylko do odczytu' })"
+                }
+                $vds = @(); try { $vds = @($sp | Get-VirtualDisk -ErrorAction SilentlyContinue) } catch { }
+                foreach ($vd in $vds) {
+                    $hs = "$($vd.HealthStatus)"
+                    [pscustomobject]@{
+                        Source = 'Dysk wirtualny (Storage Spaces)'; Id = $null; Name = "$($vd.FriendlyName) ($($vd.ResiliencySettingName), $([math]::Round($vd.Size / 1GB)) GB, pula $($sp.FriendlyName))"
+                        Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs }); WearPct = $null; TempC = $null; UncorrectedErrors = $null; PowerOnHours = $null
+                        Count = $null; Last = ''; Detail = "stan: $(OpText $vd.OperationalStatus)"
+                    }
                 }
             }
         }
         # disk 7 (uszkodzony blok), 51 (błąd stronicowania), 153/157 (ponowienie/usunięcie I/O), Ntfs 55/98 (uszkodzenie systemu plików), 129 (reset urządzenia przez sterownik)
-        $dEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7, 51, 55, 98, 129, 153, 157; StartTime = $since } -MaxEvents 1000 -ErrorAction SilentlyContinue |
-                 Where-Object { ($_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs)$' -or ($_.Id -eq 129 -and $_.ProviderName -ne 'Microsoft-Windows-Time-Service')) -and -not ($_.Id -eq 98 -and $_.Level -ge 4) })
+        # Tylko błędy i ostrzeżenia już w zapytaniu: Ntfs 98 „wolumin jest w dobrym stanie” (każde zamontowanie kopii VSS) i inni dostawcy nie wypierają
+        # prawdziwych błędów z limitu. 129 osobno, bez usługi czasu (W32Time ma częste ostrzeżenie o tym samym identyfikatorze).
+        $dCap = [Math]::Max(1000, $MaxEvents)
+        $dRaw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7, 51, 55, 98, 153, 157; Level = 1, 2, 3; StartTime = $since } -MaxEvents $dCap -ErrorAction SilentlyContinue)
+        $q129 = "<QueryList><Query Id='0' Path='System'><Select Path='System'>*[System[(EventID=129) and (Level=1 or Level=2 or Level=3) and TimeCreated[timediff(@SystemTime) &lt;= $([int64]$Days * 86400000)]]]</Select><Suppress Path='System'>*[System[Provider[@Name='Microsoft-Windows-Time-Service']]]</Suppress></Query></QueryList>"
+        $d129 = @(Get-WinEvent -FilterXml ([xml]$q129) -MaxEvents $dCap -ErrorAction SilentlyContinue)
+        if ($dRaw.Count -ge $dCap) { $truncated.Add("System – zdarzenia dyskowe (od $(D $dRaw[-1].TimeCreated))") }
+        if ($d129.Count -ge $dCap) { $truncated.Add("System – resety urządzeń, ID 129 (od $(D $d129[-1].TimeCreated))") }
+        $dEv = @(@($dRaw | Where-Object { $_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs)$' }) + $d129)
         $dEv | Group-Object ProviderName, Id | ForEach-Object {
             $g = @($_.Group | Sort-Object TimeCreated -Descending)
             [pscustomobject]@{
@@ -1426,26 +1501,36 @@ $Collector = {
     if ($sys.IsDC) {
         $dcRows = @(S 'DomainController' 'Kontroler domeny' {
             $ck = { param($c, $v, $st) [pscustomobject]@{ Check = $c; Value = "$v"; Status = $st } }
-            $dfsr = @()
-            try { $dfsr = @(Get-CimInstance -Namespace root/microsoftdfs -ClassName DfsrReplicatedFolderInfo -ErrorAction Stop | Where-Object { $_.ReplicationGroupName -eq 'Domain System Volume' }) } catch {}
+            $dfsr = @(); $dfsrErr = ''
+            try { $dfsr = @(Get-CimInstance -Namespace root/microsoftdfs -ClassName DfsrReplicatedFolderInfo -Filter "ReplicationGroupName='Domain System Volume'" -ErrorAction Stop) } catch { $dfsrErr = $_.Exception.Message }
             if ($dfsr.Count) {
                 $stMap = @{ 0 = 'niezainicjowany'; 1 = 'zainicjowany'; 2 = 'synchronizacja początkowa'; 3 = 'automatyczne odzyskiwanie'; 4 = 'normalny'; 5 = 'BŁĄD' }
                 foreach ($f in $dfsr) {
                     $st = [int]$f.State
                     & $ck "SYSVOL (DFSR) – $($f.ReplicatedFolderName)" "$($stMap[$st]) ($st)" $(if ($st -eq 4) { 'OK' } elseif ($st -eq 5) { 'Krytyczne' } else { 'Uwaga' })
                 }
-            } else { & $ck 'SYSVOL' 'brak replikacji DFSR – prawdopodobnie przestarzała FRS (migracja: dfsrmig)' 'Uwaga' }
+            } else {
+                # brak stanu DFSR to FRS tylko wtedy, gdy działa usługa NtFrs (na 2019+ FRS nie istnieje); inaczej zatrzymana DFSR albo uszkodzony dostawca WMI
+                $frs = "$((Get-Service NtFrs -ErrorAction SilentlyContinue).Status)"; $dsv = "$((Get-Service DFSR -ErrorAction SilentlyContinue).Status)"
+                if ($frs -eq 'Running') { & $ck 'SYSVOL' 'replikacja przez przestarzałą usługę FRS (migracja: dfsrmig)' 'Uwaga' }
+                else { & $ck 'SYSVOL (DFSR)' "brak stanu replikacji SYSVOL – usługa DFSR: $(if ($dsv) { $dsv } else { 'brak' })$(if ($dfsrErr) { "; WMI: $(Short $dfsrErr 150)" })" $(if ($dsv -ne 'Running') { 'Krytyczne' } else { 'Uwaga' }) }
+            }
 
             Import-Module ActiveDirectory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             if (Get-Command Get-ADReplicationPartnerMetadata -ErrorAction SilentlyContinue) {
                 try {
-                    $pm = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -ErrorAction Stop)
+                    # wszystkie partycje (bez -Partition tylko domyślna: błędy Configuration, Schema i stref DNS AD byłyby niewidoczne); starszy moduł – tylko domyślna
+                    $pm = @(); try { $pm = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -Partition * -ErrorAction Stop) } catch { $pm = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -ErrorAction Stop) }
                     if (-not $pm.Count) { & $ck 'Replikacja AD' 'brak partnerów replikacji (jedyny kontroler domeny?)' 'Info' }
-                    foreach ($p in $pm) {
-                        $partner = "$($p.Partner)" -replace '^CN=NTDS Settings,CN=([^,]+),.*$', '$1'
+                    foreach ($grp in @($pm | Group-Object { "$($_.Partner)" })) {
+                        $partner = "$($grp.Name)" -replace '^CN=NTDS Settings,CN=([^,]+),.*$', '$1'
+                        # wiersz na partnera: stan najgorszej partycji (z błędem i najdawniejszym sukcesem)
+                        $bad = @($grp.Group | Where-Object { [int]$_.ConsecutiveReplicationFailures -gt 0 -or [int64]$_.LastReplicationResult -ne 0 })
+                        $p = @(@(if ($bad.Count) { $bad } else { $grp.Group }) | Sort-Object { if ($_.LastReplicationSuccess) { [datetime]$_.LastReplicationSuccess } else { [datetime]::MinValue } })[0]
                         $fails = [int]$p.ConsecutiveReplicationFailures
                         $age = if ($p.LastReplicationSuccess) { ($now - $p.LastReplicationSuccess).TotalHours } else { 1e6 }
-                        & $ck "Replikacja AD z $partner" "ostatni sukces: $(D $p.LastReplicationSuccess), błędy z rzędu: $fails, wynik: $($p.LastReplicationResult)" $(if ($fails -eq 0 -and [int64]$p.LastReplicationResult -eq 0) { 'OK' } elseif ($age -gt 24) { 'Krytyczne' } else { 'Uwaga' })
+                        $parts = (@($bad | ForEach-Object { "$($_.Partition)" -replace '^(?:DC|CN)=([^,]+).*$', '$1' } | Sort-Object -Unique) -join ', ')
+                        & $ck "Replikacja AD z $partner" "ostatni sukces: $(D $p.LastReplicationSuccess), błędy z rzędu: $fails, wynik: $($p.LastReplicationResult)$(if ($parts) { "; partycje z błędami: $parts" })" $(if (-not $bad.Count) { 'OK' } elseif ($age -gt 24) { 'Krytyczne' } else { 'Uwaga' })
                     }
                 } catch { & $ck 'Replikacja AD' "nie udało się odczytać: $($_.Exception.Message)" 'Info' }
             } else { & $ck 'Replikacja AD' 'brak modułu ActiveDirectory – pominięto' 'Info' }
@@ -1755,10 +1840,14 @@ $Collector = {
     # ── Ekspozycja: reguły zapory wpuszczające porty wrażliwe (lista portów przychodzi ze stacji: $Config.ExposedPorts) ──
     $exposure = @(S 'Exposure' 'Ekspozycja' {
         $ports = @($ExposedPorts | ForEach-Object { "$_" })
+        $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow)
+        # Rozrost reguł zapory (np. RDS: reguły aplikacji dopisywane przy każdym logowaniu użytkownika) – filtry wszystkich reguł to minuty
+        # i setki MB pamięci sesji (serwer przekraczał limit czasu); sekcja niezebrana, żeby porównanie nie pokazało usuniętych reguł
+        if ($rules.Count -gt 20000) { $failedKeys.Add('Exposure'); $errs.Add("Ekspozycja: $($rules.Count) włączonych reguł przychodzących zapory – pominięto analizę (rozrost reguł spowalnia też logowanie; na hostach RDS: DeleteUserAppContainersOnLogoff)"); return }
         $pf = @{};  foreach ($x in @(Get-NetFirewallPortFilter -PolicyStore ActiveStore -All)) { $pf[$x.InstanceID] = $x }
         $af = @{};  foreach ($x in @(Get-NetFirewallAddressFilter -PolicyStore ActiveStore -All)) { $af[$x.InstanceID] = $x }
         $apf = @{}; foreach ($x in @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -All)) { $apf[$x.InstanceID] = $x }
-        foreach ($r in @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow)) {
+        foreach ($r in $rules) {
             $p = $pf[$r.InstanceID]; if (-not $p) { continue }
             $lp   = @($p.LocalPort | ForEach-Object { "$_" })
             $prog = "$($apf[$r.InstanceID].Program)"
@@ -2823,7 +2912,7 @@ $script:Headers = @{
     Version = 'Wersja'; Publisher = 'Wydawca'; InstallDate = 'Instalacja'; InstallDays = 'Dni temu'; Arch = 'Arch.'; Location = 'Lokalizacja'
     Group = 'Grupa'; Member = 'Członek'; Enabled = 'Włączone'; LastLogon = 'Ostatnie logowanie'; PasswordLastSet = 'Zmiana hasła'
     PasswordNeverExpires = 'Hasło nie wygasa'; SID = 'SID'; Access = 'Uprawnienia udziału'; EveryoneWrite = 'Wszyscy: zapis'; Command = 'Polecenie'
-    Subject = 'Podmiot'; Issuer = 'Wystawca'; NotAfter = 'Ważny do'; DaysLeft = 'Dni do wygaśnięcia'; PrivateKey = 'Klucz prywatny'; Thumbprint = 'Odcisk'
+    Subject = 'Podmiot'; Issuer = 'Wystawca'; NotAfter = 'Ważny do'; DaysLeft = 'Dni do wygaśnięcia'; PrivateKey = 'Klucz prywatny'; Thumbprint = 'Odcisk'; Store = 'Magazyn'
     Folder = 'Folder'; File = 'Plik'; SizeKB = 'Rozmiar [KB]'; Modified = 'Zmodyfikowano'; Executable = 'Wykonywalny'
     UptimeDays = 'Uptime [dni]'; CPU = 'CPU'; MemGB = 'RAM [GB]'; DynamicMem = 'Pamięć dynamiczna'; Gen = 'Generacja'; Replication = 'Replikacja'
     IntegrationServices = 'Usługi integracji'; DisksGB = 'Dyski [GB]'; VM = 'Maszyna'; Created = 'Utworzono'; AgeDays = 'Wiek [dni]'
@@ -3645,8 +3734,8 @@ function Invoke-ServerAnalysis {
     # Zdrowie dysków
     foreach ($r in $D.DiskHealth) {
         if ("$($r.Id)" -eq '') {
-            if ($r.Health -eq 'Awaria') { AddI 'Krytyczny' 'Dyski' "Dysk fizyczny w stanie awarii: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'crit' }
-            elseif ($r.Health -eq 'Ostrzeżenie') { AddI 'Ostrzeżenie' 'Dyski' "Dysk fizyczny zgłasza problem: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'warn' }
+            if ($r.Health -eq 'Awaria') { AddI 'Krytyczny' 'Dyski' "$($r.Source) w stanie awarii: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'crit' }
+            elseif ($r.Health -eq 'Ostrzeżenie') { AddI 'Ostrzeżenie' 'Dyski' "$($r.Source) zgłasza problem: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'warn' }
             if ("$($r.WearPct)" -ne '' -and [int]$r.WearPct -ge $C.DiskWearWarnPct) { AddI 'Ostrzeżenie' 'Dyski' "Zużycie dysku $($r.Name): $($r.WearPct)%" 'DiskHealth'; SetFlag $r 'warn' }
             if ("$($r.UncorrectedErrors)" -ne '' -and [int64]$r.UncorrectedErrors -gt 0) { AddI 'Ostrzeżenie' 'Dyski' "Nieskorygowane błędy odczytu/zapisu na $($r.Name): $($r.UncorrectedErrors)" 'DiskHealth'; SetFlag $r 'warn' }
         } elseif ([int]$r.Id -in 7, 51, 55, 98) {
