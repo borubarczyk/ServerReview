@@ -630,12 +630,6 @@ Kolektor nie zawiera treści, które PowerShell uznaje za podejrzane, więc skan
 
 ## Licencja
 
-Copyright (C) 2026 Borys Kaleta. Wszelkie prawa zastrzeżone.
+Copyright (c) 2026 Borys Kaleta. **Wszelkie prawa zastrzeżone** - [licencja zastrzeżona](LICENSE).
 
-Program jest objęty [licencją zastrzeżoną](LICENSE). To, że kod jest widoczny w repozytorium, nie daje żadnych praw do niego. Bez uprzedniej pisemnej zgody autora nie wolno go:
-
-- używać, w całości ani w części;
-- kopiować, modyfikować ani wykorzystywać jego fragmentów w innych programach;
-- rozpowszechniać, udostępniać ani sprzedawać.
-
-Program dostarczany jest bez jakiejkolwiek gwarancji. Wiążący jest pełny tekst licencji w pliku [LICENSE](LICENSE).
+Używanie, kopiowanie, modyfikowanie i rozpowszechnianie programu (w całości lub w części) wymaga uprzedniej zgody autora. Publiczna dostępność kodu nie oznacza zgody na korzystanie z niego.

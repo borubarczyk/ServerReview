@@ -1,53 +1,65 @@
-ServerReview – licencja zastrzeżona
+LICENCJA ZASTRZEŻONA - WSZELKIE PRAWA ZASTRZEŻONE
 
-Copyright (C) 2026 Borys Kaleta. Wszelkie prawa zastrzeżone.
+ServerReview
+Copyright (c) 2026 Borys Kaleta. Wszelkie prawa zastrzeżone.
 
-1. Program ServerReview, w tym kod źródłowy, dokumentacja i wszystkie
-   powiązane pliki (dalej „Program”), jest wyłączną własnością autora,
-   Borysa Kalety (dalej „Autor”).
+1. Oprogramowanie ServerReview - kod źródłowy, skrypty, moduły, testy, dokumentacja, pliki konfiguracyjne
+   i zasoby autora (dalej: „Oprogramowanie”) - jest wyłączną własnością autora i jest chronione
+   prawem autorskim.
 
-2. Bez uprzedniej pisemnej zgody Autora (także w formie elektronicznej)
-   zabronione jest:
-   a) używanie Programu, w całości lub w części;
-   b) kopiowanie, powielanie i przechowywanie Programu, z wyjątkiem
-      technicznie niezbędnego przeglądania go w serwisie, w którym
-      Autor go opublikował;
-   c) modyfikowanie, tłumaczenie, adaptowanie i tworzenie utworów
-      zależnych, w tym wykorzystywanie fragmentów kodu w innych
-      programach;
-   d) rozpowszechnianie, udostępnianie, publikowanie, sprzedaż,
-      najem, użyczanie i sublicencjonowanie Programu;
-   e) wykorzystywanie Programu do świadczenia usług na rzecz osób
-      trzecich.
+2. Bez uprzedniej zgody autora wyrażonej na piśmie lub w formie elektronicznej zabronione jest w szczególności:
+   a) używanie i uruchamianie Oprogramowania,
+   b) kopiowanie i powielanie Oprogramowania w całości lub w części,
+   c) modyfikowanie, tłumaczenie i przerabianie Oprogramowania oraz tworzenie na jego podstawie
+      utworów zależnych,
+   d) rozpowszechnianie, publikowanie, udostępnianie, sprzedaż, najem, użyczanie i sublicencjonowanie
+      Oprogramowania,
+   e) usuwanie lub zmienianie informacji o autorze i prawach autorskich.
 
-3. Opublikowanie Programu w publicznie dostępnym repozytorium nie
-   oznacza udzielenia jakiejkolwiek licencji ani zgody na czynności
-   wymienione w punkcie 2.
+3. Publiczna dostępność kodu (np. w serwisie GitHub) nie oznacza udzielenia licencji ani zgody na korzystanie
+   z Oprogramowania. Możliwość przeglądania kodu w serwisie, w którym go opublikowano, nie daje żadnych praw
+   do Oprogramowania.
 
-4. Zgoda Autora może zostać udzielona wyłącznie indywidualnie, na
-   piśmie lub w formie elektronicznej, i obejmuje tylko zakres w niej
-   wskazany. Kontakt: https://github.com/borubarczyk
+4. Zgoda autora określa zakres, czas i warunki korzystania z Oprogramowania. Wszelkie prawa, które nie zostały
+   wprost przyznane, są zastrzeżone dla autora.
 
-5. Program jest dostarczany w stanie „takim, jaki jest”, bez
-   jakiejkolwiek gwarancji, wyraźnej ani dorozumianej. W najszerszym
-   zakresie dopuszczalnym przez prawo Autor nie ponosi
-   odpowiedzialności za szkody wynikłe z używania Programu.
+5. Oprogramowanie jest dostarczane w stanie „takim, jaki jest”, bez jakichkolwiek gwarancji. W najszerszym
+   zakresie dopuszczalnym przez prawo autor nie odpowiada za szkody wynikłe z korzystania z Oprogramowania,
+   w tym za zmiany w systemach, usługach, kontach i danych.
 
-6. Do niniejszej licencji stosuje się prawo polskie, w szczególności
-   ustawę z dnia 4 lutego 1994 r. o prawie autorskim i prawach
-   pokrewnych.
+6. Składniki osób trzecich, z których Oprogramowanie korzysta, a które nie są jego częścią, podlegają
+   własnym licencjom.
 
------------------------------------------------------------------------
+7. Niniejsza licencja obowiązuje od 1 listopada 2026 r. i zastępuje wcześniej dołączone do Oprogramowania
+   pliki licencji.
 
-ServerReview – proprietary license
+8. W sprawie zgody na korzystanie z Oprogramowania należy kontaktować się z autorem przez jego profil
+   w serwisie GitHub: https://github.com/borubarczyk
 
-Copyright (C) 2026 Borys Kaleta. All rights reserved.
+-------------------------------------------------------------------------------------------------------------
 
-This software, including its source code, documentation and all
-related files, is the exclusive property of Borys Kaleta. No part of it
-may be used, copied, modified, merged, published, distributed,
-sublicensed, sold or used to provide services to third parties without
-the prior written (including electronic) permission of the author.
-Publishing the software in a publicly accessible repository does not
-grant any license. The software is provided "as is", without warranty
-of any kind. The Polish-language version above is binding.
+PROPRIETARY LICENSE - ALL RIGHTS RESERVED (English translation; in case of discrepancies the Polish version
+prevails)
+
+ServerReview
+Copyright (c) 2026 Borys Kaleta. All rights reserved.
+
+This software, including its source code, scripts, modules, tests, documentation, configuration files
+and the author's resources (the "Software"), is the exclusive property of the author and is protected
+by copyright law.
+
+Without the author's prior written or electronic consent, you may not use or run the Software; copy or
+reproduce it in whole or in part; modify, translate or adapt it or create derivative works; distribute,
+publish, share, sell, rent, lend or sublicense it; or remove or alter authorship and copyright notices.
+
+Public availability of the source code (e.g. on GitHub) does not grant any license or permission to use
+the Software. All rights not expressly granted are reserved by the author.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. TO THE MAXIMUM EXTENT PERMITTED BY LAW,
+THE AUTHOR SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE OF THE SOFTWARE, INCLUDING CHANGES TO
+SYSTEMS, SERVICES, ACCOUNTS AND DATA.
+
+Third-party components used by, but not included in, the Software are subject to their own licenses.
+
+This license applies from 1 November 2026 and replaces any license files previously included with the
+Software. To request permission, contact the author via https://github.com/borubarczyk

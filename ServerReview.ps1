@@ -51,12 +51,10 @@
       - konto z uprawnieniami administratora lokalnego na serwerach (odczyt dziennika Security)
     Plik musi być zapisany jako UTF-8 z BOM (polskie znaki w Windows PowerShell 5.1).
 
-    Copyright (C) 2026 Borys Kaleta. Wszelkie prawa zastrzeżone.
-    SPDX-License-Identifier: LicenseRef-Proprietary
-
-    Program jest własnością autora. Używanie, kopiowanie, modyfikowanie i rozpowszechnianie
-    programu lub jego części wymaga uprzedniej pisemnej zgody autora. Program jest dostarczany
-    BEZ JAKIEJKOLWIEK GWARANCJI. Pełny tekst licencji: plik LICENSE.
+    Copyright (C) 2026 Borys Kaleta
+    Wszelkie prawa zastrzeżone. Licencja zastrzeżona - zobacz plik LICENSE.
+    Używanie, kopiowanie, modyfikowanie i rozpowszechnianie wymaga uprzedniej zgody autora.
+    Program jest dostarczany bez jakichkolwiek gwarancji.
 
 .LINK
     https://github.com/borubarczyk/ServerReview
