@@ -2837,7 +2837,7 @@ $script:Headers = @{
     ComputerName = 'Nazwa komputera'; FQDN = 'FQDN'; Build = 'Kompilacja'; OSInstallDate = 'Instalacja systemu'; LastBoot = 'Ostatni start'
     Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
-    LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Host Hyper-V'; TimeZone = 'Strefa czasowa'
+    LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Rola Hyper-V (serwer jest hostem)'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
     Subcategory = 'Podkategoria'; Guid = 'GUID'; Setting = 'Ustawienie'; Required = 'Wymagane'
     MaxSizeMB = 'Rozmiar maks. [MB]'; UsedMB = 'Zajęte [MB]'; Mode = 'Tryb'; Records = 'Liczba zdarzeń'; Full = 'Pełny'; Oldest = 'Najstarsze zdarzenie'; CoveredDays = 'Pokrycie [dni]'
@@ -2903,7 +2903,8 @@ function Export-RowsToCsv($Rows, [string]$Path) {
     $skip = 'Flag', 'Key', 'Rows', 'SevColor', 'SevBg', 'Rank', 'ServerKey', 'Section', 'IssueKey', '_Search', 'Ignored'
     $out = foreach ($r in $Rows) {
         $h = [ordered]@{}
-        foreach ($p in $r.PSObject.Properties) { if ($skip -notcontains $p.Name -and $p.Name -notlike '_*') { $h[(Get-Header $p.Name)] = Protect-CsvCell $p.Value } }   # '_*' – pola wewnętrzne, niewidoczne w tabelach
+        # nagłówek też przez Protect-CsvCell – nazwy kolumn spoza listy nagłówków pochodzą z danych serwera (JSON migawki)
+        foreach ($p in $r.PSObject.Properties) { if ($skip -notcontains $p.Name -and $p.Name -notlike '_*') { $h[(Protect-CsvCell (Get-Header $p.Name))] = Protect-CsvCell $p.Value } }   # '_*' – pola wewnętrzne, niewidoczne w tabelach
         [pscustomobject]$h
     }
     @($out) | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding UTF8
@@ -2919,13 +2920,19 @@ function New-Issue($ServerKey, $Severity, $Category, $Message, $Section) {
         _Search = ("$srv $Category $Message").ToLowerInvariant()
     }
 }
+$script:LegacyIssueKeys = @{}   # klucz problemu → ten sam problem w dawnym formacie klucza (reguły wyciszeń zapisane przed zmianą)
 function Get-IssueKey([string]$Category, [string]$Section, [string]$Message) {
-    # Stały klucz problemu do wyciszania: wartości (wolne %, dni, liczniki, daty, adresy) zastąpione '#', żeby reguła działała
-    # przy kolejnych skanach. Cyfry będące częścią nazwy (SRV01, APP-02, KB5034441, 0x80090322) i numery po „ID”, „port”, „kod”
-    # zostają – wyciszenie jednej maszyny, zdarzenia albo portu nie może wyciszać innych.
-    $m = ("$Message" -replace '(?<![\p{L}\d_])(?<!\p{L}-)(?<!(?:ID|Id|port|portu|kod|KB) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '\s+', ' ').Trim()
-    "$Category|$Section|$m"
+    # Stały klucz problemu do wyciszania: wartości (wolne %, dni, liczniki, daty, adresy, także ze znakiem minus) zastąpione '#', żeby reguła
+    # działała przy kolejnych skanach. Cyfry będące częścią nazwy (SRV01, APP-02, KB5034441, 0x80090322), numery po „ID”, „port”, „kod”
+    # i wersje (SSL 3.0, TLS 1.0, Windows Server 2016, .NET 4) zostają – wyciszenie jednej maszyny, zdarzenia, portu albo wersji nie może wyciszać innych.
+    $m = ("$Message" -replace '(?<![\p{L}\d_])(?<!\d[.,:])(?<!\p{L}-)(?<!(?:ID|port|portu|kod|KB|SSL|TLS|Server|Windows|NET) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '(?<![\p{L}\d#-])-#', '#' -replace '\s+', ' ').Trim()
+    $key = "$Category|$Section|$m"
+    # dawny format (wersje zamieniane na '#', minus poza '#') – tylko do dopasowania starszych reguł wyciszeń (Test-IssueIgnored)
+    $old = "$Category|$Section|" + ("$Message" -replace '(?<![\p{L}\d_])(?<!\p{L}-)(?<!(?:ID|Id|port|portu|kod|KB) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '\s+', ' ').Trim()
+    if ($old -cne $key) { $l = $script:LegacyIssueKeys[$key]; if (-not $l) { $script:LegacyIssueKeys[$key] = $old } elseif (@($l) -notcontains $old) { $script:LegacyIssueKeys[$key] = @($l) + $old } }
+    $key
 }
+function Get-IssueKeyVariants([string]$IssueKey) { @($IssueKey) + @($script:LegacyIssueKeys[$IssueKey] | Where-Object { $_ }) }
 #endregion
 
 #region ── Dziennik operacji i dziennik dostępności ────────────────────────────
@@ -2948,7 +2955,7 @@ function Write-Log {
             if ($items.Count -ge 3000) { for ($i = 0; $i -lt 500; $i++) { $items.RemoveAt(0) } }
             $entry = [pscustomobject]@{ Time = $now.ToString('HH:mm:ss'); Level = $Level; Module = $Module; Message = $Message; _Search = ("$Module $Message").ToLowerInvariant() }
             $items.Add($entry)
-            if ($ui -and $ui['logList'] -and $ui.logPanel.Visibility -eq 'Visible') { $ui.logList.ScrollIntoView($entry) }
+            if ($ui -and $ui['logList'] -and $ui.logPanel.Visibility -eq 'Visible') { if (Test-LogAtEnd) { $ui.logList.ScrollIntoView($entry) } }
             elseif ($Level -in 'WARN', 'ERROR') { $script:LogUnread++; Update-LogBadge }
         } catch { }
     } else {
@@ -2961,6 +2968,18 @@ function Write-Log {
         $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] [{2}] {3}' -f $now, $Level, $Module, ($Message -replace '\r?\n', ' | ')
         [IO.File]::AppendAllText($file, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
     } catch { $script:LogFailed = $true }
+}
+$script:LogScroll = $null
+function Test-LogAtEnd {
+    # Nowy wpis przewija listę tylko wtedy, gdy widać jej koniec – użytkownik przewinięty wyżej czyta (albo zaznacza do skopiowania) starsze wpisy
+    $sv = $script:LogScroll
+    if (-not $sv) {
+        $b = if ([System.Windows.Media.VisualTreeHelper]::GetChildrenCount($ui.logList)) { [System.Windows.Media.VisualTreeHelper]::GetChild($ui.logList, 0) }
+        $sv = if ($b -and [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($b)) { [System.Windows.Media.VisualTreeHelper]::GetChild($b, 0) }
+        if ($sv -isnot [System.Windows.Controls.ScrollViewer]) { return $true }   # szablon listy jeszcze niezbudowany
+        $script:LogScroll = $sv
+    }
+    $sv.VerticalOffset -ge $sv.ScrollableHeight - 1
 }
 function Update-LogBadge {
     if (-not $ui -or -not $ui['logBadge']) { return }
@@ -2975,14 +2994,12 @@ function Add-AvailabilityRecord {
     param([string]$Name, [string]$Status, $DurationSec, [int]$Crit = 0, [int]$Warn = 0, [string]$Class = '', [string]$Detail = '')
     $now = Get-Date
     try {
-        if (-not (Test-Path -LiteralPath $Config.LogDir)) { New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null }
-        $file = Join-Path $Config.LogDir ('Availability_{0:yyyyMM}.csv' -f $now)
         $dur = if ("$DurationSec" -ne '') { ([double]$DurationSec).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) } else { '' }
         $line = (@(('{0:yyyy-MM-dd HH:mm:ss}' -f $now), $Name, $Status, $dur, $Crit, $Warn, $Class, (ConvertTo-CsvSafe $Detail)) | ForEach-Object { ConvertTo-CsvSafe "$_" }) -join ';'
-        if (-not (Test-Path -LiteralPath $file)) {
-            [IO.File]::WriteAllText($file, 'Czas;Serwer;Status;CzasSkanu;Krytyczne;Ostrzezenia;Rodzaj;Szczegoly' + [Environment]::NewLine, (New-Object Text.UTF8Encoding $true))
-        }
-        [IO.File]::AppendAllText($file, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
+        $script:AvailPending.Add($line)
+        Write-AvailabilityPending
+        $k = $Name.ToLowerInvariant()
+        if ($script:AvailLines) { if (-not $script:AvailLines.ContainsKey($k)) { $script:AvailLines[$k] = New-Object System.Collections.Generic.List[string] }; $script:AvailLines[$k].Add($line) }
     } catch { Write-Log "Nie zapisano dziennika dostępności: $($_.Exception.Message)" 'WARN' 'Dziennik' }
     # Statystyka 30 dni (kolumna „Dostępność” w tabeli stanu serwerów)
     if ($script:AvailStats) {
@@ -2996,8 +3013,34 @@ function Add-AvailabilityRecord {
     }
     $script:HistoryCache.Remove($Name.ToLowerInvariant())
 }
+# Wiersze jeszcze niezapisane: plik otwarty w Excelu (albo dopisywany w tej chwili przez skan bez okna) blokuje zapis – dopisujemy je przy następnej okazji
+$script:AvailPending = New-Object System.Collections.Generic.List[string]
+$script:AvailWarned  = $false
+function Write-AvailabilityPending {
+    if (-not $script:AvailPending.Count) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $Config.LogDir)) { New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null }
+        while ($script:AvailPending.Count) {
+            $mon = $script:AvailPending[0].Substring(0, 7)   # każdy wiersz do pliku swojego miesiąca (RRRR-MM)
+            $part = [string[]]@($script:AvailPending | Where-Object { $_.StartsWith($mon, [StringComparison]::Ordinal) })
+            $file = Join-Path $Config.LogDir ('Availability_{0}.csv' -f $mon.Replace('-', ''))
+            $fi = New-Object IO.FileInfo $file
+            if (-not $fi.Exists) { [IO.File]::WriteAllText($file, 'Czas;Serwer;Status;CzasSkanu;Krytyczne;Ostrzezenia;Rodzaj;Szczegoly' + [Environment]::NewLine, (New-Object Text.UTF8Encoding $true)) }
+            $len0 = if ($fi.Exists) { $fi.Length } else { -1 }
+            [IO.File]::AppendAllText($file, ($part -join [Environment]::NewLine) + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
+            # plik zmieniony tylko przez ten program – bez ponownego wczytywania w Sync-AvailabilityStats
+            if ($file -eq $script:AvailSync.File -and $len0 -eq $script:AvailSync.Len) { $fi.Refresh(); $script:AvailSync.Len = $fi.Length }
+            for ($i = $script:AvailPending.Count - 1; $i -ge 0; $i--) { if ($script:AvailPending[$i].StartsWith($mon, [StringComparison]::Ordinal)) { $script:AvailPending.RemoveAt($i) } }
+        }
+        if ($script:AvailWarned) { $script:AvailWarned = $false; Write-Log 'Dopisano zaległe wpisy dziennika dostępności.' 'INFO' 'Dziennik' }
+    } catch {
+        if ($script:AvailPending.Count -gt 20000) { $script:AvailPending.RemoveRange(0, $script:AvailPending.Count - 20000) }
+        # jedno ostrzeżenie na okres blokady, nie po jednym na każdy serwer skanu
+        if (-not $script:AvailWarned) { $script:AvailWarned = $true; Write-Log "Nie zapisano dziennika dostępności (plik otwarty w innym programie, np. w Excelu?) – wpisy zostaną dopisane później: $($_.Exception.Message)" 'WARN' 'Dziennik' }
+    }
+}
 function Read-AvailabilityLines([int]$Months) {
-    # Wiersze z ostatnich N plików miesięcznych (od najstarszego)
+    # Wiersze z ostatnich N plików miesięcznych (od najstarszego) i wiersze czekające na zapis
     $files = @()
     for ($i = $Months - 1; $i -ge 0; $i--) {
         $f = Join-Path $Config.LogDir ('Availability_{0:yyyyMM}.csv' -f (Get-Date).AddMonths(-$i))
@@ -3006,6 +3049,7 @@ function Read-AvailabilityLines([int]$Months) {
     foreach ($f in $files) {
         try { foreach ($l in [IO.File]::ReadLines($f, [Text.Encoding]::UTF8)) { if ($l -and -not $l.StartsWith('Czas;')) { $l } } } catch { }
     }
+    foreach ($l in $script:AvailPending) { $l }
 }
 $script:HistoryCache = @{}
 function Get-AvailabilityHistory([string]$Name) {
@@ -3013,28 +3057,40 @@ function Get-AvailabilityHistory([string]$Name) {
     $k = $Name.ToLowerInvariant()
     if ($script:HistoryCache.ContainsKey($k)) { return $script:HistoryCache[$k] }
     $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($l in (Read-AvailabilityLines 3)) {
+    # wiersze tego serwera z pamięci (Initialize-AvailabilityStats) – bez czytania plików z 3 miesięcy przy każdym kliknięciu serwera
+    $src = if ($script:AvailLines) { $script:AvailLines[$k] } else { Read-AvailabilityLines 3 }
+    foreach ($l in $src) {
         $c = $l.Split(';')
         if ($c.Count -lt 8 -or -not [string]::Equals($c[1], $Name, [StringComparison]::OrdinalIgnoreCase)) { continue }
         $flag = switch ($c[2]) { 'OK' { '' } 'Brak połączenia' { 'crit' } 'Limit czasu' { 'warn' } default { 'info' } }
         $rows.Add([pscustomobject]@{ Time = $c[0]; Status = $c[2]; DurationSec = $c[3]; Crit = $c[4]; Warn = $c[5]; Class = $c[6]; Detail = $c[7]; Flag = $flag })
     }
     $rows.Reverse()
+    # na czerwono/żółto tylko bieżąca seria niepowodzeń – wcześniejsze, po których był udany skan, zostają jako informacja
+    $okSeen = $false
+    foreach ($r in $rows) { if ($r.Status -eq 'OK') { $okSeen = $true } elseif ($okSeen -and $r.Flag -in 'crit', 'warn') { $r.Flag = 'info' } }
     $res = [object[]]$rows.ToArray()
     $script:HistoryCache[$k] = $res
     $res
 }
 $script:AvailStats = $null
+$script:AvailLines = $null   # wiersze dziennika dostępności z 3 miesięcy według serwera (sekcja Historia)
+$script:AvailSync  = @{ Date = $null; File = ''; Len = -1 }
 function Initialize-AvailabilityStats {
     # Jedno przejście po dzienniku z 3 miesięcy; potem aktualizowane przy każdym wyniku (Add-AvailabilityRecord)
     $stats = @{}
+    $lines = @{}
     $cut = (Get-Date).AddDays(-30).ToString('yyyy-MM-dd HH:mm:ss')
+    $cur = Join-Path $Config.LogDir ('Availability_{0:yyyyMM}.csv' -f (Get-Date))
+    $len = try { $fi = New-Object IO.FileInfo $cur; if ($fi.Exists) { $fi.Length } else { -1 } } catch { -1 }
     foreach ($l in (Read-AvailabilityLines 3)) {
         $c = $l.Split(';')
         if ($c.Count -lt 8) { continue }
         $k = $c[1].ToLowerInvariant()
         $st = $stats[$k]
         if (-not $st) { $st = @{ Seen = 0; Ok = 0; LastOk = ''; LastFail = ''; FailSince = '' }; $stats[$k] = $st }
+        if (-not $lines.ContainsKey($k)) { $lines[$k] = New-Object System.Collections.Generic.List[string] }
+        $lines[$k].Add($l)
         # procent dostępności z 30 dni; „bez połączenia od” i „ostatni udany” z całego okresu dziennika (dłuższe awarie)
         if ([string]::CompareOrdinal($c[0], $cut) -ge 0) { $st.Seen++; if ($c[2] -eq 'OK') { $st.Ok++ } }
         $t = $c[0].Substring(0, [Math]::Min(16, $c[0].Length))
@@ -3042,6 +3098,17 @@ function Initialize-AvailabilityStats {
         elseif ($c[2] -eq 'Brak połączenia') { $st.LastFail = $t; if (-not $st.FailSince) { $st.FailSince = $t } }
     }
     $script:AvailStats = $stats
+    $script:AvailLines = $lines
+    $script:AvailSync = @{ Date = (Get-Date).Date; File = $cur; Len = $len }
+    $script:HistoryCache.Clear()
+}
+function Sync-AvailabilityStats {
+    # Długo otwarte okno: okno 30 dni przesuwa się co dobę, a wiersze dopisane przez inny proces (skan bez okna z Harmonogramu zadań)
+    # zmieniają długość pliku – wtedy statystyka i historia od nowa z plików. Wywoływane przed wczytaniem wyników i po skanie.
+    Write-AvailabilityPending
+    if (-not $script:AvailStats) { return }
+    $len = try { $fi = New-Object IO.FileInfo $script:AvailSync.File; if ($fi.Exists) { $fi.Length } else { -1 } } catch { -2 }
+    if ($script:AvailSync.Date -ne (Get-Date).Date -or $len -ne $script:AvailSync.Len) { Initialize-AvailabilityStats }
 }
 function Remove-OldLogs {
     $days = [int]$Config.LogRetentionDays
@@ -3050,8 +3117,9 @@ function Remove-OldLogs {
     $cutMonth = $cut.ToString('yyyyMM')
     foreach ($f in @(Get-ChildItem -LiteralPath $Config.LogDir -File -ErrorAction SilentlyContinue)) {
         try {
-            if ($f.Name -match '^ServerReview_(\d{8})\.log$' -and $Matches[1] -lt $cut.ToString('yyyyMMdd')) { Remove-Item -LiteralPath $f.FullName -Force }
-            elseif ($f.Name -match '^Availability_(\d{6})\.csv$' -and $Matches[1] -lt $cutMonth) { Remove-Item -LiteralPath $f.FullName -Force }
+            # -ErrorAction Stop: plik zablokowany albo bez uprawnień trafia do catch (domyślnie Remove-Item zgłasza błąd niekończący)
+            if ($f.Name -match '^ServerReview_(\d{8})\.log$' -and $Matches[1] -lt $cut.ToString('yyyyMMdd')) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
+            elseif ($f.Name -match '^Availability_(\d{6})\.csv$' -and $Matches[1] -lt $cutMonth) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
         } catch { Write-Log "Nie usunięto starego dziennika $($f.Name): $($_.Exception.Message)" 'WARN' 'Dziennik' }
     }
 }
@@ -3062,12 +3130,21 @@ function Remove-OldLogs {
 # Indeks budowany raz (jedno przejście po folderach) i uzupełniany przy zapisie – bez przeszukiwania dysku dla każdego serwera.
 $script:SnapIndex = @{}
 function Get-SnapshotKey([string]$Name) { (Get-SafeName $Name).ToLowerInvariant() }
+function Test-SnapshotDirName([string]$Name) { $Name -match '^\d{8}_\d{6}(_\d+)?$' }   # folder skanu programu (RRRRMMDD_GGMMSS albo z przyrostkiem _2, _3…)
+function Get-SnapshotDirs {
+    # Tylko foldery skanów, od najnowszego; własne foldery użytkownika (np. „archiwum”, „_kopia”) nie są migawkami ani nie podlegają porządkom.
+    # Klucz sortowania stałej długości (przyrostek dopełniony zerami) – kolejność nie zależy od ustawień regionalnych, _10 jest po _9
+    try { @([IO.Directory]::GetDirectories($Config.SnapshotDir) | Where-Object { Test-SnapshotDirName ([IO.Path]::GetFileName($_)) } | Sort-Object -Descending { $n = [IO.Path]::GetFileName($_); $n.Substring(0, 15) + '_' + $(if ($n.Length -gt 15) { $n.Substring(16).PadLeft(6, '0') } else { '000001' }) }) }
+    catch { Write-Log "Nie można odczytać folderu migawek $($Config.SnapshotDir): $($_.Exception.Message)" 'WARN' 'Migawki'; @() }
+}
 function Update-SnapshotIndex {
     $idx = @{}
     if (Test-Path -LiteralPath $Config.SnapshotDir) {
-        foreach ($dir in @([IO.Directory]::GetDirectories($Config.SnapshotDir) | Sort-Object -Descending)) {
+        foreach ($dir in (Get-SnapshotDirs)) {
             $dn = [IO.Path]::GetFileName($dir)
-            foreach ($f in [IO.Directory]::GetFiles($dir)) {
+            # folder bez uprawnień albo usunięty w trakcie (porządki skanu bez okna) nie przerywa wczytywania pozostałych
+            $files = @(); try { $files = [IO.Directory]::GetFiles($dir) } catch { Write-Log "Pominięto folder migawek $dir`: $($_.Exception.Message)" 'WARN' 'Migawki'; continue }
+            foreach ($f in $files) {
                 $fn = [IO.Path]::GetFileName($f)
                 if ($fn -notmatch '^(.+?)(\.offline)?\.json(\.gz)?$') { continue }
                 $k = $Matches[1].ToLowerInvariant()
@@ -3114,20 +3191,23 @@ function Remove-OldSnapshots {
     $removed = 0
     foreach ($k in @($script:SnapIndex.Keys)) {
         $list = $script:SnapIndex[$k]
-        # ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych (znaczniki niedostępności też się liczą do limitu)
+        # ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych (znaczniki niedostępności też się liczą do limitu);
+        # najnowsza pozycja też – to wynik właśnie zakończonego skanu (znacznik niedostępności albo nowe dane)
         $lastOn = $null; foreach ($x in $list) { if (-not $x.Offline) { $lastOn = $x; break } }
         $i = $list.Count - 1
-        while ($list.Count -gt $keep -and $i -ge 0) {
+        $stuck = 0
+        while ($list.Count - $stuck -gt $keep -and $i -ge 0) {
             $e = $list[$i]
-            if ([object]::ReferenceEquals($e, $lastOn)) { $i--; continue }
-            try { if (Test-Path -LiteralPath $e.Path) { Remove-Item -LiteralPath $e.Path -Force }; $removed++ }
-            catch { Write-Log "Nie usunięto starej migawki $($e.Path): $($_.Exception.Message)" 'WARN' 'Migawki' }
-            $list.RemoveAt($i)
+            if ($i -eq 0 -or [object]::ReferenceEquals($e, $lastOn)) { $i--; continue }
+            # z indeksu tylko po udanym usunięciu – zablokowany plik (antywirus, kopia zapasowa) zostaje w indeksie (ponowna próba przy
+            # następnych porządkach), ale nie zajmuje miejsca w limicie – inaczej zamiast niego znikałyby nowsze migawki
+            try { if (Test-Path -LiteralPath $e.Path) { Remove-Item -LiteralPath $e.Path -Force -ErrorAction Stop; $removed++ }; $list.RemoveAt($i) }
+            catch { Write-Log "Nie usunięto starej migawki $($e.Path): $($_.Exception.Message)" 'WARN' 'Migawki'; $stuck++ }
             $i--
         }
     }
     if (Test-Path -LiteralPath $Config.SnapshotDir) {
-        foreach ($dir in @([IO.Directory]::GetDirectories($Config.SnapshotDir))) {
+        foreach ($dir in (Get-SnapshotDirs)) {
             # tylko stare puste foldery – świeży może należeć do skanu, który jeszcze nic nie zapisał (np. drugiej instancji)
             try { if (([DateTime]::Now - [IO.Directory]::GetCreationTime($dir)).TotalSeconds -gt [int]$Config.ScanTimeoutSec -and -not [IO.Directory]::EnumerateFileSystemEntries($dir).GetEnumerator().MoveNext()) { [IO.Directory]::Delete($dir) } } catch { }
         }
@@ -3141,6 +3221,24 @@ function Test-WritableFolder([string]$Path) {
         [IO.File]::WriteAllText($t, 'x'); [IO.File]::Delete($t)
         $true
     } catch { $false }
+}
+function Get-DataFolderWarning {
+    # Migawki to mapa ataku na całą domenę (administratorzy, udziały, porty, słabości konfiguracji). Folder danych czytelny dla zwykłych
+    # użytkowników (Wszyscy, Użytkownicy, Użytkownicy domeny…) – tylko ostrzeżenie w dzienniku; uprawnień nie zmieniamy (skan z Harmonogramu
+    # zadań może działać na innym koncie, zespół może używać wspólnego folderu)
+    $p = if (Test-Path -LiteralPath $Config.SnapshotDir) { $Config.SnapshotDir } else { $Base }
+    $names = @{ 'S-1-1-0' = 'Wszyscy'; 'S-1-5-11' = 'Użytkownicy uwierzytelnieni'; 'S-1-5-32-545' = 'Użytkownicy'; 'S-1-5-7' = 'Logowanie anonimowe' }
+    try {
+        $acl = [IO.Directory]::GetAccessControl($p, [System.Security.AccessControl.AccessControlSections]::Access)
+        $who = @(@(foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+            $sid = "$($r.IdentityReference.Value)"
+            $fr = [int]$r.FileSystemRights   # odczyt danych (1), GENERIC_ALL (0x10000000) albo GENERIC_READ (bit znaku) we wpisach dziedziczonych
+            if ("$($r.AccessControlType)" -ne 'Allow' -or -not (($fr -band 0x10000001) -or $fr -lt 0)) { continue }
+            if ($names.ContainsKey($sid)) { $names[$sid] } elseif ($sid -match '^S-1-5-21-[\d-]+-513$') { 'Użytkownicy domeny' }
+        }) | Select-Object -Unique)
+    } catch { return '' }
+    if (-not $who.Count) { return '' }
+    "Folder danych $p mogą czytać: $($who -join ', '). Migawki zawierają listy administratorów, udziały, otwarte porty i słabości konfiguracji serwerów – ogranicz uprawnienia folderu do administratorów (i konta zadania skanu bez okna)."
 }
 #endregion
 
@@ -3184,8 +3282,8 @@ $script:SettingDefs = @(
     @{ Group = 'Diagnostyka i Active Directory'; Key = 'DiagTimeoutMs';  Type = 'int';  Min = 200; Max = 15000; Label = 'Diagnoza niedostępności: limit próby DNS/ping/portu [ms]' }
     @{ Group = 'Diagnostyka i Active Directory'; Key = 'DiagPorts';      Type = 'intlist';                      Label = 'Diagnoza niedostępności: sprawdzane porty TCP (jeden na linię)' }
     @{ Group = 'Diagnostyka i Active Directory'; Key = 'AdSearchBase';   Type = 'string';                       Label = '„Pobierz z AD”: jednostka organizacyjna (DN), puste = cała domena' }
-    @{ Group = 'Diagnostyka i Active Directory'; Key = 'AdInactiveDays'; Type = 'int';  Min = 1;   Max = 3650;  Label = '„Pobierz z AD”: pomijaj konta nieaktywne dłużej niż [dni]' }
-    @{ Group = 'Dane, dziennik i blokada'; Key = 'SnapshotsToKeep';   Type = 'int';  Min = 1; Max = 10000; Label = 'Ile migawek (skanów) każdego serwera przechowywać' }
+    @{ Group = 'Diagnostyka i Active Directory'; Key = 'AdInactiveDays'; Type = 'int';  Min = 14;  Max = 3650;  Label = '„Pobierz z AD”: pomijaj konta nieaktywne dłużej niż [dni] (min. 14 – AD odświeża datę logowania komputera co 9–14 dni)' }
+    @{ Group = 'Dane, dziennik i blokada'; Key = 'SnapshotsToKeep';   Type = 'int';  Min = 2; Max = 10000; Label = 'Ile migawek (skanów) każdego serwera przechowywać (min. 2 – poprzedni skan to podstawa sekcji Zmiany)' }
     @{ Group = 'Dane, dziennik i blokada'; Key = 'CompressSnapshots'; Type = 'bool';                       Label = 'Kompresuj migawki (.json.gz – ok. 10x mniej miejsca)' }
     @{ Group = 'Dane, dziennik i blokada'; Key = 'LogRetentionDays';  Type = 'int';  Min = 7; Max = 3650;  Label = 'Przechowuj dziennik operacji i dostępności [dni]' }
     @{ Group = 'Dane, dziennik i blokada'; Key = 'LockIdleMinutes';   Type = 'int';  Min = 0; Max = 240;   Label = 'Blokada programu po bezczynności [min] (0 = wyłączona; wymaga PIN-u)' }
@@ -3248,13 +3346,35 @@ function Update-IgnoreSet {
     $script:IgnoreSet = $set
 }
 function Test-IssueIgnored([string]$ServerKey, [string]$IssueKey) {
-    $script:IgnoreSet.Contains("$ServerKey|$IssueKey") -or $script:IgnoreSet.Contains("*|$IssueKey")
+    if ($script:IgnoreSet.Contains("$ServerKey|$IssueKey") -or $script:IgnoreSet.Contains("*|$IssueKey")) { return $true }
+    # reguła zapisana dawnym kluczem (wersje SSL/TLS/systemu zamieniane na '#') nadal wycisza ten problem
+    foreach ($k in @($script:LegacyIssueKeys[$IssueKey])) { if ($k -and ($script:IgnoreSet.Contains("$ServerKey|$k") -or $script:IgnoreSet.Contains("*|$k"))) { return $true } }
+    $false
 }
 function Import-UserSettings {
     $script:SettingsWarning = $null
-    if (-not (Test-Path -LiteralPath $Config.SettingsFile)) { Update-IgnoreSet; return }
+    $f = $Config.SettingsFile
+    # Brak pliku: przerwany zapis starszej wersji (usunięty plik, została kopia .tmp). Plik nieczytelny (np. ręczna edycja z błędem JSON):
+    # kopia .bad_<data> i wczytanie poprzedniej wersji (.bak) – inaczej zamknięcie programu zapisałoby wartości domyślne
+    # w miejsce wyciszeń i PIN-u, bez śladu
+    $src = $f; $why = ''
+    if (-not (Test-Path -LiteralPath $f)) {
+        if (-not (Test-Path -LiteralPath "$f.tmp")) { Update-IgnoreSet; return }
+        $src = "$f.tmp"; $why = "Brak pliku ustawień $f – wczytano kopię z przerwanego zapisu ($src)."
+    }
     try {
-        $j = [IO.File]::ReadAllText($Config.SettingsFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $j = $null
+        try { $j = [IO.File]::ReadAllText($src, [Text.Encoding]::UTF8) | ConvertFrom-Json; if ($null -eq $j) { throw 'pusty plik' } }
+        catch {
+            $bad = "$src.bad_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            try { Copy-Item -LiteralPath $src -Destination $bad -ErrorAction Stop } catch { $bad = '' }
+            $why = "Nie udało się wczytać ustawień z $src`: $($_.Exception.Message)$(if ($bad) { " (zachowano kopię: $bad)" })."
+            if (-not (Test-Path -LiteralPath "$f.bak")) { throw $why }
+            $j = [IO.File]::ReadAllText("$f.bak", [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($null -eq $j) { throw $why }
+            $why += " Wczytano poprzednią wersję ($f.bak) – sprawdź ustawienia i wyciszenia."
+        }
+        $script:SettingsWarning = $(if ($why) { $why })
         $h = ConvertTo-Hashtable $j
         Set-ConfigFromValues $h
         if ($h.ContainsKey('IgnoredIssues')) { $Config.IgnoredIssues = @(ConvertTo-IgnoreRules $h.IgnoredIssues) }
@@ -3274,7 +3394,7 @@ function Import-UserSettings {
             if ($script:LockCfg.Length -lt 4 -or $script:LockCfg.Length -gt 8 -or -not $script:LockCfg.Salt) { $script:LockCfg.Hash = '' }
         }
     }
-    catch { $script:SettingsWarning = "Nie udało się wczytać ustawień z $($Config.SettingsFile): $($_.Exception.Message). Użyto wartości domyślnych." }
+    catch { $script:SettingsWarning = $(if ($why) { "$why Użyto wartości domyślnych – wyciszenia problemów i PIN blokady nie działają, dopóki ich nie ustawisz." } else { "Nie udało się wczytać ustawień z $src`: $($_.Exception.Message). Użyto wartości domyślnych." }) }
     Update-IgnoreSet
 }
 function Save-UserSettings {
@@ -3285,10 +3405,13 @@ function Save-UserSettings {
     $o.Ui            = [pscustomobject]$script:UiState
     $o.Lock          = [pscustomobject]$script:LockCfg
     $json = [pscustomobject]$o | ConvertTo-Json -Depth 4
-    $tmp = "$($Config.SettingsFile).tmp"
+    $f = $Config.SettingsFile
+    $tmp = "$f.tmp"
     [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
-    if (Test-Path -LiteralPath $Config.SettingsFile) { [IO.File]::Delete($Config.SettingsFile) }
-    [IO.File]::Move($tmp, $Config.SettingsFile)
+    # podmiana jednym krokiem (poprzednia wersja zostaje jako .bak) – przerwanie zapisu (wylogowanie, zamknięcie systemu) nie zostawia programu bez ustawień
+    if (-not (Test-Path -LiteralPath $f)) { [IO.File]::Move($tmp, $f); return }
+    try { [IO.File]::Replace($tmp, $f, "$f.bak") }
+    catch { [IO.File]::Copy($f, "$f.bak", $true); [IO.File]::Delete($f); [IO.File]::Move($tmp, $f) }   # system plików bez ReplaceFile (np. niektóre udziały)
 }
 $script:IgnoreSet = $null
 $script:ConfigDefaults = Get-ConfigSnapshot
@@ -6179,16 +6302,19 @@ function New-ServerItem([string]$Name, [string]$OS) {
 }
 function Add-ServerEntry([string]$Name, [string]$OS) {
     # Zwraca $true, gdy dodano. Duplikaty po nazwie krótkiej (SRV01 = srv01.firma.local) są pomijane.
-    $Name = "$Name".Trim().Trim('"', "'")   # CSV z Export-Csv ma wartości w cudzysłowach (także nagłówek "Name")
-    if (-not $Name -or $Name -in 'Name', 'ComputerName', 'DNSHostName', 'HostName', 'Server', 'Serwer') { return $false }
+    $Name = "$Name".Trim().Trim('"', "'")   # CSV z Export-Csv ma wartości w cudzysłowach
+    if (-not $Name) { return $false }   # nagłówki plików pomija Import-ServerFile – host o nazwie SERVER albo HOSTNAME da się dodać
     if (Get-ServerItem $Name) { return $false }
     $disp = Get-DisplayName $Name
     foreach ($it in $script:Servers) { if ($it.Display -eq $disp -and -not (Test-IpAddress $Name)) { return $false } }
     $item = New-ServerItem $Name $OS
     $script:Servers.Add($item)
     $script:ServerIndex[$Name] = $item
+    # serwer z migawkami na dysku (usunięty z listy i dodany ponownie): wyniki wczytuje Save-ServerList (Start-SnapshotLoad -Added)
+    if ($script:SnapIndex.ContainsKey((Get-SnapshotKey $Name))) { $script:ReloadNames[$Name] = $true }
     $true
 }
+$script:ReloadNames = @{}
 function Remove-ServerEntries([object[]]$Items) {
     foreach ($it in @($Items)) {
         if (-not $it) { continue }
@@ -6196,27 +6322,50 @@ function Remove-ServerEntries([object[]]$Items) {
         [void]$script:ServerIndex.Remove($it.Name)
         $script:Data.Remove($it.Name)
         $script:FullCache.Remove($it.Name)
+        [void]$script:FreshScan.Remove($it.Name)   # po ponownym dodaniu wyniki z dysku nie są „starsze od skanu z tej sesji”
+        $script:ReloadNames.Remove($it.Name)
         if ($script:CurrentServer -eq $it.Name) { $script:CurrentServer = $null }
     }
 }
 function Save-ServerList {
-    # Plik spoza .txt (np. CSV z inwentaryzacji podany w -ServerListFile) nie jest nadpisywany – lista trafia do servers.txt
+    # Plik spoza .txt (np. CSV z inwentaryzacji podany w -ServerListFile) nie jest nadpisywany – lista trafia do servers_<nazwa>.txt
+    # (nie do servers.txt: to główna lista programu, nadpisanie zastąpiłoby ją listą z CSV)
     $target = $Config.ServerListFile
     if ([IO.Path]::GetExtension($target) -ne '.txt') {
-        $target = Join-Path $Base 'servers.txt'
+        $target = Join-Path $Base ('servers_{0}.txt' -f (Get-SafeName ([IO.Path]::GetFileNameWithoutExtension($Config.ServerListFile))))
         if (-not $script:ListRedirected) { Write-Log "Lista serwerów z $($Config.ServerListFile) nie jest nadpisywana – zmiany zapisuję w $target" 'WARN' 'Lista'; $script:ListRedirected = $true }
         $Config.ServerListFile = $target
     }
     try { Set-Content -LiteralPath $target -Value @($script:Servers | ForEach-Object { $_.Name }) -Encoding UTF8 -ErrorAction Stop }
     catch { Write-Log "Nie zapisano listy serwerów ($target): $($_.Exception.Message)" 'ERROR' 'Lista'; Show-Toast 'Nie zapisano listy serwerów – szczegóły w dzienniku' 'crit' }
     if ($ui) { $ui.txtServerCount.Text = "$($script:Servers.Count)" }
+    if ($script:ReloadNames.Count -and -not $script:Headless) { Start-SnapshotLoad -Added }
 }
 function Import-ServerFile([string]$Path) {
+    # Plik tekstowy: pierwsza wartość z każdej linii. CSV z nagłówkiem (np. Get-ADComputer | Export-Csv, eksport z Excela): wartość
+    # z kolumny z nazwą hosta (DNSHostName, a gdy pusta – Name itd.), nie z pierwszej kolumny (DistinguishedName)
     $n = 0
-    foreach ($l in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
-        $l = "$l".Trim()
-        if (-not $l -or $l.StartsWith('#')) { continue }
-        if (Add-ServerEntry (($l -split '[,;\s]+')[0])) { $n++ }
+    $lines = @(Get-Content -LiteralPath $Path -ErrorAction Stop | ForEach-Object { "$_".Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })   # '#' – komentarz i linia #TYPE z Export-Csv
+    if (-not $lines.Count) { return 0 }
+    $hdr = 'DNSHostName', 'FQDN', 'ComputerName', 'HostName', 'Host', 'Name', 'Nazwa', 'Serwer', 'Server'
+    $sep = @(';', ',', "`t" | Where-Object { $lines[0].Contains($_) }) | Select-Object -First 1
+    if ($sep) {
+        $cols = @($lines[0].Split($sep) | ForEach-Object { $_.Trim().Trim('"') })
+        $use = @($hdr | Where-Object { $cols -contains $_ })
+        $rows = $null
+        if ($use.Count) { try { $rows = @($lines | ConvertFrom-Csv -Delimiter $sep) } catch { $rows = $null } }   # np. powtórzona nazwa kolumny
+        if ($null -ne $rows) {
+            foreach ($r in $rows) {
+                $v = ''; foreach ($c in $use) { $v = "$($r.$c)".Trim(); if ($v) { break } }
+                if ($v -and (Add-ServerEntry $v)) { $n++ }
+            }
+            return $n
+        }
+    }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $v = (($lines[$i] -split '[,;\s]+')[0]).Trim('"', "'")
+        if ($i -eq 0 -and ($hdr -contains $v -or $v -eq 'DistinguishedName')) { continue }   # nagłówek pliku z jedną kolumną albo nieczytelny CSV
+        if (Add-ServerEntry $v) { $n++ }
     }
     $n
 }
@@ -6320,7 +6469,8 @@ function New-SlimData($D) {
     $fl = @{}
     foreach ($p in $D.PSObject.Properties) {
         if ($script:HeavyKeys -contains $p.Name) {
-            $rows = @($p.Value | Where-Object { $_ -and "$($_.Flag)" -and "$($_.Flag)" -ne 'muted' })
+            # pętla foreach zamiast Where-Object – kilkukrotnie szybciej na wątku okna (setki serwerów przy wczytywaniu wyników)
+            $rows = @(foreach ($r in $p.Value) { if ($r) { $f = "$($r.Flag)"; if ($f -and $f -ne 'muted') { $r } } })
             if ($rows.Count) { $fl[$p.Name] = $rows }
             $h[$p.Name] = @()
         } else { $h[$p.Name] = $p.Value }
@@ -6349,13 +6499,14 @@ function Register-ServerData([string]$Name, $D, $Prev) {
     }
     Update-ServerItem $Name
 }
-function Get-ServerFull([string]$Name) {
-    # Pełne dane serwera do widoku szczegółów i pełnego raportu: z pamięci podręcznej albo z migawki na dysku (z ponowną analizą)
+function Get-ServerFull([string]$Name, [switch]$NoCache) {
+    # Pełne dane serwera do widoku szczegółów i pełnego raportu: z pamięci podręcznej albo z migawki na dysku (z ponowną analizą).
+    # -NoCache (pełny raport): bez zmiany pamięci podręcznej – raport kilkuset serwerów nie wypycha z niej serwerów oglądanych w oknie
     $d = $script:Data[$Name]
     if (-not $d -or -not $d.PSObject.Properties['_Slim']) { return $d }
     if ($script:FullCache.Contains($Name)) {
         $c = $script:FullCache[$Name]
-        if ($c -and "$($c._File)" -eq "$($d._File)") { Set-FullCache $Name $c; return $c }
+        if ($c -and "$($c._File)" -eq "$($d._File)") { if (-not $NoCache) { Set-FullCache $Name $c }; return $c }
     }
     $full = $null
     if ($d._File -and (Test-Path -LiteralPath $d._File)) { $full = Read-Snapshot $d._File }
@@ -6369,7 +6520,7 @@ function Get-ServerFull([string]$Name) {
     $all = Invoke-ServerAnalysis -Name $Name -D $full -Prev $prev
     $full | Add-Member -NotePropertyName _AllIssues -NotePropertyValue @($all) -Force
     Split-ServerIssues $Name $full
-    Set-FullCache $Name $full
+    if (-not $NoCache) { Set-FullCache $Name $full }
     $full
 }
 #endregion
@@ -7293,6 +7444,7 @@ function Complete-Scan($Op) {
     $el = [int]((Get-Date) - $Op.Started).TotalSeconds
     try { if ((Test-Path -LiteralPath $st.SnapDir) -and -not (Get-ChildItem -LiteralPath $st.SnapDir -Force)) { Remove-Item -LiteralPath $st.SnapDir -Force } } catch { }
     Remove-OldSnapshots
+    Sync-AvailabilityStats   # zaległe wpisy dziennika dostępności, nowa doba, wpisy skanu bez okna
     Update-VmIndex
     Update-OfflineAnalysis
     Update-StationClock
@@ -7324,14 +7476,19 @@ function Complete-Scan($Op) {
 function Invoke-PendingReanalysis {
     # ustawienia zmienione w trakcie skanu/wczytywania – ponowna analiza po zakończeniu operacji
     if ($script:ReanalyzePending -and -not (Get-Operation 'Scan') -and -not (Get-Operation 'Load')) { $script:ReanalyzePending = $false; Start-SnapshotLoad -Reanalyze }
+    elseif ($script:ReloadNames.Count) { Start-SnapshotLoad -Added }   # serwery dodane ponownie w trakcie wczytywania
 }
 $script:ReanalyzePending = $false
 
 # ── Wczytywanie wyników z dysku (start programu, ponowna analiza po zmianie ustawień) ──
-function Start-SnapshotLoad([switch]$Reanalyze) {
+function Start-SnapshotLoad([switch]$Reanalyze, [switch]$Added) {
+    # -Added: tylko serwery dodane ponownie do listy, z migawkami na dysku (Add-ServerEntry) – dane pozostałych zostają w pamięci
     if (Get-Operation 'Load') { return }
-    Update-SnapshotIndex
+    $only = @($script:ReloadNames.Keys)
+    $script:ReloadNames.Clear()
+    if ($Added) { if (-not $only.Count) { return } } else { $only = @(); Update-SnapshotIndex; Sync-AvailabilityStats }
     $items = foreach ($it in @($script:Servers)) {
+        if ($only.Count -and $only -notcontains $it.Name) { continue }
         $files = @(Get-SnapshotEntries $it.Name | ForEach-Object { @{ Path = $_.Path; Offline = $_.Offline } })
         if (-not $files.Count) { continue }
         if ($files.Count -gt 6) { $files = $files[0..5] }
@@ -7345,7 +7502,7 @@ function Start-SnapshotLoad([switch]$Reanalyze) {
     if (-not $items.Count) { return }
     if ($Reanalyze) { $script:FreshScan.Clear() }
     if (-not $script:Headless) { $ui.txtStatus.Text = "Wczytywanie wyników z dysku: 0 z $($items.Count)…" }
-    [void](Start-Operation -Kind 'Load' -Name $(if ($Reanalyze) { 'Ponowna analiza' } else { 'Wczytywanie wyników' }) -Items $items -Pool 'Local' -State @{ Last = $null; Bad = 0; Reanalyze = [bool]$Reanalyze } `
+    [void](Start-Operation -Kind 'Load' -Name $(if ($Reanalyze) { 'Ponowna analiza' } elseif ($Added) { 'Wczytywanie wyników dodanych serwerów' } else { 'Wczytywanie wyników' }) -Items $items -Pool 'Local' -State @{ Last = $null; Bad = 0; Reanalyze = [bool]$Reanalyze; Added = [bool]$Added } `
         -OnResult { param($op, $r) Receive-LoadResult $op $r } -OnComplete { param($op) Complete-Load $op })
 }
 function Receive-LoadResult($Op, $R) {
@@ -7353,6 +7510,7 @@ function Receive-LoadResult($Op, $R) {
     if ($R.Error) { Write-Log "[$(Get-DisplayName $name)] $($R.Error)" 'WARN' 'Migawki' }
     if (-not $R.Ok -or -not $R.Data) { $Op.State.Bad++; return }
     if ($script:FreshScan.Contains($name)) { return }   # w tej sesji jest już nowszy wynik skanu
+    if (-not (Get-ServerItem $name)) { return }   # usunięty z listy w trakcie wczytywania – bez osieroconych danych (kafelki Hyper-V, raport)
     $d = $R.Data
     $d | Add-Member -NotePropertyName ScannedAt -NotePropertyValue $R.ScannedAt -Force
     $d | Add-Member -NotePropertyName _File -NotePropertyValue "$($R.LatestFile)" -Force
@@ -7371,7 +7529,7 @@ function Complete-Load($Op) {
     $off = @($script:Data.Values | Where-Object { $_ -and $_.Offline }).Count
     Write-Log ("{0}: {1} serwerów w {2} s{3}{4}" -f $Op.Name, ($Op.Done - $Op.State.Bad), $el, $(if ($off) { ", bez połączenia przy ostatniej próbie: $off" }), $(if ($Op.State.Bad) { ", nieczytelne: $($Op.State.Bad)" })) 'INFO' 'Migawki'
     if (-not $script:Headless) {
-        if ($Op.State.Last) { $ui.txtLastScan.Text = "Wyniki z ostatniego skanu: $($Op.State.Last)" }
+        if ($Op.State.Last -and -not $Op.State.Added) { $ui.txtLastScan.Text = "Wyniki z ostatniego skanu: $($Op.State.Last)" }
         $ui.txtStatus.Text = "Wczytano wyniki $($Op.Done - $Op.State.Bad) serwerów"; $script:IdleStatus = $ui.txtStatus.Text
         Request-UiRefresh -All
     }
@@ -7520,7 +7678,7 @@ button{font:inherit;background:var(--panel);color:var(--text);border:1px solid v
         foreach ($it in $script:Servers) {
             $d = $script:Data[$it.Name]
             if (-not $d) { continue }
-            if ($Mode -eq 'Full' -and -not $d.Offline) { $d = Get-ServerFull $it.Name }
+            if ($Mode -eq 'Full' -and -not $d.Offline) { $d = Get-ServerFull $it.Name -NoCache }
             $os = if ($d.Offline) { 'brak połączenia' } elseif ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) { "$($d.Unsupported)" } else { "$($d.System.OS)" }
             $w.Write("<details><summary><span class=""dot"" style=""background:$($it.Color)""></span>$(HtmlEnc $it.Display) <span class=""muted"">$(HtmlEnc $os)</span>")
             if ($d._Crit) { $w.Write(" <span class=""pill p-crit"">$($d._Crit)</span>") }
@@ -7773,7 +7931,8 @@ function Add-IgnoreRule($Issue, [switch]$AllServers) {
 function Remove-IgnoreRule($Issue) {
     if (-not $Issue) { return }
     $before = @($Config.IgnoredIssues).Count
-    $Config.IgnoredIssues = @($Config.IgnoredIssues | Where-Object { $_ -and -not ($_.Key -eq $Issue.IssueKey -and ($_.Server -eq '*' -or $_.Server -eq $Issue.ServerKey)) })
+    $keys = Get-IssueKeyVariants $Issue.IssueKey   # także reguła zapisana dawnym formatem klucza
+    $Config.IgnoredIssues = @($Config.IgnoredIssues | Where-Object { $_ -and -not ($keys -contains $_.Key -and ($_.Server -eq '*' -or $_.Server -eq $Issue.ServerKey)) })
     if (@($Config.IgnoredIssues).Count -eq $before) { return }
     Save-UserSettings
     Update-IgnoreRules
@@ -7788,9 +7947,15 @@ function Update-IgnoreRules {
     Request-UiRefresh -All
 }
 function Update-IgnoredGrid {
-    $rows = @($Config.IgnoredIssues | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Server = $(if ($_.Server -eq '*') { '* (wszystkie)' } else { Get-DisplayName $_.Server }); Text = $_.Text; Added = $_.Added; By = $_.By; _Rule = $_ } })
+    # Ile serwerów reguła ukrywa teraz (wyciszone problemy wczytanych wyników): zbyt szeroka reguła „*” albo martwa (0) od razu widoczna
+    $hits = @{}
+    $muted = New-Object System.Collections.Generic.List[object]
+    foreach ($k in @($script:Data.Keys)) { $d = $script:Data[$k]; if ($d -and $d.PSObject.Properties['_Ignored']) { foreach ($i in @($d._Ignored)) { if ($i) { $muted.Add(@{ S = $k; K = $i.IssueKey }) } } } }
+    foreach ($si in @((Get-StationClockIssue), $script:StationNetIssue, $script:CveIssue)) { if ($si -and (Test-IssueIgnored '(stacja)' $si.IssueKey)) { $muted.Add(@{ S = '(stacja)'; K = $si.IssueKey }) } }
+    foreach ($m in $muted) { foreach ($v in (Get-IssueKeyVariants $m.K)) { foreach ($rk in "*|$v", "$($m.S)|$v") { if (-not $hits.ContainsKey($rk)) { $hits[$rk] = @{} }; $hits[$rk][$m.S] = $true } } }
+    $rows = @($Config.IgnoredIssues | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Server = $(if ($_.Server -eq '*') { '* (wszystkie)' } else { Get-DisplayName $_.Server }); Text = $_.Text; Hits = [int]$(if ($hits.ContainsKey("$($_.Server)|$($_.Key)")) { $hits["$($_.Server)|$($_.Key)"].Count }); Added = $_.Added; By = $_.By; _Rule = $_ } })
     $script:IgDlg.Grid.ItemsSource = $rows
-    $script:IgDlg.Info.Text = "Reguł: $($rows.Count). Zaznacz reguły i kliknij «Usuń zaznaczone», aby problemy znów były zgłaszane."
+    $script:IgDlg.Info.Text = "Reguł: $($rows.Count). «Ukrywa teraz» – na ilu serwerach reguła wycisza problem w bieżących wynikach (0 = nic nie ukrywa: problem zniknął albo zmieniła się jego treść). Zaznacz reguły i kliknij «Usuń zaznaczone», aby problemy znów były zgłaszane."
 }
 function Show-IgnoredIssuesDialog {
     $body = @'
@@ -7802,7 +7967,7 @@ function Show-IgnoredIssuesDialog {
 '@
     $w = New-Dialog -Title 'Wyciszone problemy' -Subtitle 'Wyciszony problem nie liczy się do kafelków i list. Reguła „*” działa na wszystkich serwerach.' -Body $body -Icon 'E7BA' -OkText 'Zamknij' -NoCancel -Width 900
     $grid = $w.FindName('igGrid')
-    $grid.Add_AutoGeneratingColumn({ param($s, $e) if ($e.PropertyName -like '_*') { $e.Cancel = $true; return }; $e.Column.Header = switch ($e.PropertyName) { 'Server' { 'Serwer' } 'Text' { 'Problem (przykład)' } 'Added' { 'Dodano' } 'By' { 'Kto' } default { $e.PropertyName } } })
+    $grid.Add_AutoGeneratingColumn({ param($s, $e) if ($e.PropertyName -like '_*') { $e.Cancel = $true; return }; $e.Column.Header = switch ($e.PropertyName) { 'Server' { 'Serwer' } 'Text' { 'Problem (przykład)' } 'Hits' { 'Ukrywa teraz' } 'Added' { 'Dodano' } 'By' { 'Kto' } default { $e.PropertyName } } })
     # (bez GetNewClosure – domknięcie nie widzi zmiennych i funkcji skryptu; stan okna w $script:IgDlg)
     $script:IgDlg = @{ Grid = $grid; Info = $w.FindName('igInfo') }
     Update-IgnoredGrid
@@ -7845,6 +8010,7 @@ function Invoke-HeadlessScan {
     try {
         Write-Log ("Przegląd serwerów {0} – skan bez okna (PowerShell {1}, {2}\{3}, raport: {4})" -f $script:AppVersion, $PSVersionTable.PSVersion, $env:USERDOMAIN, $env:USERNAME, $(if ($NoReport) { 'brak' } else { $ReportMode })) 'INFO' 'Program'
         if ($script:BaseFallback) { Write-Log $script:BaseFallback 'WARN' 'Program' }
+        $dw = Get-DataFolderWarning; if ($dw) { Write-Log $dw 'WARN' 'Program' }
         if ($script:SettingsWarning) { Write-Log $script:SettingsWarning 'WARN' 'Ustawienia' }
         if (-not (Test-Path -LiteralPath $Config.ServerListFile)) { Write-Log "Brak listy serwerów: $($Config.ServerListFile)" 'ERROR' 'Lista'; return 2 }
         [void](Import-ServerFile $Config.ServerListFile)
@@ -8258,6 +8424,7 @@ $window.Add_Closing({
         $script:UiState.WindowMaximized = ($s.WindowState -eq 'Maximized')
         if ($s.WindowState -eq 'Normal') { $script:UiState.WindowWidth = [int]$s.ActualWidth; $script:UiState.WindowHeight = [int]$s.ActualHeight }
         if ($script:UiState.LogVisible) { $script:UiState.LogHeight = [int]$ui.logRow.ActualHeight }
+        Write-AvailabilityPending   # ostatnia próba dopisania zaległych wpisów dziennika dostępności
         try { Save-UserSettings } catch { }
         Write-Log 'Zamknięto program.' 'INFO' 'Program'
     } catch { }
@@ -8278,12 +8445,15 @@ $window.Add_Loaded({
         else { $ui.txtStatus.Text = "Wczytano $($script:Servers.Count) serwerów z $($Config.ServerListFile)" }
         Write-Log ("Lista serwerów: {0} ({1})" -f $script:Servers.Count, $Config.ServerListFile) 'INFO' 'Lista'
         if ($script:BaseFallback) { Write-Log $script:BaseFallback 'WARN' 'Program' }
+        $dw = Get-DataFolderWarning; if ($dw) { Write-Log $dw 'WARN' 'Program' }
         if ($script:SettingsWarning) { Write-Log $script:SettingsWarning 'WARN' 'Ustawienia' }
         if (-not $script:NativeOk) { Write-Log "Bez kodu natywnego (ciemny pasek tytułu, szybkie sortowanie): $script:NativeError" 'INFO' 'Program' }
         if ($script:LogFailed) { Write-Log "Nie można zapisywać dziennika w $($Config.LogDir)" 'WARN' 'Program' }
+        Start-IdleLock   # przed wczytywaniem – błąd wczytywania nie może wyłączyć blokady po bezczynności
         Start-SnapshotLoad
         Start-CveUpdate -Auto   # dane CVE z pamięci podręcznej (i odświeżenie, gdy stare) – równolegle z wczytywaniem migawek
-        Start-IdleLock
+        # ustawienia nieczytelne (np. błąd po ręcznej edycji): nie tylko wpis w dzienniku – wyciszenia i PIN mogły zniknąć
+        if ($script:SettingsWarning) { Show-Message $script:SettingsWarning 'Ustawienia' 'warn' }
     }
 })
 Register-IdleActivity -Window $window
