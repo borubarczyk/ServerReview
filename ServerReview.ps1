@@ -6523,6 +6523,8 @@ function Add-ServerEntry([string]$Name, [string]$OS) {
     $Name = "$Name".Trim().Trim('"', "'")   # CSV z Export-Csv ma wartości w cudzysłowach (także nagłówek "Name")
     if (-not $Name -or $Name -in 'Name', 'ComputerName', 'DNSHostName', 'HostName', 'Server', 'Serwer') { return $false }
     if (Get-ServerItem $Name) { return $false }
+    # tylko nazwa hosta / FQDN / adres IPv4 lub IPv6: nazwa trafia do mstsc, \\nazwa\C$ i konsoli PowerShell, a nazwę VM i FQDN z KVP ustawia gość
+    if ($Name.Length -gt 253 -or ($Name -notmatch '^[\p{L}\p{Nd}_][\p{L}\p{Nd}_.-]*\z' -and $Name -notmatch '^(?=.*:)[0-9A-Fa-f:.]+(%[0-9A-Za-z]+)?\z')) { Write-Log "Pominięto nieprawidłową nazwę serwera: $(Get-ShortText $Name 80)" 'WARN' 'Lista'; return $false }
     $disp = Get-DisplayName $Name
     foreach ($it in $script:Servers) { if ($it.Display -eq $disp -and -not (Test-IpAddress $Name)) { return $false } }
     $item = New-ServerItem $Name $OS
@@ -7762,6 +7764,8 @@ $script:PendingDialogs = New-Object System.Collections.ArrayList
 # i wiersze wymagające uwagi – mały plik także przy kilkuset serwerach. Pełny: wszystkie sekcje każdego serwera (wczytywane
 # kolejno z migawek, do 500 wierszy na sekcję). Zapis strumieniowy – bez budowania całego dokumentu w pamięci.
 function HtmlEnc($s) { [System.Net.WebUtility]::HtmlEncode("$s") }
+# Flag wiersza bywa wartością z JSON serwera (kolektor, wiersze Hyper-V) – do atrybutu class trafiają tylko znane klasy
+function HtmlFlag($f) { if ("$f" -cin 'crit', 'warn', 'info', 'muted') { "$f" } else { '' } }
 function Write-HtmlTable([System.IO.TextWriter]$W, $Rows, [int]$Cap = 0) {
     $Rows = @($Rows | Where-Object { $null -ne $_ })
     if (-not $Rows.Count) { $W.Write('<p class="muted">Brak pozycji</p>'); return }
@@ -7773,7 +7777,7 @@ function Write-HtmlTable([System.IO.TextWriter]$W, $Rows, [int]$Cap = 0) {
     foreach ($r in $Rows) {
         if ($Cap -gt 0 -and $n -ge $Cap) { break }
         $n++
-        $W.Write('<tr class="'); $W.Write("$($r.Flag)"); $W.Write('">')
+        $W.Write('<tr class="'); $W.Write((HtmlFlag $r.Flag)); $W.Write('">')
         foreach ($c in $cols) { $W.Write('<td>'); $W.Write([System.Net.WebUtility]::HtmlEncode("$($r.$c)")); $W.Write('</td>') }
         $W.Write('</tr>')
     }
@@ -7787,7 +7791,7 @@ function Write-HtmlIssues([System.IO.TextWriter]$W, $Issues, [switch]$WithServer
     if ($WithServer) { $W.Write('<th>Serwer</th>') }
     $W.Write('<th>Kategoria</th><th>Opis</th></tr></thead><tbody>')
     foreach ($i in $Issues) {
-        $W.Write("<tr><td><span class=""pill p-$($i.Flag)"">$(HtmlEnc $i.Severity)</span></td>")
+        $W.Write("<tr><td><span class=""pill p-$(HtmlFlag $i.Flag)"">$(HtmlEnc $i.Severity)</span></td>")
         if ($WithServer) { $W.Write("<td>$(HtmlEnc $i.Server)</td>") }
         $W.Write("<td>$(HtmlEnc $i.Category)</td><td>$(HtmlEnc $i.Message)</td></tr>")
     }
@@ -7828,7 +7832,7 @@ button{font:inherit;background:var(--panel);color:var(--text);border:1px solid v
         $now = Get-Date -Format 'yyyy-MM-dd HH:mm'
         $w.Write("<!DOCTYPE html><html lang=""pl""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1""><title>Przegląd serwerów $now</title><style>$css</style></head><body>")
         $w.Write("<h1>Przegląd serwerów</h1><div class=""muted"">Wygenerowano $now przez $(HtmlEnc "$env:USERDOMAIN\$env:USERNAME"), domena $(HtmlEnc $env:USERDNSDOMAIN) – raport $(if ($Mode -eq 'Full') { 'pełny' } else { 'podsumowanie' }), wersja programu $script:AppVersion</div>")
-        $tiles = @(@('Serwery', $script:Data.Count, ''), @('Odpowiada', $o.Online, 'var(--ok)'), @('Bez połączenia', $o.Offline, 'var(--crit)'), @('Krytyczne', $o.Crit, 'var(--crit)'), @('Ostrzeżenia', $o.Warn, 'var(--warn)'), @('Hyper-V: hosty / VM', "$($o.Hosts) / $($o.VmRun)", 'var(--info)'))
+        $tiles = @(@('Serwery', $script:Servers.Count, ''), @('Odpowiada', $o.Online, 'var(--ok)'), @('Bez połączenia', $o.Offline, 'var(--crit)'), @('Krytyczne', $o.Crit, 'var(--crit)'), @('Ostrzeżenia', $o.Warn, 'var(--warn)'), @('Hyper-V: hosty / VM', "$($o.Hosts) / $($o.VmRun)", 'var(--info)'))
         $w.Write('<div class="tiles">')
         foreach ($t in $tiles) { $w.Write("<div class=""tile""><span class=""muted"">$($t[0])</span><b style=""color:$($t[2])"">$($t[1])</b></div>") }
         $w.Write('</div><h2>Wykryte problemy</h2>')
@@ -7864,7 +7868,7 @@ button{font:inherit;background:var(--panel);color:var(--text);border:1px solid v
             if (-not $d) { continue }
             if ($Mode -eq 'Full' -and -not $d.Offline) { $d = Get-ServerFull $it.Name }
             $os = if ($d.Offline) { 'brak połączenia' } elseif ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) { "$($d.Unsupported)" } else { "$($d.System.OS)" }
-            $w.Write("<details><summary><span class=""dot"" style=""background:$($it.Color)""></span>$(HtmlEnc $it.Display) <span class=""muted"">$(HtmlEnc $os)</span>")
+            $w.Write("<details><summary><span class=""dot"" style=""background:$(HtmlEnc $it.Color)""></span>$(HtmlEnc $it.Display) <span class=""muted"">$(HtmlEnc $os)</span>")
             if ($d._Crit) { $w.Write(" <span class=""pill p-crit"">$($d._Crit)</span>") }
             if ($d._Warn) { $w.Write(" <span class=""pill p-warn"">$($d._Warn)</span>") }
             $w.Write('</summary><div>')
@@ -8476,6 +8480,28 @@ function Remove-SelectedServers {
 }
 $ui.lstServers.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Delete') { Invoke-UiAction 'Lista' { Remove-SelectedServers } } })
 
+# Akcje serwera w menu kontekstowym (lista serwerów, „Stan serwerów”, tabele Hyper-V). Nazwy z chwili otwarcia menu –
+# odświeżenie tabeli w trakcie skanu nie zmienia celu wybranej akcji.
+function Add-ServerMenuItems($Menu, [string[]]$Names) {
+    $script:MenuServers = [string[]]@($Names)
+    $cnt = $script:MenuServers.Count
+    $busy = [bool](Get-Operation 'Scan')
+    [void]$Menu.Items.Add((New-MenuItem $(if ($cnt -gt 1) { "Skanuj zaznaczone ($cnt)" } else { 'Skanuj ten serwer' }) 'E768' { Start-Scan @($script:MenuServers) } -Enabled (-not $busy)))
+    [void]$Menu.Items.Add((New-MenuItem $(if ($cnt -gt 1) { "Diagnozuj połączenie ($cnt)" } else { 'Diagnozuj połączenie' }) 'E9D9' { Start-Diagnostics @($script:MenuServers) }))
+    [void]$Menu.Items.Add((New-MenuItem 'Kopiuj nazwy' 'E8C8' { [System.Windows.Clipboard]::SetText(($script:MenuServers -join [Environment]::NewLine)); Show-Toast "Skopiowano nazw: $($script:MenuServers.Count)" 'ok' }))
+    if ($cnt -ne 1) { return }
+    [void]$Menu.Items.Add((New-MenuSeparator))
+    [void]$Menu.Items.Add((New-MenuItem 'Połącz przez RDP' 'E7F4' { Start-Process mstsc.exe -ArgumentList "/v:$($script:MenuServers[0])" }))
+    # nazwa w zmiennej środowiskowej nowej konsoli, nie w tekście -Command – żaden znak nazwy nie zostanie wykonany jako kod
+    [void]$Menu.Items.Add((New-MenuItem 'PowerShell (Enter-PSSession)' 'E756' { $env:SERVERREVIEW_PSHOST = $script:MenuServers[0]; try { Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', 'Enter-PSSession -ComputerName $env:SERVERREVIEW_PSHOST' } finally { $env:SERVERREVIEW_PSHOST = $null } }))
+    [void]$Menu.Items.Add((New-MenuItem 'Zarządzanie komputerem' 'E770' { Start-Process compmgmt.msc -ArgumentList "/computer:\\$($script:MenuServers[0])" }))
+    [void]$Menu.Items.Add((New-MenuItem 'Podgląd zdarzeń' 'E81C' { Start-Process eventvwr.exe -ArgumentList $script:MenuServers[0] }))
+    [void]$Menu.Items.Add((New-MenuItem 'Usługi' 'E713' { Start-Process services.msc -ArgumentList "/computer:\\$($script:MenuServers[0])" }))
+    [void]$Menu.Items.Add((New-MenuItem 'Otwórz udział C$' 'E838' { Start-Process explorer.exe -ArgumentList "\\$($script:MenuServers[0])\C$" }))
+    $it = Get-ServerItem $script:MenuServers[0]
+    if ($it -and $it.Kind -eq 'HV') { [void]$Menu.Items.Add((New-MenuItem 'Pokaż maszyny tego hosta' 'E8FD' { $h = (Get-ServerItem $script:MenuServers[0]).Display; Show-View 'Vms'; $ui.vfAll.IsChecked = $true; $ui.txtVmFilter.Text = $h.ToLowerInvariant() })) }
+    if ($it -and $it.HvHost) { [void]$Menu.Items.Add((New-MenuItem "Przejdź do hosta $($it.HvHost)" 'E8FD' { $h = (Get-ServerItem $script:MenuServers[0]).HvHost; $hk = @($script:Servers | Where-Object { $_.Display -eq $h })[0]; if ($hk) { Select-Server $hk.Name 'HyperV' } else { Show-Toast "Host $h nie jest na liście serwerów." 'info' } })) }
+}
 # Menu kontekstowe listy serwerów (budowane przy otwarciu – zależy od zaznaczenia)
 $ui.lstServers.ContextMenu = New-Object System.Windows.Controls.ContextMenu
 $ui.lstServers.Add_ContextMenuOpening({
@@ -8484,25 +8510,9 @@ $ui.lstServers.Add_ContextMenuOpening({
     $m.Items.Clear()
     $names = @(Get-SelectedServerNames)
     if (-not $names.Count) { $e.Handled = $true; return }
-    $one = $names[0]
-    $busy = [bool](Get-Operation 'Scan')
-    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Skanuj zaznaczone ($($names.Count))" } else { 'Skanuj ten serwer' }) 'E768' { Start-Scan @(Get-SelectedServerNames) } -Enabled (-not $busy)))
-    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Diagnozuj połączenie ($($names.Count))" } else { 'Diagnozuj połączenie' }) 'E9D9' { Start-Diagnostics @(Get-SelectedServerNames) }))
-    [void]$m.Items.Add((New-MenuItem 'Kopiuj nazwy' 'E8C8' { $t = (@(Get-SelectedServerNames) -join [Environment]::NewLine); [System.Windows.Clipboard]::SetText($t); Show-Toast "Skopiowano nazw: $(@(Get-SelectedServerNames).Count)" 'ok' }))
+    Add-ServerMenuItems $m $names
     [void]$m.Items.Add((New-MenuSeparator))
-    if ($names.Count -eq 1) {
-        [void]$m.Items.Add((New-MenuItem 'Połącz przez RDP' 'E7F4' { Start-Process mstsc.exe -ArgumentList "/v:$(@(Get-SelectedServerNames)[0])" }))
-        [void]$m.Items.Add((New-MenuItem 'PowerShell (Enter-PSSession)' 'E756' { $n = @(Get-SelectedServerNames)[0]; Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', "Enter-PSSession -ComputerName '$n'" }))
-        [void]$m.Items.Add((New-MenuItem 'Zarządzanie komputerem' 'E770' { Start-Process compmgmt.msc -ArgumentList "/computer:\\$(@(Get-SelectedServerNames)[0])" }))
-        [void]$m.Items.Add((New-MenuItem 'Podgląd zdarzeń' 'E81C' { Start-Process eventvwr.exe -ArgumentList @(Get-SelectedServerNames)[0] }))
-        [void]$m.Items.Add((New-MenuItem 'Usługi' 'E713' { Start-Process services.msc -ArgumentList "/computer:\\$(@(Get-SelectedServerNames)[0])" }))
-        [void]$m.Items.Add((New-MenuItem 'Otwórz udział C$' 'E838' { Start-Process explorer.exe -ArgumentList "\\$(@(Get-SelectedServerNames)[0])\C$" }))
-        $it = Get-ServerItem $one
-        if ($it -and $it.Kind -eq 'HV') { [void]$m.Items.Add((New-MenuItem 'Pokaż maszyny tego hosta' 'E8FD' { $h = (Get-ServerItem @(Get-SelectedServerNames)[0]).Display; Show-View 'Vms'; $ui.vfAll.IsChecked = $true; $ui.txtVmFilter.Text = $h.ToLowerInvariant() })) }
-        if ($it -and $it.HvHost) { [void]$m.Items.Add((New-MenuItem "Przejdź do hosta $($it.HvHost)" 'E8FD' { $h = (Get-ServerItem @(Get-SelectedServerNames)[0]).HvHost; $hk = @($script:Servers | Where-Object { $_.Display -eq $h })[0]; if ($hk) { Select-Server $hk.Name 'HyperV' } else { Show-Toast "Host $h nie jest na liście serwerów." 'info' } })) }
-        [void]$m.Items.Add((New-MenuSeparator))
-    }
-    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Usuń z listy ($($names.Count))" } else { 'Usuń z listy' }) 'E74D' { Remove-SelectedServers } -Danger -Enabled (-not $busy)))
+    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Usuń z listy ($($names.Count))" } else { 'Usuń z listy' }) 'E74D' { Remove-SelectedServers } -Danger -Enabled (-not [bool](Get-Operation 'Scan'))))
 })
 
 # Menu problemów (przegląd i sekcja Problemy w szczegółach): wyciszanie
@@ -8530,7 +8540,21 @@ $script:IssueMenuOpening = {
     [void]$m.Items.Add((New-MenuItem 'Kopiuj treść' 'E8C8' { [System.Windows.Clipboard]::SetText("$($script:MenuIssue.Server): $($script:MenuIssue.Message)"); Show-Toast 'Skopiowano.' 'ok' 2 }))
     if ($s -eq $ui.gridIssues -and $i.ServerKey -and (Get-ServerItem $i.ServerKey)) { [void]$m.Items.Add((New-MenuItem 'Otwórz serwer' 'E9D9' { Select-Server $script:MenuIssue.ServerKey $script:MenuIssue.Section })) }
 }
-foreach ($g in 'gridIssues', 'gridDetail') { $ui[$g].ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui[$g].Add_ContextMenuOpening($script:IssueMenuOpening) }
+# Wiersze sekcji, które nie są problemem (usługi, oprogramowanie…): kopiowanie wiersza albo wartości komórki zamiast braku menu
+$script:DetailMenuOpening = {
+    param($s, $e)
+    if (Get-ContextIssue $s) { & $script:IssueMenuOpening $s $e; return }
+    $m = $s.ContextMenu
+    $m.Items.Clear()
+    $r = $s.SelectedItem
+    if (-not $r) { $e.Handled = $true; return }
+    $script:MenuRow = $r
+    [void]$m.Items.Add((New-MenuItem 'Kopiuj wiersz' 'E8C8' { [System.Windows.Clipboard]::SetText((Format-RowDetail $script:MenuRow)); Show-Toast 'Skopiowano.' 'ok' 2 }))
+    $p = "$($s.CurrentCell.Column.SortMemberPath)"   # kolumna komórki z fokusem (kliknięta prawym przyciskiem)
+    if ($p -and $r.PSObject.Properties[$p] -and "$($r.$p)") { $script:MenuCell = "$($r.$p)"; [void]$m.Items.Add((New-MenuItem "Kopiuj wartość: $((Get-Header $p) -replace '_', '__')" 'E8C8' { [System.Windows.Clipboard]::SetText($script:MenuCell); Show-Toast 'Skopiowano.' 'ok' 2 })) }
+}
+$ui.gridIssues.ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui.gridIssues.Add_ContextMenuOpening($script:IssueMenuOpening)
+$ui.gridDetail.ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui.gridDetail.Add_ContextMenuOpening($script:DetailMenuOpening)
 
 $addHandler = {
     $names = @($ui.txtAdd.Text -split '[,;\s]+' | Where-Object { $_ })
@@ -8550,8 +8574,9 @@ $ui.btnAD.Add_Click({
         $old = $window.Cursor; $window.Cursor = [System.Windows.Input.Cursors]::Wait
         try { $found = @(Get-ServersFromAD) } catch { Show-Message "Nie udało się odpytać AD: $($_.Exception.Message)" 'Pobierz z AD' 'crit'; return } finally { $window.Cursor = $old }
         if (-not $found.Count) { Show-Message "Nie znaleziono aktywnych kont serwerów Windows w AD$(if ($Config.AdSearchBase) { " (OU: $($Config.AdSearchBase))" })." 'Pobierz z AD' 'info'; return }
-        # $dn przed wewnętrznym Where-Object – tam $_ to już pozycja listy, nie wynik z AD
-        $new = @($found | Where-Object { $dn = Get-DisplayName $_.Name; -not (Get-ServerItem $_.Name) -and -not @($script:Servers | Where-Object { $_.Display -eq $dn }).Count })
+        # nazwy krótkie z listy w zbiorze – bez przeszukiwania całej listy dla każdego konta z AD (tysiące kont × setki serwerów w wątku okna)
+        $have = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase); foreach ($it in $script:Servers) { [void]$have.Add($it.Display) }
+        $new = @($found | Where-Object { -not (Get-ServerItem $_.Name) -and -not $have.Contains((Get-DisplayName $_.Name)) })
         if (-not $new.Count) { Show-Toast "W AD jest $($found.Count) aktywnych serwerów – wszystkie są już na liście." 'info'; return }
         if (Confirm-Action -Text "W AD jest $($found.Count) aktywnych serwerów Windows (logowanie w ostatnich $($Config.AdInactiveDays) dniach$(if ($Config.AdSearchBase) { ", OU: $($Config.AdSearchBase)" })), z czego $($new.Count) nie ma jeszcze na liście:`n$(Join-Short ($new | ForEach-Object { Get-DisplayName $_.Name }) 20)`n`nDodać brakujące?" -Title 'Pobierz z AD' -ConfirmText 'Dodaj' -Tone 'info') {
             foreach ($f in ($new | Sort-Object Name)) { [void](Add-ServerEntry $f.Name $f.OS) }
@@ -8622,6 +8647,36 @@ $ui.gridVms.Add_MouseDoubleClick({
     if (-not $r) { return }
     Invoke-UiAction 'Widok' { if ($r._ServerKey) { Select-Server $r._ServerKey 'Issues' } else { Select-Server $r._HostKey 'HyperV' } }
 })
+# Enter w tabeli otwiera serwer z wiersza jak dwuklik (domyślnie DataGrid przechodzi Enterem do następnego wiersza)
+function Open-GridRow($Grid, $Row) {
+    if (-not $Row) { return }
+    if ($Grid -eq $ui.gridIssues) { if ($Row.ServerKey -and (Get-ServerItem $Row.ServerKey)) { Select-Server $Row.ServerKey $Row.Section } }
+    elseif ($Grid -eq $ui.gridServers) { Select-Server $Row.Key 'Issues' }
+    elseif ($Grid -eq $ui.gridHosts) { Select-Server $Row.Key 'HvHost' }
+    elseif ($Row._ServerKey) { Select-Server $Row._ServerKey 'Issues' } else { Select-Server $Row._HostKey 'HyperV' }
+}
+# wiersz komórki z fokusem (źródło zdarzenia klawisza), a gdy fokus jest na samej tabeli – zaznaczony
+foreach ($g in 'gridIssues', 'gridServers', 'gridHosts', 'gridVms') { $ui[$g].Add_PreviewKeyDown({ param($s, $e) if ($e.Key -eq 'Return' -and [System.Windows.Input.Keyboard]::Modifiers -eq 'None') { $r = Get-ClickedRowItem $e; if (-not $r) { $r = $s.SelectedItem }; if ($r) { $e.Handled = $true; Invoke-UiAction 'Widok' { Open-GridRow $s $r } } } }) }
+# Menu tabel „Stan serwerów”, hostów i maszyn Hyper-V: akcje serwera jak na liście (maszyna – tylko gdy jest na liście)
+$onGridServerMenu = {
+    param($s, $e)
+    $m = $s.ContextMenu
+    $m.Items.Clear()
+    $rows = @($s.SelectedItems)
+    $isVm = $s -eq $ui.gridVms
+    $names = @($rows | ForEach-Object { if ($isVm) { $_._ServerKey } else { $_.Key } } | Where-Object { $_ -and (Get-ServerItem $_) } | Select-Object -Unique)
+    if ($rows.Count -eq 1 -and $names.Count) { $script:MenuGrid = $s; $script:MenuRow = $rows[0]; [void]$m.Items.Add((New-MenuItem 'Otwórz serwer' 'E8A7' { Open-GridRow $script:MenuGrid $script:MenuRow })); [void]$m.Items.Add((New-MenuSeparator)) }
+    if ($names.Count) { Add-ServerMenuItems $m $names }
+    if ($isVm) {
+        $out = @($rows | Where-Object { -not $_.OnList -and -not $_._Linux }).Count
+        $hk = if (-not $names.Count -and $rows.Count -eq 1 -and $rows[0]._HostKey -and (Get-ServerItem $rows[0]._HostKey)) { $rows[0]._HostKey } else { '' }
+        if (($out -or $hk) -and $m.Items.Count) { [void]$m.Items.Add((New-MenuSeparator)) }
+        if ($out) { [void]$m.Items.Add((New-MenuItem "Dodaj do listy serwerów ($out)" 'E710' { Add-VmsToList })) }
+        if ($hk) { $script:MenuHost = $hk; [void]$m.Items.Add((New-MenuItem "Przejdź do hosta $($rows[0].Host)" 'E8FD' { Select-Server $script:MenuHost 'HyperV' })) }
+    }
+    if (-not $m.Items.Count) { $e.Handled = $true }
+}
+foreach ($g in 'gridServers', 'gridHosts', 'gridVms') { $ui[$g].ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui[$g].Add_ContextMenuOpening($onGridServerMenu) }
 
 # Dziennik
 $ui.btnLogToggle.Add_Click({ Set-LogVisible (-not $script:UiState.LogVisible) })
