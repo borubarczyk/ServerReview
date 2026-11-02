@@ -4969,7 +4969,7 @@ function Set-CveIssue([string]$Text, [string]$Severity = 'Info') {
 
 function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     <#
-        Pobranie/odświeżenie danych CVE w tle (pula Remote – przy starcie Local jest zajęta wczytywaniem migawek).
+        Pobranie/odświeżenie danych CVE w tle (pula Aux – przy starcie Local jest zajęta wczytywaniem migawek, a Remote – skanem).
         -Auto: tylko gdy brakuje danych dla systemu z floty albo są starsze niż CveRefreshHours; po nieudanej próbie (brak danych systemu
         albo źródło nieodświeżone) kolejna najwcześniej po 30 min.
     #>
@@ -4994,7 +4994,7 @@ function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     $prods = [object[]]@($want | ForEach-Object { @{ Name = $_; Path = (Get-CveCacheFile $_) } })
     $items = @(@{ Target = 'Dane CVE'; Opt = @{ Dir = $Config.CacheDir; Products = $prods; Months = [int]$Config.CveMonths; RefreshHours = [int]$Config.CveRefreshHours; Proxy = "$($Config.CveProxy)"; Force = [bool]$Force } })
     Write-Log "Dane CVE: $($want -join ', ')$(if ($Force) { ' – pobieranie wymuszone' })" 'INFO' 'CVE'
-    [void](Start-Operation -Kind 'Cve' -Name 'Dane CVE' -Items $items -Pool 'Remote' -TimeoutSec 1800 -State @{ Manual = -not $Auto; Want = [string[]]$want } `
+    [void](Start-Operation -Kind 'Cve' -Name 'Dane CVE' -Items $items -Pool 'Aux' -TimeoutSec 1800 -State @{ Manual = -not $Auto; Want = [string[]]$want } `
         -OnResult { param($op, $r) Receive-CveResult $op $r } -OnComplete { param($op) Complete-CveUpdate $op })
 }
 
@@ -7817,7 +7817,7 @@ function Update-IssueFilter {
             $true
         }.GetNewClosure())
     }
-    $ui.txtIssuesCount.Text = "$(@($view).Count) z $(@($ui.gridIssues.ItemsSource).Count)"
+    $ui.txtIssuesCount.Text = "$($view.Count) z $(@($ui.gridIssues.ItemsSource).Count)"   # Count widoku (po filtrze) bez kopiowania wierszy do tablicy
 }
 #endregion
 
@@ -8200,16 +8200,20 @@ function Select-Server([string]$Key, [string]$Section) {
 #region ── Silnik operacji w tle (skan, wczytywanie migawek, diagnostyka) ───────
 # Pule wątków jak w AD-ManagerDiamond: każdy serwer to osobne zadanie (PowerShell w puli), więc ma własny limit czasu,
 # a wynik – razem z zapisem migawki, parsowaniem JSON i diagnostyką niedostępności – przygotowuje wątek tła.
-# Wątek okna (timer) tylko odbiera gotowe obiekty, z budżetem czasu na takt, i odświeża widoki co ~1,5 s.
-#   Remote – skan i diagnostyka (do ThrottleLimit naraz), Local – wczytywanie migawek z dysku (kilka wątków).
+# Wątek okna (timer) tylko odbiera gotowe obiekty, z budżetem czasu na takt, i odświeża widoki co ~1,5 s (rzadziej, gdy odświeżenie jest kosztowne).
+#   Remote – skan (do ThrottleLimit naraz), Local – wczytywanie migawek z dysku (kilka wątków),
+#   Aux – diagnoza na żądanie i dane CVE (mała osobna pula: nie czekają w kolejce za setkami zadań skanu).
 $script:Ops       = New-Object System.Collections.ArrayList
-$script:Pools     = @{ Remote = $null; Local = $null }
+$script:Pools     = @{ Remote = $null; Local = $null; Aux = $null }
 $script:Abandoned = New-Object System.Collections.ArrayList
 $script:AbandonAfterSec = 15
 $script:OpId      = 0
 $script:InTick    = $false
 $script:UiDirty   = @{ List = $false; Overview = $false; Vms = $false; Detail = $false }
 $script:LastUiRefresh = [Diagnostics.Stopwatch]::StartNew()
+$script:UiRefreshMs = 1500     # odstęp odświeżania widoków w trakcie operacji – rośnie z kosztem odświeżenia (Invoke-UiRefresh)
+$script:CredProbe = $false     # skan z hasłem niesprawdzonym w domenie: 2 serwery naraz, aż któryś przyjmie poświadczenia (Get-EnginePool)
+$script:PendingRetry = $null   # zaplanowana ponowna próba po skanie: @{ Targets; State; Due } – start w takcie silnika (Update-Operations)
 
 function New-EnginePool([int]$Max) {
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -8220,7 +8224,10 @@ function New-EnginePool([int]$Max) {
     $pool
 }
 function Get-EnginePool([string]$Kind) {
-    $max = if ($Kind -eq 'Local') { [Math]::Max(2, [Math]::Min(6, [Environment]::ProcessorCount)) } else { [int]$Config.ThrottleLimit }
+    $max = switch ($Kind) { 'Local' { [Math]::Max(2, [Math]::Min(6, [Environment]::ProcessorCount)) } 'Aux' { [Math]::Max(2, [Math]::Min(8, [int]$Config.ThrottleLimit)) } default { [int]$Config.ThrottleLimit } }
+    if ($Kind -eq 'Remote' -and $script:CredProbe) { $max = [Math]::Min($max, 2) }   # ochrona konta (Start-Scan, Complete-CredProbe)
+    # zadanie porzucone (zawieszone wywołanie WinRM/LDAP/DNS) nadal zajmuje miejsce w puli – limit rośnie o ich liczbę (najwyżej dwukrotnie)
+    $max += [Math]::Min($max, @($script:Abandoned | Where-Object { $_.Pool -eq $Kind }).Count)
     if (-not $script:Pools[$Kind]) { $script:Pools[$Kind] = New-EnginePool $max }
     else { try { [void]$script:Pools[$Kind].SetMaxRunspaces($max) } catch { } }
     $script:Pools[$Kind]
@@ -8238,7 +8245,7 @@ function Start-Operation {
     $pl = Get-EnginePool $Pool
     $script:OpId++
     $op = @{
-        Id = $script:OpId; Kind = $Kind; Name = $Name; Items = New-Object System.Collections.ArrayList; Total = @($Items).Count; Done = 0; Failed = 0
+        Id = $script:OpId; Kind = $Kind; Name = $Name; Pool = $Pool; Items = New-Object System.Collections.ArrayList; Total = @($Items).Count; Done = 0; Failed = 0
         Cancelled = $false; CancelAt = $null; CancelReason = ''; Started = Get-Date; TimeoutSec = $TimeoutSec; TotalTimeoutSec = $TotalTimeoutSec
         OnResult = $OnResult; OnComplete = $OnComplete; State = $State
         Sync = [hashtable]::Synchronized(@{ Started = [hashtable]::Synchronized(@{}) })
@@ -8263,13 +8270,18 @@ function Stop-Operation($Op, [string]$Reason = 'Przerwano') {
     Write-Log "$($Op.Name) – przerywanie: $Reason" 'WARN' $Op.Name
     Update-StatusBar
 }
-function Stop-AllOperations([string]$Reason = 'Przerwano') { foreach ($op in @($script:Ops)) { Stop-Operation $op $Reason } }
+function Stop-AllOperations([string]$Reason = 'Przerwano') {
+    # przerwanie anuluje też zaplanowaną ponowną próbę (Complete-Scan)
+    if ($script:PendingRetry) { Write-Log "Ponowna próba dla $(@($script:PendingRetry.Targets).Count) serwerów – anulowano: $Reason" 'WARN' 'Skan'; $script:PendingRetry = $null; Update-StatusBar }
+    foreach ($op in @($script:Ops)) { Stop-Operation $op $Reason }
+}
 
 function Get-ItemResult($Op, $Item) {
-    $r = $null
-    try { $out = $Item.PS.EndInvoke($Item.Handle); if ($out -and $out.Count) { $r = $out[0] } } catch { }
+    $r = $null; $endErr = ''
+    # wyjątek z EndInvoke (np. skrypt wątku się nie kompiluje) nie ginie – najgłębsza przyczyna trafia do opisu błędu
+    try { $out = $Item.PS.EndInvoke($Item.Handle); if ($out -and $out.Count) { $r = $out[0] } } catch { $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }; $endErr = "$($ex.Message)" }
     if (-not $r) {
-        $msg = if ($Item.TimedOut) { "Przekroczono limit czasu jednego serwera ($($Op.TimeoutSec) s)" } elseif ($Op.Cancelled) { $Op.CancelReason }
+        $msg = if ($Item.TimedOut) { "Przekroczono limit czasu jednego serwera ($($Op.TimeoutSec) s)" } elseif ($Op.Cancelled) { $Op.CancelReason } elseif ($endErr) { $endErr }
                elseif ($Item.PS.Streams.Error.Count) { "$($Item.PS.Streams.Error[0].Exception.Message)" } else { 'Zadanie nie zwróciło wyniku.' }
         $id = if ($Item.TimedOut) { 'SrTimeout' } elseif ($Op.Cancelled) { 'SrCancelled' } else { 'SrNoResult' }
         $st = $Op.Sync.Started[$Item.Target]
@@ -8295,7 +8307,9 @@ function Update-Operations {
     $script:InTick = $true
     $budget = [Diagnostics.Stopwatch]::StartNew()
     try {
-        foreach ($a in @($script:Abandoned)) { if ($a.Handle.IsCompleted) { try { [void]$a.PS.EndInvoke($a.Handle) } catch { }; try { $a.PS.Dispose() } catch { }; $script:Abandoned.Remove($a) } }
+        foreach ($a in @($script:Abandoned)) { if ($a.Handle.IsCompleted) { try { [void]$a.PS.EndInvoke($a.Handle) } catch { }; try { $a.PS.Dispose() } catch { }; $script:Abandoned.Remove($a); if ($script:Pools[$a.Pool]) { [void](Get-EnginePool $a.Pool) } } }
+        $pr = $script:PendingRetry
+        if ($pr -and (Get-Date) -ge $pr.Due -and -not (Get-Operation 'Scan')) { $script:PendingRetry = $null; Start-Scan @($pr.Targets) $pr.State }   # trwający skan – ponowna próba po nim
         foreach ($op in @($script:Ops)) {
             if (-not $op.Cancelled -and $op.TotalTimeoutSec -gt 0 -and ((Get-Date) - $op.Started).TotalSeconds -gt $op.TotalTimeoutSec) { Stop-Operation $op "Przekroczono limit czasu całego skanu ($($op.TotalTimeoutSec) s)" }
             $abandon = $op.Cancelled -and $op.CancelAt -and ((Get-Date) - $op.CancelAt).TotalSeconds -ge $script:AbandonAfterSec
@@ -8304,8 +8318,9 @@ function Update-Operations {
                 if ($budget.ElapsedMilliseconds -gt 300) { break }   # reszta wyników w kolejnym takcie – okno ma reagować
                 if ($it.Handle.IsCompleted) { Complete-OperationItem $op $it (Get-ItemResult $op $it); continue }
                 if ($abandon -or ($it.Stopping -and ((Get-Date) - $it.StopAt).TotalSeconds -ge $script:AbandonAfterSec)) {
-                    [void]$script:Abandoned.Add(@{ PS = $it.PS; Handle = $it.Handle })
                     $st = $op.Sync.Started[$it.Target]
+                    # zadanie, które ruszyło, dalej zajmuje miejsce w puli – limit puli rośnie o nie (Get-EnginePool), żeby kolejka nie stała
+                    [void]$script:Abandoned.Add(@{ PS = $it.PS; Handle = $it.Handle; Pool = $(if ($st) { $op.Pool } else { '' }) }); if ($st) { [void](Get-EnginePool $op.Pool) }
                     $r = [pscustomobject]@{ Mode = $op.Kind; Name = $it.Target; Ok = $false; Data = $null; Prev = $null; Last = $null
                                             Error = $(if ($it.TimedOut) { "Przekroczono limit czasu jednego serwera ($($op.TimeoutSec) s); zadanie nie odpowiedziało na przerwanie" } else { "$($op.CancelReason) (zadanie porzucone)" })
                                             ErrorId = $(if ($it.TimedOut) { 'SrTimeout' } else { 'SrCancelled' }); ErrorCode = ''; Diag = $null; SnapFile = ''; SnapError = ''; LatestFile = ''; PrevFile = ''; ScannedAt = ''; ReceivedUtc = $null
@@ -8334,11 +8349,11 @@ function Update-Operations {
     catch { Write-Log "Błąd silnika operacji: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program' }
     finally {
         $script:InTick = $false
-        if ($script:Ops.Count -eq 0 -and $script:EngineTimer -and -not $script:Abandoned.Count) { $script:EngineTimer.Stop() }
+        if ($script:Ops.Count -eq 0 -and $script:EngineTimer -and -not $script:Abandoned.Count -and -not $script:PendingRetry) { $script:EngineTimer.Stop() }
     }
     if (-not $script:Headless) {
         Update-StatusBar
-        if ($script:LastUiRefresh.ElapsedMilliseconds -ge 1500 -or $script:Ops.Count -eq 0) { Invoke-UiRefresh }
+        if ($script:LastUiRefresh.ElapsedMilliseconds -ge $script:UiRefreshMs -or $script:Ops.Count -eq 0) { Invoke-UiRefresh }
         # Okna z wynikami – dopiero po zwolnieniu taktu (okno modalne nie wstrzymuje odbioru wyników pozostałych serwerów)
         # DispatcherTimer wznawia się dopiero po powrocie z Tick – bez ponownego uzbrojenia okno modalne (i blokada PIN-em
         # czekająca na odblokowanie) zatrzymałoby odbiór wyników i limity czasu serwerów
@@ -8357,14 +8372,17 @@ function Request-UiRefresh([switch]$All, [switch]$List, [switch]$Detail) {
 }
 function Invoke-UiRefresh {
     # Odświeżenie widoków, które się zmieniły – tylko widocznych (pozostałe przy przełączeniu widoku)
+    # Następne w trakcie operacji najwcześniej po 3× czasie tego odświeżenia, liczonym od jego końca (Update-Operations): przy dużej
+    # flocie przebudowa tabel nie zajmuje całego wątku okna – kliknięcia i odbiór wyników mają czas między odświeżeniami
     if ($script:Headless -or -not $ui) { return }
-    $script:LastUiRefresh.Restart()
+    $refreshSw = [Diagnostics.Stopwatch]::StartNew()
     try {
         if ($script:UiDirty.List) { Refresh-ServerList; $script:UiDirty.List = $false }
         if ($script:UiDirty.Overview -and $ui.viewOverview.Visibility -eq 'Visible') { Update-Overview; $script:UiDirty.Overview = $false }
         if ($script:UiDirty.Vms -and $ui.viewVms.Visibility -eq 'Visible') { Update-VmView; $script:UiDirty.Vms = $false }
         if ($script:UiDirty.Detail -and $ui.viewServer.Visibility -eq 'Visible') { Show-ServerDetail $script:CurrentServer; $script:UiDirty.Detail = $false }
     } catch { Write-Log "Błąd odświeżania widoku: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program' }
+    finally { $script:UiRefreshMs = [Math]::Min(15000, [Math]::Max(1500, 3 * $refreshSw.ElapsedMilliseconds)); $script:LastUiRefresh.Restart() }
 }
 $script:IdleStatus = ''   # komunikat paska stanu przywracany, gdy nie ma już żadnej operacji (Update-StatusBar)
 function Update-StatusBar {
@@ -8373,8 +8391,8 @@ function Update-StatusBar {
     if (-not $ops.Count) {
         $ui.statusDot.Fill = Brush '#5EE3AE'
         $ui.prg.Visibility = 'Collapsed'
-        $ui.btnCancelOps.Visibility = 'Collapsed'
-        if ($script:IdleStatus) { $ui.txtStatus.Text = $script:IdleStatus }   # ostatni komunikat sprzed operacji albo podsumowanie skanu/wczytania
+        $ui.btnCancelOps.Visibility = if ($script:PendingRetry) { 'Visible' } else { 'Collapsed' }   # „Przerwij” anuluje zaplanowaną ponowną próbę
+        if ($script:IdleStatus) { $ui.txtStatus.Text = $script:IdleStatus + $(if ($script:PendingRetry) { "   •   start ponownej próby za $([int][Math]::Max(0, [Math]::Ceiling(($script:PendingRetry.Due - (Get-Date)).TotalSeconds))) s" }) }   # ostatni komunikat sprzed operacji albo podsumowanie skanu/wczytania
         Set-ScanUi $false
         return
     }
@@ -8384,7 +8402,7 @@ function Update-StatusBar {
         $el = [int]((Get-Date) - $op.Started).TotalSeconds
         $running = $op.Sync.Started.Count - $op.Done   # Count bez wyliczania kluczy – wątki tła dopisują je w tym czasie
         $t = '{0}: {1} z {2}' -f $op.Name, $op.Done, $op.Total
-        if ($op.Kind -eq 'Scan') { $t += ", w toku $([Math]::Max(0, $running))" }
+        if ($op.Kind -eq 'Scan') { $t += ", w toku $([Math]::Max(0, $running))"; $slow = Update-ScanItems $op; if ($slow) { $t += ", najdłużej: $slow" } }
         if ($op.Failed) { $t += ", bez danych: $($op.Failed)" }
         if ($op.Cancelled) { $t += ' – przerywanie…' }
         "$t, $el s"
@@ -8395,6 +8413,21 @@ function Update-StatusBar {
     $ui.prg.Value = if ($total) { [double]$done / $total * 100 } else { 0 }
     $ui.btnCancelOps.Visibility = 'Visible'
     Set-ScanUi ([bool](Get-Operation 'Scan'))
+}
+function Update-ScanItems($Op) {
+    # Pozycje listy serwerów w trakcie skanu: zadania, które już ruszyły, pokazują „skanowanie… N s” (czas z Sync.Started – odczyt
+    # indeksem, bez wyliczania kluczy dopisywanych przez wątki tła); zwraca najdłużej skanowany serwer (od 30 s) do paska stanu
+    $now = [DateTime]::UtcNow; $top = $null; $topSec = 29
+    foreach ($x in $Op.Items) {
+        if ($x.Finished) { continue }
+        $t0 = $Op.Sync.Started[$x.Target]
+        if (-not $t0) { continue }
+        $sec = [int]($now - $t0).TotalSeconds
+        $li = Get-ServerItem $x.Target
+        if ($li) { $li.Color = '#4C7DF0'; $li.Sub = "skanowanie… $sec s"; $script:UiDirty.List = $true }
+        if ($sec -gt $topSec) { $topSec = $sec; $top = $x.Target }
+    }
+    if ($top) { "$(Get-DisplayName $top) $topSec s" }
 }
 function Set-ScanUi([bool]$On) {
     if (-not $ui) { return }
@@ -8419,7 +8452,8 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
     $days = 0
     if ($RetryOf) { $days = $RetryOf.Days }
     elseif ($ui -and $ui.txtDays) {
-        if (-not [int]::TryParse($ui.txtDays.Text, [ref]$days) -or $days -lt 1 -or $days -gt 180) { $days = $Config.EventDays; $ui.txtDays.Text = "$days" }
+        # poza zakresem 1–180: powyżej 180 – 180, inaczej liczba dni z ustawień; z komunikatem, nie po cichu
+        if (-not [int]::TryParse($ui.txtDays.Text, [ref]$days) -or $days -lt 1 -or $days -gt 180) { $was = "$($ui.txtDays.Text)".Trim(); $days = $(if ($days -gt 180) { 180 } else { [int]$Config.EventDays }); $ui.txtDays.Text = "$days"; Show-Toast "Zakres zdarzeń musi wynosić od 1 do 180 dni (wpisano: $(if ($was) { $was } else { 'puste pole' })) – użyto $days." 'warn' 6 }
     } else { $days = $Config.EventDays }
     # Linux (rozpoznany na hoście Hyper-V) nie jest skanowany
     $linux = @($Targets | Where-Object { Test-LinuxGuest $_ })
@@ -8427,6 +8461,8 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
     if ($linux.Count) { Write-Log "Pominięto maszyny z Linuksem: $(Join-Short ($linux | ForEach-Object { Get-DisplayName $_ }) 10)" 'INFO' 'Skan' }
     $Targets = @($Targets | Where-Object { $linux -notcontains $_ })
     if (-not $Targets.Count) { Request-UiRefresh -List; return }
+    # nowy skan zastępuje zaplanowaną ponowną próbę dla serwerów, które obejmuje (pozostałe – po nim, Update-Operations)
+    if (-not $RetryOf -and $script:PendingRetry) { $script:PendingRetry.Targets = @($script:PendingRetry.Targets | Where-Object { $Targets -notcontains $_ }); if (-not $script:PendingRetry.Targets.Count) { $script:PendingRetry = $null } }
 
     # folder skanu: znacznik czasu (kolejność migawek = kolejność nazw); dwa skany w tej samej sekundzie dostają przyrostek _2, _3…
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -8446,10 +8482,14 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
             Preflight = [bool]$Config.Preflight
         } }
         $it = Get-ServerItem $t
-        if ($it) { $it.Color = '#4C7DF0'; $it.Sub = $(if ($RetryOf) { 'ponowna próba…' } else { 'w kolejce do skanu…' }) }
+        if ($it) { $it.Color = '#56688F'; $it.Sub = $(if ($RetryOf) { 'ponowna próba…' } else { 'w kolejce do skanu…' }) }   # szaroniebieski – w kolejce; niebieski – w toku (Update-ScanItems)
     }
-    $state = @{ SnapDir = $snapDir; Ok = 0; Offline = 0; Timeout = 0; Cancelled = 0; AuthFails = 0; Days = $days; Targets = $Targets; RetryOf = $RetryOf }
+    $state = @{ SnapDir = $snapDir; Ok = 0; Offline = 0; Timeout = 0; Cancelled = 0; Errors = 0; AuthFails = 0; FailAt = @{}; Days = $days; Targets = $Targets; RetryOf = $RetryOf }
     $who = if ($script:Cred) { $script:Cred.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
+    # Ochrona konta: hasło niesprawdzone w domenie (Test-Credential bez dostępu do kontrolera) – najpierw 2 serwery naraz, a nie ThrottleLimit
+    # nieudanych logowań jednocześnie; pełna równoległość po pierwszym serwerze, który przyjmie poświadczenia (Complete-CredProbe)
+    $script:CredProbe = [bool]($script:Cred -and $script:CredVerified -ne $true)
+    if ($script:CredProbe) { Write-Log "Hasło konta $who nie zostało sprawdzone w domenie – skan zaczyna od 2 serwerów naraz, aż któryś przyjmie poświadczenia (ochrona przed zablokowaniem konta)" 'INFO' 'Skan' }
     if ($RetryOf) { Write-Log ("Ponowna próba dla {0} serwerów z błędem, który może być chwilowy: {1}" -f $Targets.Count, (Join-Short ($Targets | ForEach-Object { Get-DisplayName $_ }) 10)) 'INFO' 'Skan' }
     else { Write-Log ("Skan – start: {0} serwerów (równolegle {1}, limit {2} s na serwer, zdarzenia z {3} dni{4}), konto {5}" -f $Targets.Count, $Config.ThrottleLimit, $Config.ServerTimeoutSec, $days, $(if ($skipList.Count) { ", pominięte sekcje: $($skipList.Count)" } else { '' }), $who) 'INFO' 'Skan' }
     [void](Start-Operation -Kind 'Scan' -Name $(if ($RetryOf) { 'Ponowna próba' } else { 'Skan' }) -Items @($items) -Pool 'Remote' -TimeoutSec ([int]$Config.ServerTimeoutSec) -TotalTimeoutSec ([int]$Config.ScanTimeoutSec) -State $state `
@@ -8457,6 +8497,13 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
     Request-UiRefresh -List
 }
 function Get-NowText { Get-Date -Format 'yyyy-MM-dd HH:mm' }
+function Complete-CredProbe {
+    # serwer przyjął poświadczenia niesprawdzone wcześniej w domenie (Start-Scan) – dalej pełna równoległość skanu
+    if (-not $script:CredProbe) { return }
+    $script:CredProbe = $false; $script:CredVerified = $true
+    [void](Get-EnginePool 'Remote')
+    Write-Log "Serwer przyjął poświadczenia konta $($script:Cred.UserName) – skan dalej z pełną równoległością ($($Config.ThrottleLimit))" 'INFO' 'Skan'
+}
 function Receive-ScanResult($Op, $R) {
     $name = $R.Name
     $st = $Op.State
@@ -8477,12 +8524,21 @@ function Receive-ScanResult($Op, $R) {
         if (@($d.PSObject.Properties['Truncated'].Value).Count) { Write-Log "[$(Get-DisplayName $name)] Osiągnięto limit pobieranych zdarzeń: $(@($d.Truncated) -join '; ') – zwiększ limit w Ustawieniach" 'WARN' 'Skan' }
         Add-AvailabilityRecord $name 'OK' $d.DurationSec $dd._Crit $dd._Warn '' ''
         $st.AuthFails = 0
+        Complete-CredProbe
     }
     elseif ($R.ErrorId -eq 'SrCancelled') {
         # Przerwany skan nie zmienia danych serwera (to nie jest niedostępność)
         $st.Cancelled++
         Update-ServerItem $name
         if (-not $prevData) { $it = Get-ServerItem $name; if ($it) { $it.Color = '#4A5263'; $it.Sub = 'skan przerwany' } }
+    }
+    elseif ($R.ErrorId -eq 'SrNoResult' -or (-not "$($R.ErrorId)" -and -not $R.Diag)) {
+        # Błąd programu w wątku tła (zadanie bez wyniku albo wyjątek poza obsługą błędów połączenia) – to nie jest niedostępność serwera:
+        # dane, dziennik dostępności i ponowna próba bez zmian, przyczyna w dzienniku
+        $st.Errors++
+        Write-Log "[$(Get-DisplayName $name)] Błąd programu podczas skanu (to nie jest brak połączenia): $($R.Error)" 'ERROR' 'Program'
+        Update-ServerItem $name
+        if (-not $prevData) { $it = Get-ServerItem $name; if ($it) { $it.Color = '#4A5263'; $it.Sub = 'błąd programu – szczegóły w dzienniku' } }
     }
     elseif ($R.ErrorId -eq 'SrTimeout') {
         $st.Timeout++
@@ -8506,6 +8562,7 @@ function Receive-ScanResult($Op, $R) {
     }
     else {
         $st.Offline++
+        $st.FailAt[$name] = Get-Date   # chwila porażki – ponowna próba najwcześniej RetryDelaySec później (Complete-Scan)
         $last = $R.Last
         if (-not $last -and $prevData -and $prevData.PSObject.Properties['_Last']) { $last = $prevData._Last }
         $d = [pscustomobject]@{ Offline = $true; Error = $R.Error; ErrorId = $R.ErrorId; ErrorCode = $R.ErrorCode; Diag = $R.Diag; _Last = $last; ScannedAt = (Get-NowText); _File = "$($R.SnapFile)"; DurationSec = $R.DurationSec }
@@ -8516,6 +8573,7 @@ function Receive-ScanResult($Op, $R) {
         $cause = if ($R.Diag) { "$($R.Diag.Cause)" } else { Get-ShortText $R.Error 200 }
         Write-Log ("[{0}] Brak połączenia – {1}{2}{3}" -f (Get-DisplayName $name), $cause, $(if ($R.Diag -and $R.Diag.Ports) { " (porty: $($R.Diag.Ports))" }), $(if ($R.Diag -and $R.Diag.Notes) { "; $($R.Diag.Notes)" })) $(if ($cls -eq 'Remote') { 'WARN' } else { 'ERROR' }) 'Skan'
         if (-not $st.RetryOf) { Add-AvailabilityRecord $name $(if ($cls -eq 'Remote') { 'Błąd zbierania danych' } else { 'Brak połączenia' }) $R.DurationSec 0 0 $cls $cause }
+        if ($cls -eq 'Remote') { Complete-CredProbe }   # serwer odpowiedział po zalogowaniu (brak danych to nie odmowa poświadczeń)
         # Ochrona konta: kilka odmów logowania z rzędu bez żadnego sukcesu = złe hasło – przerwij, zanim konto zostanie zablokowane w domenie
         if ($cls -eq 'Auth' -and $script:Cred) {
             $st.AuthFails++
@@ -8542,6 +8600,12 @@ function Test-TransientFailure($D) {
     $cls = if ($D.PSObject.Properties['Diag'] -and $D.Diag) { "$($D.Diag.Class)" } else { '' }
     $cls -in '', 'Offline', 'WinRM', 'Network', 'Unknown', 'Limit'
 }
+function Test-FailingBefore([string]$Name, [datetime]$Since) {
+    # serwer bez połączenia już przed podaną chwilą (statystyka dostępności: FailSince, z dokładnością do minuty) – np. wyłączony od tygodni
+    $av = if ($script:AvailStats) { $script:AvailStats[$Name.ToLowerInvariant()] } else { $null }
+    [bool]($av -and $av.FailSince -and [string]::CompareOrdinal("$($av.FailSince)", $Since.ToString('yyyy-MM-dd HH:mm')) -lt 0)
+}
+$script:RetryDelaySec = 60   # ponowna próba najwcześniej tyle sekund po porażce serwera (restart, opóźniony start WinRM)
 function Complete-Scan($Op) {
     $st = $Op.State
     $el = [int]((Get-Date) - $Op.Started).TotalSeconds
@@ -8552,33 +8616,40 @@ function Complete-Scan($Op) {
     Update-OfflineAnalysis
     Update-StationClock
     foreach ($t in @($st.Targets)) { Update-ServerItem $t }
-    $retry = @()
+    $retry = @(); $wait = 0
     if ($st.RetryOf) {
         # wynik ponownej próby: serwery, które teraz odpowiedziały, przechodzą do udanych w liczniku skanu głównego
         $p = $st.RetryOf
-        $p.Ok += $st.Ok; $p.Timeout += $st.Timeout; $p.Offline = [Math]::Max(0, $p.Offline - $st.Ok - $st.Timeout)
+        $p.Ok += $st.Ok; $p.Timeout += $st.Timeout; $p.Errors += $st.Errors; $p.Offline = [Math]::Max(0, $p.Offline - $st.Ok - $st.Timeout - $st.Errors)
         $script:LastScanState = $p
-        $msg = "Ponowna próba zakończona w $el s: odpowiedziało $($st.Ok) z $($st.Targets.Count)$(if ($st.Offline) { ", nadal bez połączenia $($st.Offline)" })"
+        $msg = "Ponowna próba zakończona w $el s: odpowiedziało $($st.Ok) z $($st.Targets.Count)$(if ($st.Offline) { ", nadal bez połączenia $($st.Offline)" })$(if ($st.Errors) { ", błąd programu $($st.Errors)" })"
     } else {
         $script:LastScanState = $st
         if (-not $Op.Cancelled) { Update-StationNetwork $st }
-        if ($Config.RetryFailed -and -not $Op.Cancelled -and -not $script:StationNetIssue) { $retry = @($st.Targets | Where-Object { $script:FreshScan.Contains($_) -and (Test-TransientFailure $script:Data[$_]) }) }
-        $msg = "Skan zakończony w $el s: $($st.Ok) OK, bez połączenia $($st.Offline)$(if ($st.Timeout) { ", limit czasu $($st.Timeout)" })$(if ($st.Cancelled) { ", przerwane $($st.Cancelled)" })$(if ($retry.Count) { "; ponowna próba: $($retry.Count)" })"
+        # błąd chwilowy, ale nie serwery bez połączenia już przed tym skanem (wyłączone od dawna – druga runda testu portu i diagnozy nic nie da)
+        if ($Config.RetryFailed -and -not $Op.Cancelled -and -not $script:StationNetIssue) { $retry = @($st.Targets | Where-Object { $script:FreshScan.Contains($_) -and (Test-TransientFailure $script:Data[$_]) -and -not (Test-FailingBefore $_ $Op.Started) }) }
+        if ($retry.Count) {
+            # start najwcześniej RetryDelaySec po porażce serwera (restartujący się serwer nie dostaje ponowienia po kilku sekundach) – w takcie silnika
+            $due = Get-Date
+            foreach ($t in $retry) { $f = $st.FailAt[$t]; if ($f -and $f.AddSeconds($script:RetryDelaySec) -gt $due) { $due = $f.AddSeconds($script:RetryDelaySec) } }
+            $script:PendingRetry = @{ Targets = $retry; State = $st; Due = $due }
+            $wait = [int][Math]::Ceiling(($due - (Get-Date)).TotalSeconds)
+        }
+        $msg = "Skan zakończony w $el s: $($st.Ok) OK, bez połączenia $($st.Offline)$(if ($st.Timeout) { ", limit czasu $($st.Timeout)" })$(if ($st.Cancelled) { ", przerwane $($st.Cancelled)" })$(if ($st.Errors) { ", błąd programu $($st.Errors)" })$(if ($retry.Count) { "; ponowna próba: $($retry.Count)" })"
     }
-    Write-Log $msg $(if ($st.Offline -or $st.Timeout -or $Op.Cancelled) { 'WARN' } else { 'OK' }) 'Skan'
+    Write-Log "$msg$(if ($wait -gt 0) { " (za $wait s)" })" $(if ($st.Offline -or $st.Timeout -or $st.Errors -or $Op.Cancelled) { 'WARN' } else { 'OK' }) 'Skan'
     if (-not $script:Headless) {
         $ui.txtStatus.Text = $msg; $script:IdleStatus = $msg
         $ui.txtLastScan.Text = "Ostatni skan: $(Get-NowText)"
-        Show-Toast $msg $(if ($Op.Cancelled) { 'warn' } elseif ($st.Offline) { 'warn' } else { 'ok' }) 6
+        Show-Toast $msg $(if ($Op.Cancelled) { 'warn' } elseif ($st.Offline -or $st.Errors) { 'warn' } else { 'ok' }) 6
         Request-UiRefresh -All
     }
-    if ($retry.Count) { Start-Scan $retry $st }
     Start-CveUpdate -Auto   # nowy system w flocie albo stare dane CVE
     Invoke-PendingReanalysis
 }
 function Invoke-PendingReanalysis {
-    # ustawienia zmienione w trakcie skanu/wczytywania – ponowna analiza po zakończeniu operacji
-    if ($script:ReanalyzePending -and -not (Get-Operation 'Scan') -and -not (Get-Operation 'Load')) { $script:ReanalyzePending = $false; Start-SnapshotLoad -Reanalyze }
+    # ustawienia zmienione w trakcie skanu/wczytywania – ponowna analiza po zakończeniu operacji (także po zaplanowanej ponownej próbie)
+    if ($script:ReanalyzePending -and -not (Get-Operation 'Scan') -and -not (Get-Operation 'Load') -and -not $script:PendingRetry) { $script:ReanalyzePending = $false; Start-SnapshotLoad -Reanalyze }
     elseif ($script:ReloadNames.Count) { Start-SnapshotLoad -Added }   # serwery dodane ponownie w trakcie wczytywania
 }
 $script:ReanalyzePending = $false
@@ -8605,22 +8676,32 @@ function Start-SnapshotLoad([switch]$Reanalyze, [switch]$Added) {
     if (-not $items.Count) { return }
     if ($Reanalyze) { $script:FreshScan.Clear() }
     if (-not $script:Headless) { $ui.txtStatus.Text = "Wczytywanie wyników z dysku: 0 z $($items.Count)…" }
-    [void](Start-Operation -Kind 'Load' -Name $(if ($Reanalyze) { 'Ponowna analiza' } elseif ($Added) { 'Wczytywanie wyników dodanych serwerów' } else { 'Wczytywanie wyników' }) -Items $items -Pool 'Local' -State @{ Last = $null; Bad = 0; Reanalyze = [bool]$Reanalyze; Added = [bool]$Added } `
+    [void](Start-Operation -Kind 'Load' -Name $(if ($Reanalyze) { 'Ponowna analiza' } elseif ($Added) { 'Wczytywanie wyników dodanych serwerów' } else { 'Wczytywanie wyników' }) -Items $items -Pool 'Local' -State @{ Last = $null; Bad = 0; Cancelled = 0; Reanalyze = [bool]$Reanalyze; Added = [bool]$Added } `
         -OnResult { param($op, $r) Receive-LoadResult $op $r } -OnComplete { param($op) Complete-Load $op })
 }
 function Receive-LoadResult($Op, $R) {
     $name = $R.Name
+    if ($R.ErrorId -eq 'SrCancelled') { $Op.State.Cancelled++; return }   # przerwane wczytywanie to nie nieczytelna migawka (Complete-Load)
     if ($R.Error) { Write-Log "[$(Get-DisplayName $name)] $($R.Error)" 'WARN' 'Migawki' }
     if (-not $R.Ok -or -not $R.Data) { $Op.State.Bad++; return }
     if ($script:FreshScan.Contains($name)) { return }   # w tej sesji jest już nowszy wynik skanu
     if (-not (Get-ServerItem $name)) { return }   # usunięty z listy w trakcie wczytywania – bez osieroconych danych (kafelki Hyper-V, raport)
-    $d = $R.Data
-    $d | Add-Member -NotePropertyName ScannedAt -NotePropertyValue $R.ScannedAt -Force
-    $d | Add-Member -NotePropertyName _File -NotePropertyValue "$($R.LatestFile)" -Force
-    $d | Add-Member -NotePropertyName _PrevFile -NotePropertyValue "$($R.PrevFile)" -Force
-    if ($d.Offline) { $d | Add-Member -NotePropertyName _Last -NotePropertyValue $R.Last -Force }
-    Register-ServerData $name $d $R.Prev
-    if (-not $Op.State.Last -or [string]::CompareOrdinal($R.ScannedAt, $Op.State.Last) -gt 0) { $Op.State.Last = $R.ScannedAt }
+    $old = $script:Data[$name]
+    if ($Op.State.Reanalyze -and $old -and -not ($old.PSObject.Properties['_File'] -and $old._File)) {
+        # ponowna analiza: dane tylko z tej sesji, bez pliku (limit czasu bez wcześniejszych danych, Linux, nieudany zapis migawki) –
+        # zostają (starsza migawka z dysku udawałaby aktualny wynik), analizowane od nowa z nowymi progami
+        Register-ServerData $name $old $null
+    } else {
+        $d = $R.Data
+        $d | Add-Member -NotePropertyName ScannedAt -NotePropertyValue $R.ScannedAt -Force
+        $d | Add-Member -NotePropertyName _File -NotePropertyValue "$($R.LatestFile)" -Force
+        $d | Add-Member -NotePropertyName _PrevFile -NotePropertyValue "$($R.PrevFile)" -Force
+        if ($d.Offline) { $d | Add-Member -NotePropertyName _Last -NotePropertyValue $R.Last -Force }
+        # ponowna analiza tej samej migawki: stan z tej sesji, którego nie ma w pliku (ostrzeżenie o limicie czasu, ręczna diagnoza)
+        if ($Op.State.Reanalyze -and $old -and "$($old._File)" -eq "$($R.LatestFile)") { foreach ($k in @('_ScanNote', '_ManualDiag') + @(if ($d.Offline) { 'Diag' })) { if ($old.PSObject.Properties[$k]) { $d | Add-Member -NotePropertyName $k -NotePropertyValue $old.$k -Force } } }
+        Register-ServerData $name $d $R.Prev
+        if (-not $Op.State.Last -or [string]::CompareOrdinal($R.ScannedAt, $Op.State.Last) -gt 0) { $Op.State.Last = $R.ScannedAt }
+    }
     $script:UiDirty.List = $true; $script:UiDirty.Overview = $true; $script:UiDirty.Vms = $true
     if ($name -eq $script:CurrentServer) { $script:UiDirty.Detail = $true }
 }
@@ -8630,12 +8711,14 @@ function Complete-Load($Op) {
     Update-StationClock
     $el = [math]::Round(((Get-Date) - $Op.Started).TotalSeconds, 1)
     $off = @($script:Data.Values | Where-Object { $_ -and $_.Offline }).Count
-    Write-Log ("{0}: {1} serwerów w {2} s{3}{4}" -f $Op.Name, ($Op.Done - $Op.State.Bad), $el, $(if ($off) { ", bez połączenia przy ostatniej próbie: $off" }), $(if ($Op.State.Bad) { ", nieczytelne: $($Op.State.Bad)" })) 'INFO' 'Migawki'
+    $n = $Op.Done - $Op.State.Bad - $Op.State.Cancelled
+    Write-Log ("{0}: {1} serwerów w {2} s{3}{4}{5}" -f $Op.Name, $n, $el, $(if ($off) { ", bez połączenia przy ostatniej próbie: $off" }), $(if ($Op.State.Bad) { ", nieczytelne: $($Op.State.Bad)" }), $(if ($Op.Cancelled) { " – przerwano ($($Op.CancelReason)), nie wczytano: $($Op.State.Cancelled)" })) $(if ($Op.Cancelled) { 'WARN' } else { 'INFO' }) 'Migawki'
     if (-not $script:Headless) {
         if ($Op.State.Last -and -not $Op.State.Added) { $ui.txtLastScan.Text = "Wyniki z ostatniego skanu: $($Op.State.Last)" }
-        $ui.txtStatus.Text = "Wczytano wyniki $($Op.Done - $Op.State.Bad) serwerów"; $script:IdleStatus = $ui.txtStatus.Text
+        $ui.txtStatus.Text = if ($Op.Cancelled) { "$($Op.Name) – przerwano: wczytano wyniki $n z $($Op.Total) serwerów" } else { "Wczytano wyniki $n serwerów" }; $script:IdleStatus = $ui.txtStatus.Text
         Request-UiRefresh -All
     }
+    if ($Op.Cancelled) { return }   # przerwane (przycisk Przerwij, zamykanie) – bez automatycznego pobierania CVE i ponownej analizy
     Start-CveUpdate -Auto   # dane CVE dla systemów z floty (pierwsze pobranie albo odświeżenie)
     Invoke-PendingReanalysis
 }
@@ -8649,12 +8732,16 @@ function Start-Diagnostics([string[]]$Targets) {
         @{ Target = $t; Opt = @{ ErrorText = $(if ($d -and $d.Offline) { "$($d.Error)" } else { '' }); ErrorId = $(if ($d -and $d.Offline) { "$($d.ErrorId)" } else { '' }); ErrorCode = ''; DiagPorts = [int[]]@($Config.DiagPorts); DiagTimeoutMs = [int]$Config.DiagTimeoutMs } }
     }
     Write-Log "Diagnostyka połączenia: $(Join-Short ($Targets | ForEach-Object { Get-DisplayName $_ }) 8)" 'INFO' 'Diagnoza'
-    [void](Start-Operation -Kind 'Diag' -Name 'Diagnoza' -Items @($items) -Pool 'Remote' -TimeoutSec 120 -State @{ Single = ($Targets.Count -eq 1) } `
+    [void](Start-Operation -Kind 'Diag' -Name 'Diagnoza' -Items @($items) -Pool 'Aux' -TimeoutSec 120 -State @{ Single = ($Targets.Count -eq 1) } `
         -OnResult { param($op, $r) Receive-DiagResult $op $r } -OnComplete { param($op) Request-UiRefresh -All })
 }
 function Receive-DiagResult($Op, $R) {
     $name = $R.Name
-    if (-not $R.Ok -or -not $R.Diag) { Write-Log "[$(Get-DisplayName $name)] Diagnoza nie powiodła się: $($R.Error)" 'ERROR' 'Diagnoza'; return }
+    if (-not $R.Ok -or -not $R.Diag) {
+        Write-Log "[$(Get-DisplayName $name)] Diagnoza nie powiodła się: $($R.Error)" 'ERROR' 'Diagnoza'
+        if ($Op.State.Single -and $R.ErrorId -ne 'SrCancelled') { Show-Toast "Diagnoza $(Get-DisplayName $name) nie powiodła się: $(Get-ShortText $R.Error 120)" 'warn' 6 }   # nie tylko wpis w dzienniku
+        return
+    }
     $dg = $R.Diag
     $d = $script:Data[$name]
     if ($d) {
@@ -9007,7 +9094,7 @@ function Show-SettingsDialog {
     if ($script:SetDlg -and $script:SetDlg.Saved) {
         $ui.txtDays.Text = "$($Config.EventDays)"
         Update-SettingsButton
-        foreach ($k in 'Remote', 'Local') { if ($script:Pools[$k]) { [void](Get-EnginePool $k) } }   # nowy limit równoległości
+        foreach ($k in @($script:Pools.Keys)) { if ($script:Pools[$k]) { [void](Get-EnginePool $k) } }   # nowy limit równoległości
         if ($script:SetDlg.Changed) {
             # nowe progi i reguły: ponowna analiza zapisanych wyników (w tle, z migawek) – po trwającym skanie, jeśli trwa
             if ((Get-Operation 'Scan') -or (Get-Operation 'Load')) {
@@ -9110,7 +9197,7 @@ function Enter-InstanceMutex([string]$Kind) {
     $m.Dispose()
     $null
 }
-function Wait-Operations { while ($script:Ops.Count -or $script:Abandoned.Count) { Update-Operations; if (-not $script:Ops.Count) { break }; Start-Sleep -Milliseconds 300 } }
+function Wait-Operations { while ($script:Ops.Count -or $script:Abandoned.Count -or $script:PendingRetry) { Update-Operations; if (-not $script:Ops.Count -and -not $script:PendingRetry) { break }; Start-Sleep -Milliseconds 300 } }
 # ── Powiadomienia po skanie bez okna: e-mail (SMTP) i webhook ──
 # Stan ostatniego powiadomienia (klucze problemów) w Cache\notify_state.json – „nowe” = nieobecne w poprzednim powiadomieniu
 function Get-NotifyFile { Join-Path $Config.CacheDir 'notify_state.json' }
@@ -9210,7 +9297,7 @@ function Invoke-HeadlessScan {
         if (-not $NoReport) { try { $rep = "$(@(Export-HtmlReport -Mode $ReportMode -NoOpen)[-1])" } catch { Write-Log "Nie utworzono raportu: $($_.Exception.Message)" 'ERROR' 'Raport' } }
         try { Send-ScanNotification $rep } catch { Write-Log "Błąd powiadomień: $($_.Exception.Message)" 'ERROR' 'Powiadomienia' }
         Remove-OldLogs
-        if ($st.Offline -or $st.Timeout -or $st.Cancelled) { return 1 }   # Cancelled: limit czasu całego skanu
+        if ($st.Offline -or $st.Timeout -or $st.Cancelled -or $st.Errors) { return 1 }   # Cancelled: limit czasu całego skanu; Errors: błąd programu w wątku skanu
         return 0
     } catch { Write-Log "Błąd skanu bez okna: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program'; return 2 }
     finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
@@ -9276,6 +9363,7 @@ function Set-OtherCredential {
     $ok = Test-Credential $c
     if ($ok -eq $false) { Write-Log "Odrzucono poświadczenia $($c.UserName) – błędne hasło lub konto zablokowane." 'ERROR' 'Konto'; Show-Message "Domena odrzuciła poświadczenia konta $($c.UserName) (błędne hasło, konto zablokowane lub wyłączone). Konto nie zostało zmienione." 'Konto' 'crit'; return }
     $script:Cred = $c
+    $script:CredVerified = ($ok -eq $true)   # niesprawdzone w domenie: skan zaczyna od 2 serwerów naraz (Start-Scan, ochrona przed blokadą konta)
     Write-Log "Konto do połączeń: $($c.UserName)$(if ($null -eq $ok) { ' (nie sprawdzono w domenie)' } else { ' (sprawdzone w domenie)' })" 'INFO' 'Konto'
     Update-CredLabel
     Show-Toast "Konto: $($c.UserName)" 'ok'
@@ -9736,7 +9824,7 @@ finally {
     $deadline = (Get-Date).AddSeconds(5)
     foreach ($op in @($script:Ops)) { foreach ($it in $op.Items) { if (-not $it.Finished) { try { [void]$it.PS.BeginStop($null, $null) } catch { } } } }
     foreach ($op in @($script:Ops)) { foreach ($it in $op.Items) { $left = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds); try { [void]$it.Handle.AsyncWaitHandle.WaitOne($left) } catch { } } }
-    foreach ($k in 'Remote', 'Local') { $p = $script:Pools[$k]; if ($p) { try { $p.BeginClose($null, $null) | Out-Null } catch { } } }
+    foreach ($k in @($script:Pools.Keys)) { $p = $script:Pools[$k]; if ($p) { try { $p.BeginClose($null, $null) | Out-Null } catch { } } }
     if ($script:InstanceMutex) { try { $script:InstanceMutex.ReleaseMutex() } catch { }; $script:InstanceMutex.Dispose() }
 }
 #endregion
