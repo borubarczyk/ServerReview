@@ -320,6 +320,17 @@ $Collector = {
         $hvts = ($vts -and "$($vts.Status)" -eq 'Running' -and (-not $vtp -or $vtp.Enabled -ne 0))
     } catch {}
     $sys.HvTimeSync = [bool]$hvts
+    # Ostrzeżenia usługi czasu: 36 (brak synchronizacji od doby), 47 (brak odpowiedzi ręcznie podanego serwera NTP), 129 i 134 (nie można
+    # ustalić źródła domenowego / ręcznego). PDC bez działającego NTP chodzi na własnym zegarze, a z nim cała domena (i stacja) – porównanie
+    # zegarów ze stacją tego nie pokaże. Bez nawiasów klamrowych: Get-SnapshotSummary wycina System prostym wyrażeniem.
+    $sys.TimeSyncWarn = 0; $sys.TimeSyncNoSync = 0; $sys.TimeSyncLast = ''
+    try {
+        $tsw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Time-Service'; Id = 36, 47, 129, 134; StartTime = $since } -MaxEvents 200 -ErrorAction SilentlyContinue)
+        $sys.TimeSyncWarn = $tsw.Count; $sys.TimeSyncNoSync = @($tsw | Where-Object { $_.Id -eq 36 }).Count
+        if ($tsw.Count) { $sys.TimeSyncLast = "$(D $tsw[0].TimeCreated), zdarzenie $($tsw[0].Id): $(Short $tsw[0].Message 200)" -replace '[{}]', '' }
+    } catch {}
+    # Kontroler domeny głównej lasu: tylko PDC tej domeny potrzebuje zewnętrznego źródła NTP (PDC domen podrzędnych biorą czas z hierarchii domen)
+    if ($sys.IsDC) { try { $rdse = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList 'LDAP://RootDSE'; $sys.ForestRoot = ("$($rdse.InvokeGet('rootDomainNamingContext'))" -eq "$($rdse.InvokeGet('defaultNamingContext'))"); $rdse.Dispose() } catch {} }
 
     $pr = @()
     try {
@@ -1435,6 +1446,8 @@ $Collector = {
                     & $ck "SYSVOL (DFSR) – $($f.ReplicatedFolderName)" "$($stMap[$st]) ($st)" $(if ($st -eq 4) { 'OK' } elseif ($st -eq 5) { 'Krytyczne' } else { 'Uwaga' })
                 }
             } else { & $ck 'SYSVOL' 'brak replikacji DFSR – prawdopodobnie przestarzała FRS (migracja: dfsrmig)' 'Uwaga' }
+            # SysvolReady = 0: kontroler nie udostępnia SYSVOL i NETLOGON (np. nieukończona synchronizacja początkowa DFSR, nieudane odtwarzanie)
+            if ("$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' 'SysvolReady')" -eq '0') { & $ck 'SYSVOL – udostępnianie (SysvolReady)' '0 – kontroler nie udostępnia SYSVOL ani NETLOGON; klienci uwierzytelnieni przez ten DC nie pobiorą zasad grupy ani skryptów logowania' 'Krytyczne' }
 
             Import-Module ActiveDirectory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             if (Get-Command Get-ADReplicationPartnerMetadata -ErrorAction SilentlyContinue) {
@@ -1557,14 +1570,24 @@ $Collector = {
                     $m    = AdFind "(&$usr$(InChain $gdn)$en)"
                     $off  = AdFind "(&$usr$(InChain $gdn)$(Uac 2))"
                     $idle = AdFind "(&$usr$(InChain $gdn)$en(!(objectSid=$domSid-500))(|(lastLogonTimestamp<=$cut90)(&(!(lastLogonTimestamp=*))(whenCreated<=$created90))))"
+                    # konta komputerów, gMSA/MSA i obce podmioty (konta z domen zaufanych, SID jako nazwa) – zapytania o osoby ich nie obejmują
+                    $npm  = @((AdFind "(&(|(objectClass=user)(objectClass=foreignSecurityPrincipal))(!(objectCategory=person))$(InChain $gdn))") | ForEach-Object { if ("$($_.Name)" -match '^S-1-\d') { [pscustomobject]@{ Name = (AccOf $_.Name); DN = $_.DN } } else { $_ } })
                     $txt = "$($m.Count) aktywnych kont$(if ($m.Count) { ": $(Names $m 10)" })$(if ($off.Count) { "; wyłączone: $($off.Count)" })$(if ($idle.Count) { "; nieużywane od 90 dni: $(Names $idle 5)" })"
-                    $st = if (($g.Big -and $m.Count -gt $g.Big) -or $idle.Count) { 'Uwaga' } elseif ($g.Empty -and $m.Count) { 'Zalecenie' } else { 'Info' }
-                    if ($g.Empty -and $m.Count) { $txt += ' – grupa powinna być pusta (uprawnienia bliskie administratorowi domeny)' }
+                    if ($npm.Count) { $txt += "; konta komputerów, usług (gMSA/MSA) i z innych domen: $(Names $npm 5)" }
+                    $st = if (($g.Big -and $m.Count -gt $g.Big) -or $idle.Count -or $npm.Count) { 'Uwaga' } elseif ($g.Empty -and $m.Count) { 'Zalecenie' } else { 'Info' }
+                    if ($g.Empty -and ($m.Count -or $npm.Count)) { $txt += ' – grupa powinna być pusta (uprawnienia bliskie administratorowi domeny)' }
                     if ($idle.Count) { $txt += ' – nieużywane konta uprzywilejowane wyłącz albo usuń z grupy' }
+                    if ($npm.Count) { $txt += ' – konto komputera lub usługi w grupie uprzywilejowanej to znana technika utrwalenia dostępu; sprawdź, czy to zamierzone' }
                     AdRow "Grupa uprzywilejowana: $($g.N)" $txt $st
                 }
             }
             $privOr = if ($privDn.Count) { '(|' + (@($privDn | ForEach-Object { InChain $_ }) -join '') + ')' } else { '(objectSid=S-1-0-0)' }
+            # Lista kont uprzywilejowanych (DOMENA\sAMAccountName, do 500) – stacja szuka ich wśród kont usług i zadań wszystkich serwerów
+            Try-Ad 'Konta uprzywilejowane – lista' {
+                if (-not ($domSid -and "$(AccOf "$domSid-512")" -match '^([^\\]+)\\')) { return }   # nazwa NetBIOS domeny z nazwy grupy Administratorzy domeny
+                $nb = $Matches[1]
+                $sys.PrivAccounts = (@((AdFind "(&(objectClass=user)$en$privOr)") | Select-Object -First 500 | ForEach-Object { "$(AdGet $_.DN 'sAMAccountName')" } | Where-Object { $_ -and $_ -notmatch '[{}]' } | ForEach-Object { "$nb\$_" }) -join ',')
+            }
 
             Try-Ad 'Hasło konta krbtgt' {
                 $age = 'krócej niż 180 dni'; $st = 'OK'
@@ -1684,6 +1707,13 @@ $Collector = {
                 $pu = AdList (GroupDn "(objectSid=$domSid-525)") 'member'
                 if ([int]$dfl -ge 6) { AdRow 'Grupa Użytkownicy chronieni' $(if ($pu.Count) { "$($pu.Count) członków" } else { 'pusta – konta administratorów nie korzystają z dodatkowej ochrony (bez NTLM, delegowania i zapamiętywania poświadczeń)' }) $(if ($pu.Count) { 'OK' } else { 'Zalecenie' }) }
             }
+            # Kopia zapasowa AD: NTDS zapisuje zdarzenie 2089 raz dziennie dla każdej partycji bez kopii w progu „Backup Latency Threshold”
+            # (domyślnie połowa czasu życia tombstone). Stan kopii jest replikowany – wystarczy dziennik jednego kontrolera (ocena raz na domenę).
+            Try-Ad 'Kopia zapasowa Active Directory' {
+                $bk = @(Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2089; StartTime = $since } -MaxEvents 100 -ErrorAction SilentlyContinue)
+                $bkp = @($bk | ForEach-Object { if ("$($_.Message)" -match '\b(?:CN|DC)=[^\s,]+(?:,(?:CN|DC)=[^\s,]+)*') { $Matches[0] } } | Select-Object -Unique)
+                AdRow 'Kopia zapasowa Active Directory (zdarzenie 2089)' $(if ($bk.Count) { "brak kopii zapasowej w progu opóźnienia$(if ($bkp.Count) { ", partycje: $(@($bkp | Select-Object -First 5) -join '; ')" }) (ostatnio $(D $bk[0].TimeCreated)) – bez aktualnej kopii stanu systemu kontrolera nie da się odtworzyć domeny po awarii lub ataku" } else { "brak ostrzeżeń z $Days dni" }) $(if ($bk.Count) { 'Uwaga' } else { 'OK' })
+            }
             Try-Ad 'Zaufania' {
                 foreach ($t in (AdFind '(objectClass=trustedDomain)' "CN=System,$defNC")) {
                     $ta = [int](AdGet $t.DN 'trustAttributes'); $td = [int](AdGet $t.DN 'trustDirection'); $tp = "$(AdGet $t.DN 'trustPartner')"
@@ -1726,15 +1756,19 @@ $Collector = {
                 if (-not $svRoot) { $svRoot = Join-Path $env:SystemRoot 'SYSVOL\sysvol' }
                 $base = Join-Path $svRoot $dnsDom
                 if (-not (Test-Path -LiteralPath $base)) { AdRow 'SYSVOL – hasła w plikach' "nie znaleziono folderu $base" 'Info'; return }
-                $files = @(Get-ChildItem -LiteralPath $base -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and $_.Length -lt 2MB -and $_.Extension -match '^\.(xml|bat|cmd|vbs|ps1|kix|ini|inf)$' } | Select-Object -First 5000)
-                $gpp = New-Object System.Collections.Generic.List[string]; $scr = New-Object System.Collections.Generic.List[string]
+                # najpierw scripts (NETLOGON – najczęstsze miejsce haseł), potem Policies; z plików .ini tylko scripts.ini / psscripts.ini (parametry skryptów)
+                $files = @(@(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | Sort-Object { $_.Name -ne 'scripts' }) | ForEach-Object { if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -ErrorAction SilentlyContinue } else { $_ } } | Where-Object { -not $_.PSIsContainer -and $_.Length -lt 2MB -and ($_.Extension -match '^\.(xml|bat|cmd|vbs|ps1|kix)$' -or $_.Name -match '^(ps)?scripts\.ini$') } | Select-Object -First 5000)
+                $gpp = New-Object System.Collections.Generic.List[string]; $scr = New-Object System.Collections.Generic.List[string]; $alp = New-Object System.Collections.Generic.List[string]
                 foreach ($f in $files) {
                     $t = ''; try { $t = [IO.File]::ReadAllText($f.FullName) } catch { continue }
                     $rel = $f.FullName.Substring($base.Length).TrimStart('\')
-                    if ($f.Extension -eq '.xml') { if ($t -match 'cpassword="[^"]+"') { $gpp.Add($rel) } }
-                    elseif ($f.Extension -match '^\.(bat|cmd|vbs|ps1|kix)$' -and $t -match '(?im)(\bnet\s+use\b[^\r\n]*\s/user:\S+|\bpassword\s*[=:]\s*(?!(Read-Host|Get-|Import-|ConvertTo-|ConvertFrom-|New-Object|InputBox)\b)["'']?[^\s"''%$(]{4,}|-AsPlainText\b)') { $scr.Add($rel) }
+                    # Registry.xml: wartość DefaultPassword (autologowanie Winlogon) zapisana jawnym tekstem w atrybucie value
+                    if ($f.Extension -eq '.xml') { if ($t -match 'cpassword="[^"]+"') { $gpp.Add($rel) }; if ($t -match '(?i)<(?=[^>]*\sname="DefaultPassword")(?=[^>]*\svalue="[^"]+")') { $alp.Add($rel) } }
+                    elseif ($f.Extension -match '^\.(bat|cmd|vbs|ps1|kix|ini)$' -and $t -match '(?im)(\bnet\s+use\b[^\r\n]*\s/user:\S+|^\s*\d+Parameters\s*=[^\r\n]*/user:\S+|\bpassword\s*[=:]\s*(?!(Read-Host|Get-|Import-|ConvertTo-|ConvertFrom-|New-Object|InputBox)\b)["'']?[^\s"''%$(]{4,}|-AsPlainText\b)') { $scr.Add($rel) }
                 }
-                AdRow 'SYSVOL – hasła w preferencjach zasad grupy (cpassword)' $(if ($gpp.Count) { "$($gpp.Count) plików: $(@($gpp | Select-Object -First 5) -join ', ') – hasło odszyfruje każdy użytkownik domeny; usuń preferencję i zmień hasło" } else { "brak (sprawdzono $($files.Count) plików)" }) $(if ($gpp.Count) { 'Krytyczne' } else { 'OK' })
+                # limit 5000 plików: brak znalezisk nie oznacza „OK”, gdy części plików nie przejrzano
+                AdRow 'SYSVOL – hasła w preferencjach zasad grupy (cpassword)' $(if ($gpp.Count) { "$($gpp.Count) plików: $(@($gpp | Select-Object -First 5) -join ', ') – hasło odszyfruje każdy użytkownik domeny; usuń preferencję i zmień hasło" } elseif ($files.Count -ge 5000) { "brak w sprawdzonych plikach – sprawdzono tylko pierwsze $($files.Count) plików (limit), pozostałych nie przejrzano" } else { "brak (sprawdzono $($files.Count) plików)" }) $(if ($gpp.Count) { 'Krytyczne' } elseif ($files.Count -ge 5000) { 'Info' } else { 'OK' })
+                if ($alp.Count) { AdRow 'SYSVOL – hasło autologowania w preferencjach rejestru (DefaultPassword)' "$($alp.Count) plików: $(@($alp | Select-Object -First 5) -join ', ') – hasło zapisane jawnym tekstem czyta każdy użytkownik domeny; usuń preferencję i zmień hasło" 'Krytyczne' }
                 if ($scr.Count) { AdRow 'SYSVOL – możliwe hasła w skryptach' "$(@($scr | Select-Object -First 6) -join ', ')$(if ($scr.Count -gt 6) { " (+$($scr.Count - 6))" }) – skrypty czyta każdy użytkownik domeny" 'Uwaga' }
                 # Zasady haseł (szyfrowanie odwracalne, złożoność): obowiązujące na kontrolerze = zasady domeny z wygrywającego GPO
                 # (secedit /export do pliku tymczasowego, usuwanego od razu); gdy się nie uda – Default Domain Policy z SYSVOL
@@ -2847,6 +2881,7 @@ $script:Headers = @{
     Profile = 'Profil sieci'; DomainRoleId = 'Rola w domenie (kod)'; BuildNumber = 'Numer kompilacji'; CommitLimitGB = 'Limit pamięci wirtualnej [GB]'; CommitUsedPct = 'Użycie pamięci wirtualnej [%]'
     PageFileAuto = 'Plik stronicowania zarządzany automatycznie'; PageFiles = 'Pliki stronicowania'; ResourceExhaustion = 'Wyczerpanie pamięci (zdarzenia 2004)'
     TimeSource = 'Źródło czasu (W32Time)'; NtpServer = 'Serwer NTP'; HvTimeSync = 'Czas z hosta Hyper-V'; CollectedUtc = 'Czas zebrania danych (UTC)'; TimeOffsetSec = 'Różnica czasu vs stacja [s]'
+    TimeSyncWarn = 'Ostrzeżenia usługi czasu (zdarzenia)'; TimeSyncNoSync = 'Brak synchronizacji czasu od doby (zdarzenia 36)'; TimeSyncLast = 'Ostatnie ostrzeżenie usługi czasu'; ForestRoot = 'Domena główna lasu'; PrivAccounts = 'Konta uprzywilejowane domeny'
     Down = 'Wyłączenie'; Up = 'Start'; DowntimeMin = 'Przestój [min]'; Initiator = 'Zainicjował'; Reason = 'Przyczyna'; Sec = 'Czas [s]'
     CpuUsage = 'CPU [%]'; MemStartupGB = 'RAM startowy [GB]'; ReplicationMode = 'Tryb replikacji'; Checkpoints = 'Checkpointy'; CheckpointType = 'Typ checkpointów'
     AutoStop = 'Przy wyłączeniu hosta'; IntegrationVersion = 'Wersja usług integracji'; GuestOS = 'System gościa'; GuestFQDN = 'Nazwa gościa (FQDN)'
@@ -3402,6 +3437,12 @@ function Invoke-ServerAnalysis {
     foreach ($r in $D.Tasks) {
         if ($r.Failed -eq 'Tak') { AddI 'Ostrzeżenie' 'Harmonogram' "Zadanie $($r.Path): $($r.ResultText) ($($r.Result)), ostatnio $($r.LastRun)" 'Tasks'; SetFlag $r 'warn' }
     }
+    # Konta domenowe usług i zadań („konto|usługa X”): lekka lista, która przetrwa New-SlimData (Services i Tasks to HeavyKeys) –
+    # Update-VmIndex porównuje ją z kontami uprzywilejowanymi domeny. Kopia lekka nie ma już tych sekcji, więc listy nie nadpisujemy.
+    if (-not $D.PSObject.Properties['_Slim']) {
+        $ra = @(@($D.Services | Where-Object { $_ } | ForEach-Object { "$($_.Account)|usługa $($_.Name)" }) + @($D.Tasks | Where-Object { $_ } | ForEach-Object { "$($_.RunAs)|zadanie $($_.Path)" }) | Where-Object { $_ -match '^[^|]*[\\@][^|]*\|' -and $_ -notmatch '^(\.|NT AUTHORITY|NT SERVICE|BUILTIN|IIS APPPOOL|NT VIRTUAL MACHINE)\\' } | Sort-Object -Unique)
+        $D | Add-Member -NotePropertyName _RunAs -NotePropertyValue ([string[]]$ra) -Force
+    }
 
     # Zdarzenia
     # Kernel-Power 41 i EventLog 6008 omawia sekcja Restarty (jeden problem na serwer zamiast kilku)
@@ -3587,9 +3628,16 @@ function Invoke-ServerAnalysis {
         if ($ti) { $list.Add($ti) }
         if ($s.IsDC -eq $true) {
             $isPdc = ("$($s.DomainRoleId)" -eq '5')
-            if ($isPdc -and "$($s.TimeSource)" -in 'NT5DS', 'NoSync', '') { AddI 'Ostrzeżenie' 'Czas' "Kontroler PDC nie ma zewnętrznego źródła czasu (W32Time Type: $(if ($s.TimeSource) { $s.TimeSource } else { 'brak' })) – z jego zegarem synchronizuje się cała domena" 'System' }
+            # PDC domeny podrzędnej poprawnie bierze czas z domeny nadrzędnej (NT5DS) – zewnętrznego NTP potrzebuje tylko PDC domeny głównej lasu
+            # (starsze migawki bez ForestRoot: jak dotąd); NoSync jest błędem na każdym PDC
+            $rootPdc = $isPdc -and "$($s.PSObject.Properties['ForestRoot'].Value)" -ne 'False'
+            if (($rootPdc -and "$($s.TimeSource)" -in 'NT5DS', 'NoSync', '') -or ($isPdc -and "$($s.TimeSource)" -eq 'NoSync')) { AddI 'Ostrzeżenie' 'Czas' "Kontroler PDC nie ma zewnętrznego źródła czasu (W32Time Type: $(if ($s.TimeSource) { $s.TimeSource } else { 'brak' })) – z jego zegarem synchronizuje się cała domena" 'System' }
             if ($s.HvTimeSync -eq $true) { AddI $(if ($isPdc) { 'Ostrzeżenie' } else { 'Info' }) 'Czas' 'Kontroler domeny w maszynie Hyper-V bierze czas z hosta (VMICTimeProvider) – dla DC zalecane jest wyłączenie tego dostawcy' 'System' }
         }
+        # Usługa czasu nie może się zsynchronizować (zdarzenia Time-Service): na PDC z jego zegarem rozjeżdża się cała domena, a porównanie ze stacją
+        # tego nie pokaże. Pojedyncze ostrzeżenia po restarcie (DNS albo DC jeszcze niedostępne) są typowe – zgłaszamy od 3 albo przy zdarzeniu 36
+        $tsn = [int]"$($s.PSObject.Properties['TimeSyncWarn'].Value)"; $ts36 = [int]"$($s.PSObject.Properties['TimeSyncNoSync'].Value)"
+        if ($tsn -ge 3 -or $ts36 -gt 0) { AddI $(if ("$($s.DomainRoleId)" -eq '5') { 'Ostrzeżenie' } else { 'Info' }) 'Czas' "Usługa czasu nie może się zsynchronizować ze źródłem: $tsn ostrzeżeń w $days dni$(if ($ts36) { ", w tym $($ts36)× brak synchronizacji od ponad doby" }) (ostatnio $($s.TimeSyncLast))$(if ("$($s.DomainRoleId)" -eq '5') { ' – PDC chodzi na własnym zegarze, a z nim cała domena; różnice czasu względem stacji tego nie pokażą' })" 'System' }
         if ("$($s.CommitUsedPct)" -ne '' -and [int]$s.CommitUsedPct -ge $C.CommitWarnPct) { AddI 'Ostrzeżenie' 'Zasoby' "Wysokie użycie pamięci wirtualnej (commit): $($s.CommitUsedPct)% z $($s.CommitLimitGB) GB – aplikacjom może zabraknąć pamięci" 'System' }
         if ("$($s.ResourceExhaustion)" -ne '' -and [int]$s.ResourceExhaustion -gt 0) { AddI 'Ostrzeżenie' 'Zasoby' "Windows zgłosił wyczerpanie pamięci wirtualnej $($s.ResourceExhaustion)× w $days dni (zdarzenie 2004)" 'System' }
         $bn = "$($s.BuildNumber)"
@@ -4220,19 +4268,24 @@ function Update-VmIndex {
             if ($used -gt $avail) { & $addX $rep.Key 'Ostrzeżenie' "Klaster $cn nie przetrwa awarii największego węzła: maszyny używają $([math]::Round($used)) GB RAM, a po awarii zostanie ok. $([math]::Round($avail)) GB (z zapasem $($Config.HvHostMinFreeGB) GB na węzeł)" 'Cluster' $cn }
         }
     }
-    # Wszystkie kontrolery domeny na jednym hoście = awaria hosta wyłącza logowanie w całej domenie
-    $dcByHost = @{}; $dcCount = 0
+    # Wszystkie kontrolery domeny na jednym hoście = awaria hosta wyłącza logowanie w całej domenie (osobno dla każdej domeny lasu)
+    $dcByDom = @{}
     foreach ($it in @($script:Servers)) {
         $d = $script:Data[$it.Name]
         if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['System'] -or -not $d.System -or -not $d.System.IsDC) { continue }
-        $dcCount++
+        $dk = "$($d.System.Domain)".ToLowerInvariant()
+        if (-not $dcByDom.ContainsKey($dk)) { $dcByDom[$dk] = @{ Dcs = (New-Object System.Collections.Generic.List[string]); Hosts = @{} } }
+        $x = $dcByDom[$dk]; $x.Dcs.Add($it.Name)
         $h = if ($d.System.PSObject.Properties['HvHost'] -and $d.System.HvHost) { Get-DisplayName "$($d.System.HvHost)" } else { "(fizyczny) $($it.Display)" }
-        if (-not $dcByHost.ContainsKey($h)) { $dcByHost[$h] = New-Object System.Collections.Generic.List[string] }
-        $dcByHost[$h].Add($it.Display)
+        if (-not $x.Hosts.ContainsKey($h)) { $x.Hosts[$h] = New-Object System.Collections.Generic.List[string] }
+        $x.Hosts[$h].Add($it.Display)
     }
-    if ($dcCount -ge 2 -and $dcByHost.Count -eq 1) {
-        $h = @($dcByHost.Keys)[0]
-        & $addX (@($script:Servers | Where-Object { $dcByHost[$h] -contains $_.Display })[0].Name) 'Ostrzeżenie' "Wszystkie skanowane kontrolery domeny ($($dcByHost[$h] -join ', ')) działają na jednym hoście $h – jego awaria wyłączy logowanie w domenie" 'System' ''
+    foreach ($dk in @($dcByDom.Keys | Sort-Object)) {
+        $x = $dcByDom[$dk]
+        if ($x.Dcs.Count -lt 2 -or $x.Hosts.Count -ne 1) { continue }
+        $h = @($x.Hosts.Keys)[0]
+        # nazwa domeny w treści tylko przy kilku domenach – przy jednej treść (i klucz wyciszenia) jak dotąd
+        & $addX (@($script:Servers | Where-Object { $x.Hosts[$h] -contains $_.Display })[0].Name) 'Ostrzeżenie' "Wszystkie skanowane kontrolery domeny$(if ($dcByDom.Count -gt 1) { " $dk" }) ($($x.Hosts[$h] -join ', ')) działają na jednym hoście $h – jego awaria wyłączy logowanie w domenie" 'System' '' $null ([string[]]$x.Dcs.ToArray())
     }
     # Active Directory: ocena raz na domenę – z PDC (rola 5), a gdy go nie skanowano albo sekcja się nie udała, z pierwszego alfabetycznie DC
     $doms = @{}
@@ -4243,6 +4296,23 @@ function Update-VmIndex {
         $dn = "$($d.System.Domain)".ToLowerInvariant()
         if (-not $doms.ContainsKey($dn)) { $doms[$dn] = New-Object System.Collections.Generic.List[object] }
         $doms[$dn].Add(@{ Key = $it.Name; D = $d; Pdc = ([int]$d.System.PSObject.Properties['DomainRoleId'].Value -eq 5); Stale = [bool]($d.PSObject.Properties['_ScanNote'] -and $d._ScanNote) })
+    }
+    # Konta domenowe usług i zadań serwerów (lista _RunAs z analizy): klucz „domena\konto” (NetBIOS albo DNS z UPN) → serwer → co używa konta.
+    # Bez kontrolerów domeny – hasło zapisane na DC nie daje niczego ponad dostęp do samego DC.
+    $runAs = @{}
+    if ($doms.Count) {
+        foreach ($it in @($script:Servers)) {
+            $d = $script:Data[$it.Name]
+            if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['_RunAs'] -or ($d.PSObject.Properties['System'] -and $d.System -and $d.System.IsDC)) { continue }
+            foreach ($ent in @($d._RunAs)) {
+                $acc, $what = "$ent" -split '\|', 2
+                $ak = if ($acc -match '^([^\\@]+)\\([^\\@]+)$') { "$($Matches[1])\$($Matches[2])" } elseif ($acc -match '^([^\\@]+)@([^\\@]+)$') { "$($Matches[2])\$($Matches[1])" } else { '' }
+                if (-not $ak) { continue }
+                $ak = $ak.ToLowerInvariant()
+                if (-not $runAs.ContainsKey($ak)) { $runAs[$ak] = New-Object System.Collections.Specialized.OrderedDictionary }
+                if (-not $runAs[$ak].Contains($it.Display)) { $runAs[$ak][$it.Display] = "$what" }
+            }
+        }
     }
     foreach ($dn in @($doms.Keys | Sort-Object)) {
         $rep = @($doms[$dn] | Sort-Object { $_.Stale }, { -not $_.Pdc }, { $_.Key })[0]
@@ -4256,6 +4326,22 @@ function Update-VmIndex {
             }
         }
         if ($recs.Count) { & $addX $rep.Key 'Info' ("Do utwardzenia w domenie ($($recs.Count)): " + (Join-Short $recs 4)) 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys }
+        # Konto uprzywilejowane domeny jako konto usługi lub zadania: hasło leży w LSA Secrets serwera (albo token w pamięci) – administrator serwera przejmie domenę
+        $pal = @("$($rep.D.System.PSObject.Properties['PrivAccounts'].Value)" -split ',' | Where-Object { $_ })
+        if ($pal.Count -and $runAs.Count) {
+            $hit = New-Object System.Collections.Specialized.OrderedDictionary
+            foreach ($pa in $pal) {
+                foreach ($ak in @("$pa".ToLowerInvariant(), "$dn\$($pa -replace '^.*\\', '')".ToLowerInvariant())) {
+                    if (-not $runAs.ContainsKey($ak)) { continue }
+                    if (-not $hit.Contains($pa)) { $hit[$pa] = New-Object System.Collections.Specialized.OrderedDictionary }
+                    foreach ($hk in @($runAs[$ak].Keys)) { if (-not $hit[$pa].Contains($hk)) { $hit[$pa][$hk] = $runAs[$ak][$hk] } }
+                }
+            }
+            foreach ($pa in @($hit.Keys)) {
+                $srvs = @(foreach ($hk in @($hit[$pa].Keys)) { if ($hit[$pa][$hk]) { "$hk ($($hit[$pa][$hk]))" } else { $hk } })
+                & $addX $rep.Key 'Krytyczny' "Konto uprzywilejowane domeny $pa jest kontem usług lub zadań na serwerach ($($srvs.Count)): $(Join-Short $srvs 6) – hasło konta jest zapisane na tych serwerach (LSA Secrets) albo jego token działa w ich pamięci, więc administrator każdego z nich przejmie domenę; użyj gMSA albo konta bez uprawnień administracyjnych domeny" 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys
+            }
+        }
     }
     # Ta sama maszyna pod dwiema nazwami (alias DNS, nazwa klastra, adres IP) – skanowana podwójnie
     $byComp = @{}
