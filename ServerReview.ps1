@@ -146,7 +146,7 @@ $Config = [ordered]@{
     CveRefreshHours        = 24      # dane starsze niż tyle godzin są pobierane ponownie
     CveProxy               = ''      # serwer proxy dla pobierania, np. http://proxy:8080 (puste = ustawienia systemowe)
     # Koniec rozszerzonego wsparcia Microsoft wg numeru kompilacji (bez płatnego ESU)
-    OsSupportEnd           = @{ '9200' = '2023-10-10'; '9600' = '2023-10-10'; '14393' = '2027-01-12'; '17763' = '2029-01-09'; '20348' = '2031-10-14'; '26100' = '2034-10-10' }
+    OsSupportEnd           = @{ '6001' = '2020-01-14'; '6002' = '2020-01-14'; '6003' = '2020-01-14'; '7600' = '2020-01-14'; '7601' = '2020-01-14'; '9200' = '2023-10-10'; '9600' = '2023-10-10'; '14393' = '2027-01-12'; '17763' = '2029-01-09'; '20348' = '2031-10-14'; '26100' = '2034-10-10' }
     # Sekcje pomijane podczas skanu – ustawiane w oknie Ustawienia (puste = skanuj wszystko)
     SkipSections           = @()
     ServerListFile         = Join-Path $Base 'servers.txt'
@@ -559,7 +559,8 @@ $Collector = {
         foreach ($s in $svcAll) {
             $p = "$($s.PathName)".Trim()
             if (-not $p -or $p.StartsWith('"')) { continue }
-            if ($p -match '^(?i)([a-z]:\\.+?\.exe)' -and $Matches[1] -match '\s') { $uq.Add("$($s.Name)") }
+            # tylko Windows i C:\Program Files (domyślnie bez prawa zapisu dla użytkowników) – pozostałe ścieżki są ostrzeżeniem w analizie usług
+            if ($p -match '^(?i)([a-z]:\\.+?\.exe)' -and $Matches[1] -match '\s' -and $p -match '^([a-z]:\\Windows|c:\\Program Files( \(x86\))?)\\') { $uq.Add("$($s.Name)") }
         }
         if ($uq.Count) { Add-Check 'Niecytowane ścieżki usług ze spacją' "$(Short ($uq -join ', ') 300) – przy prawie zapisu do folderu nadrzędnego możliwe uruchomienie cudzego pliku jako usługa" 'Zalecenie' }
     } catch { HErr 'podniesienie uprawnień' $_ }
@@ -3170,7 +3171,7 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: system i dyski'; Key = 'DiskRetryWarn';     Type = 'int'; Min = 1; Max = 100000; Label = 'Ponowienia/resety I/O dysku: ostrzeżenie od [liczba]' }
     @{ Group = 'Progi: system i dyski'; Key = 'BugCheckCritCount'; Type = 'int'; Min = 1; Max = 1000;   Label = 'BSOD: krytyczne od [liczba w okresie]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'CertWarnDays';       Type = 'int'; Min = 1; Max = 3650;    Label = 'Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem' }
-    @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba]' }
+    @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba] prób jednego konta z jednego źródła' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'RecentSoftwareDays'; Type = 'int'; Min = 1; Max = 3650;    Label = 'Nowe oprogramowanie: z ostatnich [dni]' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveCheck';        Type = 'bool';                    Label = 'Sprawdzaj brakujące poprawki Windows (CVE) – stacja pobiera dane Microsoft i katalog CISA KEV' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveMonths';       Type = 'int'; Min = 1; Max = 36;  Label = 'Dane CVE z ostatnich [miesięcy]' }
@@ -3323,7 +3324,8 @@ function Invoke-ServerAnalysis {
         $msg   = "Brak połączenia: $cause."
         if ($cls -eq 'Timeout') { $sev = 'Ostrzeżenie'; $msg = "Skan przerwany – przekroczono limit czasu ($($C.ServerTimeoutSec) s); brak aktualnych danych." }
         elseif ($cls -eq 'Remote') { $sev = 'Ostrzeżenie'; $msg = "$cause." }
-        $vmOff = $vm -and "$($vm.Row.State)" -notlike 'Running*'
+        # RunningCritical (utracony dostęp do plików maszyny) jako przyczyna tylko wtedy, gdy gość faktycznie nie odpowiada w sieci
+        $vmOff = $vm -and ("$($vm.Row.State)" -notlike 'Running*' -or ("$($vm.Row.State)" -like '*Critical' -and (Test-NetworkDown $D)))
         if ($vmOff) {
             $vst = "$($vm.Row.State)"
             $since = "$($vm.Row.PSObject.Properties['StateSince'].Value)"
@@ -3338,10 +3340,12 @@ function Invoke-ServerAnalysis {
             $hb = "$($vm.Row.Heartbeat)"
             if ($hb -match '^(LostCommunication|NoContact|Error)') { $msg += " Maszyna działa na hoście $($vm.HostDisplay), ale system gościa nie odpowiada (heartbeat: $hb) – możliwe zawieszenie systemu albo awaria usług integracji." }
             else { $msg += " Maszyna działa na hoście $($vm.HostDisplay)$(if ($hb) { " (heartbeat: $hb)" })." }
+            if ("$($vm.Row.State)" -like '*Critical') { $msg += " Stan maszyny $($vm.Row.State) – Hyper-V nie ma dostępu do części jej plików (wolumen/CSV niedostępny lub pełny)." }
         }
         # host Hyper-V, na którym maszyna ostatnio działała, też nie odpowiada – przyczyną jest najpewniej host (jeden problem krytyczny na hoście)
+        # tylko gdy gość nie odpowiada w sieci: odmowa dostępu, Kerberos, WinRM czy zapora to odpowiedź gościa (nie jest na martwym hoście), DNS nie zależy od hosta
         $hostDown = $false
-        if (-not $vm -and $cls -notin 'Timeout', 'Remote') {
+        if (-not $vm -and (Test-NetworkDown $D)) {
             $hk = Find-ServerKey (Get-LastHvHost $D)
             if ($hk -and $hk -ne $Name -and (Test-NetworkDown $script:Data[$hk])) {
                 $hostDown = $true; $sev = 'Ostrzeżenie'
@@ -3395,7 +3399,9 @@ function Invoke-ServerAnalysis {
             foreach ($p in $C.IgnoredStoppedServices) { if ($r.Name -like $p) { $ignored = $true; break } }
             if (-not $ignored) { AddI 'Ostrzeżenie' 'Usługi' "Usługa automatyczna zatrzymana: $($r.DisplayName) ($($r.Name))" 'Services'; SetFlag $r 'warn' }
         }
-        if ($r.Unquoted -eq 'Tak') { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Niecytowana ścieżka usługi ze spacjami: $($r.Name) – $($r.Path)" 'Services'; SetFlag $r 'warn' }
+        # w C:\Program Files i C:\Windows zwykły użytkownik domyślnie nie utworzy pliku – takie ścieżki są tylko zaleceniem w Konfiguracji bezpieczeństwa
+        if ($r.Unquoted -eq 'Tak' -and "$($r.Path)" -match '^\s*c:\\(Program Files( \(x86\))?|Windows)\\') { SetFlag $r 'info' }
+        elseif ($r.Unquoted -eq 'Tak') { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Niecytowana ścieżka usługi ze spacjami: $($r.Name) – $($r.Path)" 'Services'; SetFlag $r 'warn' }
     }
 
     # Zadania
@@ -3435,11 +3441,25 @@ function Invoke-ServerAnalysis {
     $sec   = @($D.SecurityEvents)
     $fails = @($sec | Where-Object { $_.Id -in 4625, 4771 })
     if ($fails.Count) {
-        $ft  = ($fails | Measure-Object Count -Sum).Sum
-        $top = $fails | Sort-Object Count -Descending | Select-Object -First 1
-        $sv  = if ($ft -ge $C.FailedLogonWarn) { 'Ostrzeżenie' } else { 'Info' }
-        AddI $sv 'Bezpieczeństwo' "$ft nieudanych logowań w $days dni$(if ($ft -ge $C.MaxEvents) { " (osiągnięto limit $($C.MaxEvents) pobieranych zdarzeń – faktycznie może być więcej)" }); najwięcej: $($top.Account) z $($top.Source) ×$($top.Count)" 'SecurityEvents'
-        foreach ($r in $fails) { if ($r.Count -ge 5) { SetFlag $r 'warn' } }
+        # suma ze stałą treścią (bez nazw kont, więc wyciszenie działa w kolejnych skanach); ostrzeżenia osobno dla konta i źródła ponad próg oraz dla źródła próbującego wielu kont
+        $ft   = ($fails | Measure-Object Count -Sum).Sum
+        $fAcc = @($fails | ForEach-Object { "$($_.Account)" -replace '^.*\\', '' } | Where-Object { $_ } | Sort-Object -Unique)
+        # ucięcie wg znacznika z migawki (limit z czasu skanu, nie bieżące ustawienie); starsza migawka bez znacznika – porównanie z bieżącym limitem
+        $tm = @(@($D.PSObject.Properties['Truncated'].Value) -like 'Security 4625*')
+        $tr = if ($tm.Count) { " (osiągnięto limit pobieranych zdarzeń – pełne dane dopiero $(if ("$($tm[0])" -match '\(od ([^)]+)\)') { "od $($Matches[1])" } else { 'z części okresu' }), faktycznie może być więcej)" } elseif (-not $D.PSObject.Properties['Truncated'] -and $ft -ge $C.MaxEvents) { " (osiągnięto limit $($C.MaxEvents) pobieranych zdarzeń – faktycznie może być więcej)" } else { '' }
+        AddI 'Info' 'Bezpieczeństwo' "$ft nieudanych logowań w $days dni (różnych kont: $($fAcc.Count))$tr" 'SecurityEvents'
+        $hot = @($fails | Where-Object { [int]$_.Count -ge $C.FailedLogonWarn } | Sort-Object { [int]$_.Count } -Descending)
+        foreach ($r in @($hot | Select-Object -First 5)) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Nieudane logowania konta $($r.Account)$(if ($r.Source) { " z $($r.Source)" })$(if ("$($r.Id)" -eq '4771') { ' (Kerberos)' }): ×$($r.Count) w $days dni – stare hasło w usłudze, zadaniu albo na telefonie, albo próba odgadnięcia hasła" 'SecurityEvents' }
+        if ($hot.Count -gt 5) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Kolejne konta z co najmniej $($C.FailedLogonWarn) nieudanymi logowaniami z jednego źródła: $($hot.Count - 5) – zobacz sekcję Zdarzenia bezpieczeństwa" 'SecurityEvents' }
+        foreach ($r in $hot) { SetFlag $r 'warn' }
+        # password spray: z jednego źródła po kilka prób na wiele różnych kont – próg na konto tego nie wyłapie
+        foreach ($sg in @($fails | Group-Object { @("$($_.Source)".Trim() -split '\s+')[0] } | Where-Object { $_.Name -and $_.Name -notmatch '^(127\.|::1$)' })) {
+            $sa = @($sg.Group | ForEach-Object { "$($_.Account)" -replace '^.*\\', '' } | Where-Object { $_ } | Sort-Object -Unique)
+            if ($sa.Count -lt 10) { continue }
+            AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Możliwy atak na hasła (password spray) z $($sg.Name): nieudane logowania na różne konta (kont: $($sa.Count), prób: $(($sg.Group | Measure-Object Count -Sum).Sum)) w $days dni – jeśli to serwer pośredniczący w logowaniu (Exchange, ADFS, RDS, VPN), mogą to być pomyłki użytkowników" 'SecurityEvents'
+            foreach ($r in $sg.Group) { SetFlag $r 'warn' }
+        }
+        foreach ($r in $fails) { if ([int]$r.Count -ge 5) { SetFlag $r 'info' } }
     }
     # Nieudane logowania z adresów publicznych = usługa logowania dostępna z internetu
     # (tylko IPv4 – globalne adresy IPv6 bywają wewnętrzne; 100.64.0.0/10 to CGNAT, nie internet)
@@ -3496,11 +3516,22 @@ function Invoke-ServerAnalysis {
 
     # Udziały, certyfikaty, foldery
     foreach ($r in $D.Shares) { if ($r.EveryoneWrite -eq 'Tak') { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): Wszyscy mają zapis na poziomie udziału – sprawdź NTFS" 'Shares'; SetFlag $r 'info' } }
+    # Po ręcznym odnowieniu stary certyfikat zostaje w magazynie obok nowego – najdłuższa ważność wg podmiotu i wystawcy
+    # (bez pustych podmiotów: np. certyfikaty DC z samym SAN z różnych szablonów nie są swoimi następcami)
+    $certBest = @{}
+    foreach ($r in @($D.Certificates)) { if ($r -and $r.PrivateKey -eq 'Tak' -and "$($r.Subject)") { $ck = "$($r.Subject)|$($r.Issuer)".ToLowerInvariant(); if (-not $certBest.ContainsKey($ck) -or [int]$r.DaysLeft -gt $certBest[$ck]) { $certBest[$ck] = [int]$r.DaysLeft } } }
+    $certExp = New-Object System.Collections.Generic.List[object]
     foreach ($r in $D.Certificates) {
         if ($r.PrivateKey -ne 'Tak') { continue }
-        if ($r.DaysLeft -lt 0) { AddI 'Info' 'Certyfikaty' "Wygasły certyfikat: $(Get-ShortText $r.Subject 80) ($($r.NotAfter))" 'Certificates'; SetFlag $r 'info' }
-        elseif ($r.DaysLeft -le $C.CertWarnDays) { AddI 'Ostrzeżenie' 'Certyfikaty' "Certyfikat wygasa za $($r.DaysLeft) dni: $(Get-ShortText $r.Subject 80)" 'Certificates'; SetFlag $r 'warn' }
+        $ck = "$($r.Subject)|$($r.Issuer)".ToLowerInvariant()
+        $newer = if ("$($r.Subject)" -and $certBest.ContainsKey($ck) -and $certBest[$ck] -gt $C.CertWarnDays -and [int]$r.DaysLeft -lt $certBest[$ck]) { $certBest[$ck] } else { $null }
+        # odcisk w treści: wyciszenie ostrzeżenia o starym egzemplarzu nie wycisza za rok jego następcy o tym samym podmiocie
+        $tp = "$($r.Thumbprint)"; $tp = if ($tp) { " (odcisk $($tp.Substring(0, [math]::Min(8, $tp.Length))))" } else { '' }
+        if ($r.DaysLeft -lt 0) { if ($null -ne $newer) { SetFlag $r 'muted' } else { $certExp.Add($r); SetFlag $r 'info' } }   # wygasły, ale jest ważny następca – bez problemu
+        elseif ($r.DaysLeft -le $C.CertWarnDays -and $null -ne $newer) { AddI 'Info' 'Certyfikaty' "Certyfikat wygasa za $($r.DaysLeft) dni: $(Get-ShortText $r.Subject 80)$tp – jest już nowszy certyfikat z tym samym podmiotem i wystawcą (ważny jeszcze $newer dni); sprawdź, czy usługi (IIS, RDP, ADFS) używają nowego, i usuń stary" 'Certificates'; SetFlag $r 'info' }
+        elseif ($r.DaysLeft -le $C.CertWarnDays) { AddI 'Ostrzeżenie' 'Certyfikaty' "Certyfikat wygasa za $($r.DaysLeft) dni: $(Get-ShortText $r.Subject 80)$tp" 'Certificates'; SetFlag $r 'warn' }
     }
+    if ($certExp.Count) { AddI 'Info' 'Certyfikaty' ("Wygasłe certyfikaty z kluczem prywatnym ($($certExp.Count)): " + (Join-Short ($certExp | Sort-Object { [int]$_.DaysLeft } -Descending | ForEach-Object { "$(if ("$($_.Subject)") { Get-ShortText $_.Subject 60 } else { "odcisk $($_.Thumbprint)" }) ($($_.NotAfter))" }) 3) + ' – usuń nieużywane') 'Certificates' }
     foreach ($r in $D.Folders) {
         if ($r.File -like '`[podsumowanie`]*' -and $r.Executable) { AddI 'Info' 'Foldery' "W $($r.Folder) jest $($r.Executable) plików wykonywalnych/skryptów" 'Folders' }
         elseif ($r.Executable -eq 'Tak') { SetFlag $r 'info' }
@@ -3599,7 +3630,7 @@ function Invoke-ServerAnalysis {
             $endDt = [datetime]::MinValue
             if ([datetime]::TryParseExact($endTxt, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$endDt)) {
                 $left = [int]($endDt - (Get-Date)).TotalDays
-                if ($left -lt 0) { AddI 'Krytyczny' 'System' "$($s.OS): koniec wsparcia $endTxt – system nie dostaje poprawek bezpieczeństwa (chyba że ma wykupione ESU)" 'System' }
+                if ($left -lt 0) { AddI 'Krytyczny' 'System' "$($s.OS): koniec wsparcia $endTxt – system nie dostaje poprawek bezpieczeństwa $(if ([int]$bn -lt 9200) { '(płatne ESU dla 2008/2008 R2 też już się skończyło)' } else { '(chyba że ma wykupione ESU)' })" 'System' }
                 elseif ($left -le $C.SupportWarnDays) { AddI 'Info' 'System' "$($s.OS): koniec wsparcia $endTxt (za $left dni)" 'System' }
             }
         }
@@ -3790,12 +3821,15 @@ function Invoke-ServerAnalysis {
 }
 function Get-RiskyExclusion($Row) {
     # Wykluczenie Defendera obejmujące cały dysk, katalogi systemowe/tymczasowe, interpretery skryptów albo rozszerzenia plików wykonywalnych
-    $n = ("$($Row.Name)".Trim().ToLowerInvariant() -replace '(\\\*(\.\*)?)+$', '').TrimEnd('\')   # c:\* = cały dysk, c:\windows\temp\* = katalog
+    # zmienne środowiskowe (Defender je rozwija) zamieniane na ścieżki: %SystemDrive% = cały dysk systemowy, %SystemRoot%\System32 = katalog systemowy
+    $raw = "$($Row.Name)".Trim().ToLowerInvariant()
+    $n = ($raw -replace '(\\\*(\.\*)?)+$', '').TrimEnd('\') -replace '^%systemdrive%', 'c:' -replace '^%(systemroot|windir)%', 'c:\windows' -replace '^%programfiles\(x86\)%', 'c:\program files (x86)' -replace '^%programfiles%', 'c:\program files' -replace '^%(programdata|allusersprofile)%', 'c:\programdata' -replace '^%public%', 'c:\users\public'   # c:\* = cały dysk, c:\windows\temp\* = katalog
     $t = "$($Row.Type)"
-    if ($t -like '*ścieżka*') {
+    # wykluczenie procesu z maską folderu (C:\Windows\System32\*) obejmuje pliki otwierane przez każdy proces z tego folderu
+    if ($t -like '*ścieżka*' -or ($t -like '*proces*' -and $raw -match '\\\*$')) {
         if ($n -match '^[a-z]:$') { return 'cały dysk' }
-        if ($n -match '^(%?[a-z]+%?|[a-z]:)\\(windows|windows\\temp|windows\\system32|users|users\\public|programdata|temp|perflogs|program files( \(x86\))?)$' -or $n -match '^%(temp|tmp|windir|systemroot|programdata|userprofile)%$') { return 'katalog systemowy albo tymczasowy' }
-        if ($n -match '\\appdata\\(local|roaming)(\\temp)?$') { return 'profil użytkownika' }
+        if ($n -match '^(%?[a-z]+%?|[a-z]:)\\(windows|windows\\temp|windows\\system32|windows\\syswow64|users|users\\public|programdata|temp|perflogs|program files( \(x86\))?)$' -or $n -match '^%(temp|tmp|windir|systemroot|programdata|userprofile)%$') { return 'katalog systemowy albo tymczasowy' }
+        if ($n -match '\\appdata\\(local|roaming)(\\temp)?$' -or $n -match '^%(appdata|localappdata)%(\\temp)?$') { return 'profil użytkownika' }
     }
     if ($t -like '*proces*' -and $n -match '(^|\\)(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|wmic|msiexec|certutil|bitsadmin)\.exe$') { return 'interpreter albo narzędzie systemowe' }
     if ($t -like '*rozszerzenie*' -and $n.TrimStart('.') -in 'exe', 'dll', 'ps1', 'bat', 'cmd', 'vbs', 'js', 'hta', 'scr', 'msi') { return 'rozszerzenie plików wykonywalnych' }
@@ -4203,12 +4237,14 @@ function Update-VmIndex {
         $good = @($nodes | Where-Object { -not ($_.D.PSObject.Properties['_ScanNote'] -and $_.D._ScanNote) -and @($_.D.PSObject.Properties['Failed'].Value) -notcontains 'Cluster' })
         $rep = if ($good.Count) { $good[0] } else { $nodes[0] }
         $rows = @($rep.D.PSObject.Properties['Cluster'].Value | Where-Object { $_ })
+        # wyciszenia: reguła zapisana pod dowolnym węzłem klastra (reprezentant zmienia się, gdy węzeł ma limit czasu albo jest niedostępny)
+        $nk = [string[]]@(@($nodes | ForEach-Object { $_.Key }) + @($rows | Where-Object { "$($_.Type)" -eq 'Węzeł' } | ForEach-Object { Find-ServerKey "$($_.Name)" }) | Where-Object { $_ })
         foreach ($r in $rows) {
             switch ("$($r.Type)") {
-                'Węzeł'   { if ("$($r.State)" -ne 'Up') { & $addX $rep.Key $(if ("$($r.State)" -eq 'Down') { 'Krytyczny' } else { 'Ostrzeżenie' }) "Węzeł $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn } }
-                'CSV'     { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Krytyczny' "Wolumen CSV $($r.Name) klastra $cn w stanie $($r.State) – maszyny na nim mogą być wstrzymane" 'Cluster' $cn } }
-                'Rola VM' { if ("$($r.State)" -eq 'Failed') { & $addX $rep.Key 'Krytyczny' "Rola maszyny $($r.Name) w klastrze $cn w stanie Failed (właściciel: $($r.Owner))" 'Cluster' $cn } elseif ("$($r.State)" -eq 'PartialOnline') { & $addX $rep.Key 'Ostrzeżenie' "Rola maszyny $($r.Name) w klastrze $cn częściowo online" 'Cluster' $cn } }
-                'Kworum'  { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Ostrzeżenie' "Zasób kworum $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn } }
+                'Węzeł'   { if ("$($r.State)" -ne 'Up') { & $addX $rep.Key $(if ("$($r.State)" -eq 'Down') { 'Krytyczny' } else { 'Ostrzeżenie' }) "Węzeł $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn '' $nk } }
+                'CSV'     { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Krytyczny' "Wolumen CSV $($r.Name) klastra $cn w stanie $($r.State) – maszyny na nim mogą być wstrzymane" 'Cluster' $cn '' $nk } }
+                'Rola VM' { if ("$($r.State)" -eq 'Failed') { & $addX $rep.Key 'Krytyczny' "Rola maszyny $($r.Name) w klastrze $cn w stanie Failed (właściciel: $($r.Owner))" 'Cluster' $cn '' $nk } elseif ("$($r.State)" -eq 'PartialOnline') { & $addX $rep.Key 'Ostrzeżenie' "Rola maszyny $($r.Name) w klastrze $cn częściowo online" 'Cluster' $cn '' $nk } }
+                'Kworum'  { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Ostrzeżenie' "Zasób kworum $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn '' $nk } }
             }
         }
         # N+1: czy pozostałe węzły pomieszczą maszyny po awarii największego węzła (tylko gdy przeskanowano wszystkie węzły)
@@ -4217,7 +4253,7 @@ function Update-VmIndex {
             $used = 0.0; $ramAll = 0.0; $ramMax = 0.0
             foreach ($n in $nodes) { $used += [double]$n.D.System.HvRamAssignedGB; $ram = [double]$n.D.System.RamGB; $ramAll += $ram; if ($ram -gt $ramMax) { $ramMax = $ram } }
             $avail = $ramAll - $ramMax - ($nodes.Count - 1) * [double]$Config.HvHostMinFreeGB
-            if ($used -gt $avail) { & $addX $rep.Key 'Ostrzeżenie' "Klaster $cn nie przetrwa awarii największego węzła: maszyny używają $([math]::Round($used)) GB RAM, a po awarii zostanie ok. $([math]::Round($avail)) GB (z zapasem $($Config.HvHostMinFreeGB) GB na węzeł)" 'Cluster' $cn }
+            if ($used -gt $avail) { & $addX $rep.Key 'Ostrzeżenie' "Klaster $cn nie przetrwa awarii największego węzła: maszyny używają $([math]::Round($used)) GB RAM, a po awarii zostanie ok. $([math]::Round($avail)) GB (z zapasem $($Config.HvHostMinFreeGB) GB na węzeł)" 'Cluster' $cn '' $nk }
         }
     }
     # Wszystkie kontrolery domeny na jednym hoście = awaria hosta wyłącza logowanie w całej domenie
@@ -4274,7 +4310,8 @@ function Update-VmIndex {
         foreach ($it in $down) {
             $d = $script:Data[$it.Name]
             $hk = Find-ServerKey (Get-LastHvHost $d)
-            if (-not $hk -or $hk -eq $it.Name -or -not (Test-NetworkDown $script:Data[$hk]) -or (Find-VmForServer $it.Name $d)) { continue }
+            # zablokowany WinRM (Firewall) = gość odpowiada, więc nie jest na niedostępnym hoście
+            if (-not $hk -or $hk -eq $it.Name -or -not (Test-NetworkDown $d) -or -not (Test-NetworkDown $script:Data[$hk]) -or (Find-VmForServer $it.Name $d)) { continue }
             if (-not $byHost.ContainsKey($hk)) { $byHost[$hk] = New-Object System.Collections.Generic.List[string] }
             $byHost[$hk].Add($it.Display)
         }
@@ -4288,7 +4325,7 @@ function Update-VmIndex {
             $d = $script:Data[$it.Name]
             if (-not $d -or ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported)) { continue }
             $sns = @(Get-ServerSubnets $d)
-            if (-not $d.Offline -and -not $sns.Count) { $noAddr++ }   # np. pominięta sekcja Adresacja – nie wiadomo, ile serwerów podsieci działa
+            if (-not $d.Offline -and -not $sns.Count) { $noAddr++ }   # np. pominięta sekcja Adresacja – nie wiadomo, w której podsieci działają (liczone do każdej)
             foreach ($sn in $sns) { if (-not $netAll.ContainsKey($sn)) { $netAll[$sn] = 0 }; $netAll[$sn]++ }
         }
         foreach ($it in $down) {
@@ -4298,9 +4335,9 @@ function Update-VmIndex {
             }
         }
         foreach ($sn in @($netDown.Keys | Sort-Object)) {
-            if ($noAddr) { break }
+            # działające serwery bez znanego adresu mogą należeć do tej podsieci – doliczone do mianownika (ostrożnie, bez wyłączania całego sprawdzenia)
             $g = $netDown[$sn]; $tot = [int]$netAll[$sn]
-            if ($g.Count -lt 3 -or $tot -lt 1 -or $g.Count / $tot -lt 0.8) { continue }
+            if ($g.Count -lt 3 -or $tot -lt 1 -or $g.Count / ($tot + $noAddr) -lt 0.8) { continue }
             $fw = @($g | Where-Object { "$($script:Data[$_.Name].Diag.Class)" -eq 'Firewall' }).Count
             $names = Join-Short ($g | ForEach-Object { $_.Display }) 8
             $txt = if ($fw -ge $g.Count / 2) { "W podsieci $sn serwery odpowiadają, ale WinRM (TCP 5985) jest blokowany na $($g.Count) z $tot ($names) – prawdopodobnie zapora sieciowa / ACL między stacją a podsiecią albo reguła zapory z GPO" }
@@ -4332,6 +4369,8 @@ function Find-VmForServer([string]$Name, $D) {
         $cands = @($ix.ByName["$($sys.HvVmName)".ToUpperInvariant()] | Where-Object { $_ })
         if ($cands.Count -gt 1 -and $sys.HvHost) { $hs = Get-DisplayName "$($sys.HvHost)"; $p = @($cands | Where-Object { $_.HostDisplay -eq $hs }); if ($p.Count) { $cands = $p } }
     }
+    # serwer fizyczny albo na innej platformie (VMware, KVM…) nie jest gościem Hyper-V – zgodność nazwy z maszyną (np. pozostałość po migracji) jest przypadkowa
+    if (-not $cands.Count -and $sys -and -not "$($sys.PSObject.Properties['HvVmId'].Value)" -and $sys.PSObject.Properties['Hypervisor'] -and "$($sys.Hypervisor)" -ne 'Hyper-V') { return $null }
     if (-not $cands.Count) {
         $short = Get-DisplayName $Name
         $cands = @(@($ix.ByGuest[$short]) + @($ix.ByName[$short.ToUpperInvariant()]) | Where-Object { $_ })
@@ -6273,7 +6312,7 @@ function Update-ServerItem([string]$Name) {
         $why = switch ($cls) { 'Dns' { 'brak w DNS' } 'Offline' { 'nie odpowiada' } 'WinRM' { 'WinRM nie działa' } 'Firewall' { 'zapora blokuje WinRM' } 'Auth' { 'odmowa dostępu' } 'Kerberos' { 'błąd Kerberos' } 'TrustedHosts' { 'wymaga TrustedHosts' } 'Timeout' { 'limit czasu' } 'Remote' { 'błąd zbierania danych' } default { 'brak połączenia' } }
         $vm = Find-VmForServer $Name $d
         if ($vm -and "$($vm.Row.State)" -ne 'Running') { $why = "VM $(Get-VmStateText "$($vm.Row.State)") na $($vm.HostDisplay)" }
-        elseif (-not $vm -and $cls -notin 'Timeout', 'Remote') {
+        elseif (-not $vm -and (Test-NetworkDown $d)) {
             $hk = Find-ServerKey (Get-LastHvHost $d)
             if ($hk -and $hk -ne $Name -and (Test-NetworkDown $script:Data[$hk])) { $why = "host $(Get-DisplayName $hk) nie odpowiada" }
         }
