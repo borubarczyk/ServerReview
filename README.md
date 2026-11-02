@@ -107,6 +107,8 @@ Po skanie bez okna program może wysłać powiadomienie e-mailem (SMTP) i/lub we
 - Opcjonalnie powiadomienie obejmuje też ostrzeżenia albo wszystkie aktywne problemy przy każdym skanie (wyłącz „tylko o nowych”).
 - Wiadomość zawiera listę problemów (do 100), liczbę wszystkich aktywnych problemów krytycznych i liczbę rozwiązanych od poprzedniego powiadomienia. Do e-maila można dołączyć raport HTML (do 10 MB).
 - Stan ostatniego powiadomienia jest w pliku `Cache\notify_state.json`. Gdy wysyłka się nie uda, stan się nie zmienia i te same problemy zostaną wysłane przy następnym skanie.
+- Powiadomienie obejmuje też problemy całej domeny i klastra (np. konta uprzywilejowane domeny używane jako konta usług). Treść z serwerów jest neutralizowana przed wysłaniem webhookiem (wzmianki `@channel`/`@here`, linki).
+- Po aktualizacji programu pierwsze powiadomienie może jednorazowo powtórzyć problemy, których treść się zmieniła (np. nieudane logowania, zatrzymane usługi z kodem wyjścia); kolejne skany wysyłają już tylko nowe.
 - Serwer SMTP musi przyjmować pocztę bez logowania (typowy wewnętrzny przekaźnik); szyfrowanie STARTTLS jest opcjonalne. Webhook korzysta z proxy ustawionego dla danych CVE albo z proxy systemowego.
 - Adres webhooka zawiera klucz dostępu i jest zapisany w `settings.json` – chroń ten plik jak hasło.
 
