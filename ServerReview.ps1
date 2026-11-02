@@ -4148,7 +4148,8 @@ function Invoke-ServerAnalysis {
         $fAcc = @($fails | ForEach-Object { "$($_.Account)" -replace '^.*\\', '' } | Where-Object { $_ } | Sort-Object -Unique)
         # ucięcie wg znacznika z migawki (limit z czasu skanu, nie bieżące ustawienie); starsza migawka bez znacznika – porównanie z bieżącym limitem
         $tm = @(@($D.PSObject.Properties['Truncated'].Value) -like 'Security 4625*')
-        $tr = if ($tm.Count) { " (osiągnięto limit pobieranych zdarzeń – pełne dane dopiero $(if ("$($tm[0])" -match '\(od ([^)]+)\)') { "od $($Matches[1])" } else { 'z części okresu' }), faktycznie może być więcej)" } elseif (-not $D.PSObject.Properties['Truncated'] -and $ft -ge $C.MaxEvents) { " (osiągnięto limit $($C.MaxEvents) pobieranych zdarzeń – faktycznie może być więcej)" } else { '' }
+        $trFrom = if ($tm.Count -and "$($tm[0])" -match '\(od ([^)]+)\)') { "od $($Matches[1])" } else { 'z części okresu' }   # nawias w wyrażeniu regularnym nie może być wewnątrz $( ) w ciągu
+        $tr = if ($tm.Count) { " (osiągnięto limit pobieranych zdarzeń – pełne dane dopiero $trFrom, faktycznie może być więcej)" } elseif (-not $D.PSObject.Properties['Truncated'] -and $ft -ge $C.MaxEvents) { " (osiągnięto limit $($C.MaxEvents) pobieranych zdarzeń – faktycznie może być więcej)" } else { '' }
         AddI 'Info' 'Bezpieczeństwo' "$ft nieudanych logowań w $days dni (różnych kont: $($fAcc.Count))$tr" 'SecurityEvents'
         $hot = @($fails | Where-Object { [int]$_.Count -ge $C.FailedLogonWarn } | Sort-Object { [int]$_.Count } -Descending)
         foreach ($r in @($hot | Select-Object -First 5)) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Nieudane logowania konta $($r.Account)$(if ($r.Source) { " z $($r.Source)" })$(if ("$($r.Id)" -eq '4771') { ' (Kerberos)' }): ×$($r.Count) w $days dni – stare hasło w usłudze, zadaniu albo na telefonie, albo próba odgadnięcia hasła" 'SecurityEvents' }
