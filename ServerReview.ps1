@@ -77,6 +77,7 @@ $Config = [ordered]@{
     IncludeWarnings        = $false   # $true = także ostrzeżenia z System/Application (dużo szumu)
     DiskWarnPct            = 20
     DiskCritPct            = 10
+    DiskMinFreeGB          = 0        # dysk poniżej progu krytycznego, ale z co najmniej tyloma GB wolnego = tylko ostrzeżenie (duże wolumeny; 0 = bez warunku)
     UptimeWarnDays         = 45
     PatchWarnDays          = 45
     CertWarnDays           = 30
@@ -880,6 +881,9 @@ $Collector = {
             if ((-not $isMs) -or $autoStop -or (-not $builtin) -or $unquoted) {
                 [pscustomobject]@{
                     Name = $s.Name; DisplayName = $s.DisplayName; State = "$($s.State)"; StartMode = $mode; Account = $acct
+                    # zatrzymana usługa automatyczna: kod wyjścia (1067 = awaria procesu, 1066/N = błąd zgłoszony przez usługę) i start wyzwalany zdarzeniem (klucz TriggerInfo)
+                    ExitCode = $(if (-not $autoStop) { '' } elseif ([int64]$s.ExitCode -eq 1066 -and $s.ServiceSpecificExitCode) { "1066/$($s.ServiceSpecificExitCode)" } else { "$($s.ExitCode)" })
+                    Trigger = $(if ($autoStop -and (Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Name)\TriggerInfo")) { 'Tak' } else { '' })
                     Vendor = $vendor; Microsoft = $(if ($isMs) { 'Tak' } else { 'Nie' }); Unquoted = $(if ($unquoted) { 'Tak' } else { '' }); Path = (Hide-Secret $raw)
                 }
             }
@@ -1195,12 +1199,19 @@ $Collector = {
     }
 
     # ── Udziały ──
-    $everyone = 'Everyone'
-    try { $everyone = (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')).Translate([System.Security.Principal.NTAccount]).Value } catch {}
     $shares = @(S 'Shares' 'Udziały' {
         # CIM zamiast Get-SmbShare/Get-SmbShareAccess (moduł SmbShare zgłasza błąd, gdy brak jego pliku lokalizacji w języku sesji)
         # GetAccessControlEntries – ta sama metoda, której używa Get-SmbShareAccess (tylko odczyt); błędy zbiorczo, jeden wpis na serwer
         $acTxt = @{ 0 = 'Allow'; 1 = 'Deny' }; $arTxt = @{ 0 = 'Full'; 1 = 'Change'; 2 = 'Read'; 3 = 'Custom' }
+        # Grupy obejmujące (prawie) wszystkich – po SID, niezależnie od języka nazw: Wszyscy, Anonim, Sieć, Użytkownicy uwierzytelnieni,
+        # Użytkownicy, Użytkownicy/Goście/Komputery domeny. Nazwa konta → SID z pamięcią podręczną (tłumaczenie bywa zapytaniem do domeny)
+        $sidOf = @{}
+        function BroadSid([string]$Acct) {
+            if (-not $sidOf.ContainsKey($Acct)) { $v = ''; if ($Acct -match '^S-1-\d') { $v = $Acct } else { try { $v = (New-Object System.Security.Principal.NTAccount($Acct)).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { } }; $sidOf[$Acct] = $v }
+            $v = $sidOf[$Acct]
+            ($v -in 'S-1-1-0', 'S-1-5-7', 'S-1-5-2', 'S-1-5-11', 'S-1-5-32-545') -or ($v -match '^S-1-5-21-[\d-]+-51[345]$')
+        }
+        function SidName([string]$Sid) { try { (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value } catch { $Sid } }
         $accFail = New-Object System.Collections.Generic.List[string]; $accWhy = New-Object System.Collections.Generic.List[string]
         Get-CimInstance -Namespace root\Microsoft\Windows\SMB -ClassName MSFT_SmbShare | Where-Object { $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|[A-Z]\$)$' } | ForEach-Object {
             $sh = $_; $acc = @()
@@ -1212,11 +1223,23 @@ $Collector = {
                 $acc = @(@($cimr | ForEach-Object { if ($null -ne $_.ItemValue) { $_.ItemValue } else { $_.Output } }) | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ AccountName = "$($_.AccountName)"; AccessControlType = $acTxt[[int]$_.AccessControlType]; AccessRight = $arTxt[[int]$_.AccessRight] } })
             }
             catch { $accFail.Add("$($sh.Name)"); $accWhy.Add("$($_.Exception.Message) ($($_.CategoryInfo.Reason))") }
-            $ew  = $acc | Where-Object { $_.AccountName -eq $everyone -and "$($_.AccessControlType)" -eq 'Allow' -and "$($_.AccessRight)" -in 'Full', 'Change' }
+            $bw  = @($acc | Where-Object { "$($_.AccessControlType)" -eq 'Allow' -and "$($_.AccessRight)" -in 'Full', 'Change' -and (BroadSid $_.AccountName) } | ForEach-Object { $_.AccountName } | Select-Object -Unique)
+            $ewTxt = ''
+            if ($bw.Count -and "$($sh.ShareType)" -notmatch '^(1|2|3|PrintQueue|CommDevice|IPC)$') {
+                # NTFS folderu głównego (odczyt samej listy DACL). Zmiana cudzych plików: zapis danych dziedziczony na pliki, pełne prawa ogólne
+                # albo zmiana uprawnień/właściciela. Sam zapis danych w folderze (domyślne dziedziczenie z katalogu głównego dysku) = tylko nowe pliki
+                $nf = $null; $nc = $null
+                try {
+                    $rules = @([IO.Directory]::GetAccessControl($sh.Path, [System.Security.AccessControl.AccessControlSections]::Access).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object { "$($_.AccessControlType)" -eq 'Allow' -and ([int]$_.FileSystemRights -band 0x500C0002) -and (BroadSid "$($_.IdentityReference.Value)") })
+                    $nf = @($rules | Where-Object { ([int]$_.FileSystemRights -band 0x500C0000) -or ([int]$_.InheritanceFlags -band 2) } | ForEach-Object { SidName "$($_.IdentityReference.Value)" } | Select-Object -Unique)
+                    $nc = @($rules | ForEach-Object { SidName "$($_.IdentityReference.Value)" } | Select-Object -Unique)
+                } catch { }
+                $ewTxt = if ($null -eq $nc) { "udział, NTFS nieodczytany: $($bw -join ', ')" } elseif ($nf.Count) { "udział i NTFS: $($nf -join ', ')" } elseif ($nc.Count) { "udział i NTFS (tworzenie plików): $($nc -join ', ')" } else { "tylko udział: $($bw -join ', ')" }
+            }
             [pscustomobject]@{
                 Name = $sh.Name; Path = $sh.Path; Description = $sh.Description
                 Access = (@($acc | ForEach-Object { "$($_.AccountName): $($_.AccessControlType) $($_.AccessRight)" }) -join '; ')
-                EveryoneWrite = $(if ($ew) { 'Tak' } else { '' })
+                EveryoneWrite = $ewTxt
             }
         }
         if ($accFail.Count) { $errs.Add("Udziały – uprawnienia: $($accWhy[0]); nie odczytano dla $($accFail.Count) udziałów: $((@($accFail) | Select-Object -First 5) -join ', ')$(if ($accFail.Count -gt 5) { ', …' })") }
@@ -1225,7 +1248,8 @@ $Collector = {
     # ── Autostart ──
     $autostart = @(S 'Autostart' 'Autostart' {
         foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
-                       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce') {
+                       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+                       'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run') {
             if (-not (Test-Path $k)) { continue }
             $rk = Get-Item -LiteralPath $k
             foreach ($vn in @($rk.GetValueNames())) {
@@ -1234,11 +1258,39 @@ $Collector = {
         }
         $sf = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
         if (Test-Path $sf) {
-            Get-ChildItem $sf -File -Force | Where-Object Name -ne 'desktop.ini' | ForEach-Object { [pscustomobject]@{ Location = 'Folder Autostart (wszyscy)'; Name = $_.Name; Command = $_.FullName } }
+            # skrót .lnk: cel i argumenty – podmiana celu zmienia klucz porównania (CreateShortcut tylko czyta plik, bez Save nic nie zapisuje)
+            $wsh = $null; try { $wsh = New-Object -ComObject WScript.Shell } catch { }
+            Get-ChildItem $sf -File -Force | Where-Object Name -ne 'desktop.ini' | ForEach-Object {
+                $cmd = $_.FullName
+                if ($wsh -and $_.Extension -eq '.lnk') { try { $lnk = $wsh.CreateShortcut($_.FullName); if ($lnk.TargetPath) { $cmd = "$($lnk.TargetPath) $($lnk.Arguments)".Trim() } } catch { } }
+                [pscustomobject]@{ Location = 'Folder Autostart (wszyscy)'; Name = $_.Name; Command = (Hide-Secret $cmd) }
+            }
         }
         $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         if ($wl.Userinit -and $wl.Userinit -notmatch '^[A-Za-z]:\\Windows\\system32\\userinit\.exe,?$') { [pscustomobject]@{ Location = 'Winlogon'; Name = 'Userinit'; Command = "$($wl.Userinit)" } }
         if ($wl.Shell -and $wl.Shell -ne 'explorer.exe') { [pscustomobject]@{ Location = 'Winlogon'; Name = 'Shell'; Command = "$($wl.Shell)" } }
+        # Rzadziej używane miejsca autostartu całej maszyny (tylko odczyt rejestru): Debugger w Image File Execution Options (uruchamiany
+        # zamiast programu, np. sethc.exe na ekranie logowania), MonitorProcess w SilentProcessExit, AppInit_DLLs (gdy włączone),
+        # polecenia Session Manager przy starcie systemu (poza sprawdzaniem dysków autochk) i pakiety LSA spoza listy domyślnej
+        foreach ($ik in @(@{ K = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'; L = 'IFEO (Debugger)'; V = 'Debugger' }, @{ K = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'; L = 'IFEO 32-bit (Debugger)'; V = 'Debugger' }, @{ K = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit'; L = 'SilentProcessExit (MonitorProcess)'; V = 'MonitorProcess' })) {
+            foreach ($sk in @(Get-ChildItem -LiteralPath $ik.K -ErrorAction SilentlyContinue)) {
+                $dbg = ''; try { $dbg = "$($sk.GetValue($ik.V))".Trim() } catch { }
+                if ($dbg) { [pscustomobject]@{ Location = $ik.L; Name = $sk.PSChildName; Command = (Hide-Secret $dbg) } }
+            }
+        }
+        foreach ($wk in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
+            $ai = "$(RegV $wk 'AppInit_DLLs')".Trim()
+            if ($ai -and "$(RegV $wk 'LoadAppInit_DLLs')" -eq '1') { [pscustomobject]@{ Location = $(if ($wk -like '*WOW6432Node*') { 'AppInit_DLLs 32-bit' } else { 'AppInit_DLLs' }); Name = 'AppInit_DLLs'; Command = $ai } }
+        }
+        foreach ($vn in 'BootExecute', 'SetupExecute', 'Execute') {
+            foreach ($be in @(RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' $vn)) { if ("$be".Trim() -and "$be" -notmatch '^\s*autocheck\s+autochk\b') { [pscustomobject]@{ Location = 'Session Manager'; Name = $vn; Command = "$be".Trim() } } }
+        }
+        $lsaDef = 'msv1_0', 'scecli', 'rassfm', 'kerberos', 'schannel', 'wdigest', 'tspkg', 'pku2u', 'cloudap', 'negoexts', 'livessp'
+        foreach ($lp in @(@{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; V = 'Authentication Packages' }, @{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; V = 'Notification Packages' }, @{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; V = 'Security Packages' }, @{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig'; V = 'Security Packages' })) {
+            foreach ($pk in @(@(RegV $lp.K $lp.V) | ForEach-Object { "$_" -split '[\s,]+' } | ForEach-Object { $_.Trim('"') } | Where-Object { $_ -and $lsaDef -notcontains $_ } | Select-Object -Unique)) {
+                [pscustomobject]@{ Location = $(if ($lp.K -like '*\OSConfig') { 'LSA (OSConfig)' } else { 'LSA' }); Name = $lp.V; Command = $pk }
+            }
+        }
     })
 
     # ── Certyfikaty ──
@@ -3324,13 +3376,13 @@ $script:Headers = @{
     Proto = 'Protokół'; Port = 'Port'; Address = 'Adres'; Scope = 'Nasłuch na'; Process = 'Proces'; Service = 'Usługa'; PID = 'PID'
     Direction = 'Kierunek'; Remote = 'Adres zdalny'; RemotePort = 'Port zdalny'; LocalPort = 'Port lokalny'; Network = 'Sieć'; Count = 'Liczba'
     Name = 'Nazwa'; DisplayName = 'Nazwa wyświetlana'; State = 'Stan'; StartMode = 'Uruchamianie'; Account = 'Konto'; Vendor = 'Producent'
-    Microsoft = 'Microsoft'; Unquoted = 'Niecytowana ścieżka'; Path = 'Ścieżka'
+    Microsoft = 'Microsoft'; Unquoted = 'Niecytowana ścieżka'; Path = 'Ścieżka'; ExitCode = 'Kod wyjścia'; Trigger = 'Start wyzwalany zdarzeniem'
     RunAs = 'Uruchom jako'; LastRun = 'Ostatnio'; Result = 'Kod'; ResultText = 'Wynik'; Failed = 'Błąd'; NextRun = 'Następne'; Author = 'Autor'; Action = 'Akcja'
     Log = 'Dziennik'; Level = 'Poziom'; Source = 'Źródło'; Id = 'ID'; First = 'Pierwsze'; Last = 'Ostatnie'; Message = 'Komunikat'
     Time = 'Czas'; Type = 'Typ'; Detail = 'Szczegóły'; Event = 'Zdarzenie'; By = 'Wykonał'
     Version = 'Wersja'; Publisher = 'Wydawca'; InstallDate = 'Instalacja'; InstallDays = 'Dni temu'; Arch = 'Arch.'; Location = 'Lokalizacja'
     Group = 'Grupa'; Member = 'Członek'; Enabled = 'Włączone'; LastLogon = 'Ostatnie logowanie'; PasswordLastSet = 'Zmiana hasła'
-    PasswordNeverExpires = 'Hasło nie wygasa'; SID = 'SID'; Access = 'Uprawnienia udziału'; EveryoneWrite = 'Wszyscy: zapis'; Command = 'Polecenie'
+    PasswordNeverExpires = 'Hasło nie wygasa'; SID = 'SID'; Access = 'Uprawnienia udziału'; EveryoneWrite = 'Zapis dla wszystkich'; Command = 'Polecenie'
     Subject = 'Podmiot'; Issuer = 'Wystawca'; NotAfter = 'Ważny do'; DaysLeft = 'Dni do wygaśnięcia'; PrivateKey = 'Klucz prywatny'; Thumbprint = 'Odcisk'; Store = 'Magazyn'
     Folder = 'Folder'; File = 'Plik'; SizeKB = 'Rozmiar [KB]'; Modified = 'Zmodyfikowano'; Executable = 'Wykonywalny'
     UptimeDays = 'Uptime [dni]'; CPU = 'CPU'; MemGB = 'RAM [GB]'; DynamicMem = 'Pamięć dynamiczna'; Gen = 'Generacja'; Replication = 'Replikacja'
@@ -3771,6 +3823,7 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: system i dyski'; Key = 'DiskCritPct';       Type = 'int'; Min = 1; Max = 99;     Label = 'Dysk: krytyczne poniżej [% wolnego]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastDays';     Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: ostrzeżenie, gdy spadnie poniżej progu krytycznego w ciągu [dni]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastCritDays'; Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: krytyczne, gdy zapełni się w ciągu [dni]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'DiskMinFreeGB';     Type = 'int'; Min = 0; Max = 1000000; Label = 'Dysk: krytyczne tylko, gdy wolnego jest też mniej niż [GB] (duże wolumeny; 0 = bez warunku)' }
     @{ Group = 'Progi: system i dyski'; Key = 'RamWarnPct';        Type = 'int'; Min = 1; Max = 100;    Label = 'RAM: ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'CommitWarnPct';     Type = 'int'; Min = 1; Max = 100;    Label = 'Pamięć wirtualna (commit): ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'UptimeWarnDays';    Type = 'int'; Min = 1; Max = 3650;   Label = 'Uptime: ostrzeżenie powyżej [dni]' }
@@ -4055,7 +4108,8 @@ function Invoke-ServerAnalysis {
     $hNow = Get-Date
     foreach ($r in $D.Disks) {
         $msg = "Dysk $($r.Drive) $($r.Label): wolne $($r.FreePct)% ($($r.FreeGB) z $($r.SizeGB) GB)"
-        if ($r.FreePct -lt $C.DiskCritPct) { AddI 'Krytyczny' 'Dyski' $msg 'Disks'; SetFlag $r 'crit' }
+        # duży wolumen (ustawienie DiskMinFreeGB): mimo niskiego procentu zostaje dużo miejsca – ostrzeżenie zamiast problemu krytycznego
+        if ($r.FreePct -lt $C.DiskCritPct -and -not ([int]$C.DiskMinFreeGB -gt 0 -and [double]$r.FreeGB -ge [int]$C.DiskMinFreeGB)) { AddI 'Krytyczny' 'Dyski' $msg 'Disks'; SetFlag $r 'crit' }
         elseif ($r.FreePct -lt $C.DiskWarnPct) { AddI 'Ostrzeżenie' 'Dyski' $msg 'Disks'; SetFlag $r 'warn' }
         $full = ''; $rate = ''
         $pts = @($dHist["$($r.Drive)".ToLowerInvariant()] | Where-Object { $_ })
@@ -4089,20 +4143,29 @@ function Invoke-ServerAnalysis {
     }
 
     # Usługi
+    # Program lub skrypt w folderze, w którym zwykli użytkownicy mogą tworzyć pliki (Temp, Users\Public, PerfLogs) – podłożenie pliku
+    # (np. biblioteki DLL obok programu) daje uprawnienia konta usługi/zadania. AppData poza Temp pominięte (aktualizatory na RDS).
+    $wrRx = '(?i)(?:^|[\s"''=,;(])(?:[a-z]:\\(?:temp|tmp|perflogs|users\\public|windows\\temp)|%(?:temp|tmp|public)%|[a-z]:\\users\\[^\\"]+\\appdata\\local\\temp|%localappdata%\\temp)\\[^"|<>]*?\.(?:exe|dll|com|scr|cpl|ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|hta|msi|jar|py)(?=$|[\s"'',;|)])'
     foreach ($r in $D.Services) {
         if ($r.StartMode -like 'Auto*' -and $r.State -ne 'Running') {
             $ignored = $false
             foreach ($p in $C.IgnoredStoppedServices) { if ($r.Name -like $p) { $ignored = $true; break } }
-            if (-not $ignored) { AddI 'Ostrzeżenie' 'Usługi' "Usługa automatyczna zatrzymana: $($r.DisplayName) ($($r.Name))" 'Services'; SetFlag $r 'warn' }
+            # start wyzwalany zdarzeniem (Trigger Start) z kodem 0 albo 1077: usługa sama kończy pracę i wraca przy zdarzeniu – stan normalny
+            $ecTxt = "$($r.PSObject.Properties['ExitCode'].Value)"
+            if ("$($r.PSObject.Properties['Trigger'].Value)" -eq 'Tak' -and $ecTxt -in '0', '1077') { $ignored = $true }
+            $ecNote = switch -regex ($ecTxt) { '^0?$' { '' } '^1067$' { ' – proces usługi zakończył się nieoczekiwanie (kod wyjścia 1067)' } '^1066/' { " – usługa zgłosiła własny błąd (kod wyjścia $ecTxt)" } '^1077$' { ' – nie była uruchamiana od startu systemu (kod wyjścia 1077)' } default { " (kod wyjścia $ecTxt)" } }
+            if (-not $ignored) { AddI 'Ostrzeżenie' 'Usługi' "Usługa automatyczna zatrzymana: $($r.DisplayName) ($($r.Name))$ecNote" 'Services'; SetFlag $r 'warn' }
         }
         # w C:\Program Files i C:\Windows zwykły użytkownik domyślnie nie utworzy pliku – takie ścieżki są tylko zaleceniem w Konfiguracji bezpieczeństwa
         if ($r.Unquoted -eq 'Tak' -and "$($r.Path)" -match '^\s*c:\\(Program Files( \(x86\))?|Windows)\\') { SetFlag $r 'info' }
         elseif ($r.Unquoted -eq 'Tak') { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Niecytowana ścieżka usługi ze spacjami: $($r.Name) – $($r.Path)" 'Services'; SetFlag $r 'warn' }
+        if ("$($r.Path)" -match $wrRx) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Usługa $($r.Name) (konto $($r.Account)) uruchamia plik z folderu, w którym zwykli użytkownicy mogą tworzyć pliki: $(Get-ShortText $r.Path 150)" 'Services'; SetFlag $r 'warn' }
     }
 
     # Zadania
     foreach ($r in $D.Tasks) {
         if ($r.Failed -eq 'Tak') { AddI 'Ostrzeżenie' 'Harmonogram' "Zadanie $($r.Path): $($r.ResultText) ($($r.Result)), ostatnio $($r.LastRun)" 'Tasks'; SetFlag $r 'warn' }
+        if ("$($r.Action)" -match $wrRx) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Zadanie $($r.Path) (konto $($r.RunAs)) uruchamia plik z folderu, w którym zwykli użytkownicy mogą tworzyć pliki: $(Get-ShortText $r.Action 150)" 'Tasks'; SetFlag $r 'warn' }
     }
     # Konta domenowe usług i zadań („konto|usługa X”): lekka lista, która przetrwa New-SlimData (Services i Tasks to HeavyKeys) –
     # Update-VmIndex porównuje ją z kontami uprzywilejowanymi domeny. Kopia lekka nie ma już tych sekcji, więc listy nie nadpisujemy.
@@ -4110,6 +4173,17 @@ function Invoke-ServerAnalysis {
         $ra = @(@($D.Services | Where-Object { $_ } | ForEach-Object { "$($_.Account)|usługa $($_.Name)" }) + @($D.Tasks | Where-Object { $_ } | ForEach-Object { "$($_.RunAs)|zadanie $($_.Path)" }) | Where-Object { $_ -match '^[^|]*[\\@][^|]*\|' -and $_ -notmatch '^(\.|NT AUTHORITY|NT SERVICE|BUILTIN|IIS APPPOOL|NT VIRTUAL MACHINE)\\' } | Sort-Object -Unique)
         $D | Add-Member -NotePropertyName _RunAs -NotePropertyValue ([string[]]$ra) -Force
     }
+
+    # Autostart: Debugger IFEO dla programów dostępnych z ekranu logowania = znany backdoor (SYSTEM bez logowania, także przez RDP);
+    # pozostałe wpisy w rzadziej używanych miejscach – jedna informacja; polecenia z folderów zapisywalnych dla użytkowników
+    $oddAuto = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $D.Autostart) {
+        $loc = "$($r.Location)"
+        if ($loc -like 'IFEO*' -and "$($r.Name)" -in 'sethc.exe', 'utilman.exe', 'osk.exe', 'narrator.exe', 'magnify.exe', 'displayswitch.exe', 'atbroker.exe') { AddI 'Krytyczny' 'Bezpieczeństwo' "Debugger IFEO dla $($r.Name): $(Get-ShortText $r.Command 120) – uruchamia się zamiast tego programu z ekranu logowania (także RDP), z uprawnieniami SYSTEM i bez logowania" 'Autostart'; SetFlag $r 'crit' }
+        elseif ($loc -match '^(IFEO|SilentProcessExit|AppInit_DLLs|Session Manager|LSA)') { $oddAuto.Add("$loc $($r.Name): $(Get-ShortText $r.Command 60)"); SetFlag $r 'info' }
+        if ("$($r.Command)" -match $wrRx) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Autostart $($r.Name) ($loc) uruchamia plik z folderu, w którym zwykli użytkownicy mogą tworzyć pliki: $(Get-ShortText $r.Command 150)" 'Autostart'; SetFlag $r 'warn' }
+    }
+    if ($oddAuto.Count) { AddI 'Info' 'Bezpieczeństwo' "Wpisy w rzadziej używanych miejscach autostartu (IFEO, AppInit_DLLs, Session Manager, pakiety LSA) – sprawdź, czy są znane: $(Join-Short $oddAuto 3)" 'Autostart' }
 
     # Zdarzenia
     # Kernel-Power 41 i EventLog 6008 omawia sekcja Restarty (jeden problem na serwer zamiast kilku)
@@ -4123,6 +4197,18 @@ function Invoke-ServerAnalysis {
         $top   = $errRows | Sort-Object Count -Descending | Select-Object -First 1
         AddI 'Info' 'Zdarzenia' "$total błędów ($($errRows.Count) rodzajów) w System/Application z $days dni; najczęstszy: $($top.Source) ID $($top.Id) ×$($top.Count)" 'Events'
         foreach ($r in $errRows) { if ($r.Count -ge 20) { SetFlag $r 'info' } }
+    }
+    # Nieudane instalacje aktualizacji (WindowsUpdateClient 20) – przyczyna braku poprawek wprost. Bez problemu: poprawka zainstalowana
+    # później (KB na liście zainstalowanych) i definicje Defendera (wiek sygnatur ocenia Konfiguracja bezpieczeństwa)
+    foreach ($r in @($D.Events | Where-Object { "$($_.Source)" -eq 'Microsoft-Windows-WindowsUpdateClient' -and "$($_.Id)" -eq '20' })) {
+        $wuMsg = "$($r.Message)"
+        $wuKb = [regex]::Match($wuMsg, '(?i)\bKB\d{6,8}\b').Value.ToUpperInvariant()
+        $wuCode = [regex]::Match($wuMsg, '0x[0-9A-Fa-f]{8}').Value
+        $wuTitle = if ($wuCode) { $wuMsg.Substring($wuMsg.IndexOf($wuCode) + $wuCode.Length) -replace '^[\s:.]+', '' } else { '' }
+        if (-not $wuTitle) { $wuTitle = $wuMsg }
+        if (($wuKb -and $s -and ",$($s.PSObject.Properties['HotFixIds'].Value)," -like "*,$wuKb,*") -or $wuKb -in 'KB2267602', 'KB2461484', 'KB915597') { SetFlag $r 'info'; continue }
+        AddI 'Ostrzeżenie' 'Aktualizacje' "Nieudane instalacje aktualizacji ×$($r.Count) w $days dni, ostatnia $($r.Last)$(if ($wuCode) { " z błędem $wuCode" }): $(Get-ShortText $wuTitle 150)" 'Events'
+        SetFlag $r 'warn'
     }
 
     # Restarty
@@ -4226,7 +4312,18 @@ function Invoke-ServerAnalysis {
     if ($pne.Count) { AddI 'Info' 'Konta' ("Włączone konta lokalne z hasłem bez wygasania: " + (Join-Short ($pne | ForEach-Object { $_.Name }) 5)) 'LocalUsers' }
 
     # Udziały, certyfikaty, foldery
-    foreach ($r in $D.Shares) { if ($r.EveryoneWrite -eq 'Tak') { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): Wszyscy mają zapis na poziomie udziału – sprawdź NTFS" 'Shares'; SetFlag $r 'info' } }
+    # Zapis dla grup obejmujących wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy, Użytkownicy domeny…): na poziomie udziału
+    # i w NTFS folderu głównego. Sam udział z „Wszyscy: pełna kontrola” przy zamkniętym NTFS to typowa, poprawna konfiguracja.
+    $shCreate = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $D.Shares) {
+        $ew = "$($r.EveryoneWrite)"; $ewWho = $ew -replace '^[^:]*:\s*', ''
+        if ($ew -like 'udział i NTFS: *') { AddI 'Ostrzeżenie' 'Udziały' "Udział $($r.Name) ($($r.Path)): zapis dla wszystkich na poziomie udziału i NTFS ($ewWho) – każdy użytkownik może zmieniać, usuwać i szyfrować pliki" 'Shares'; SetFlag $r 'warn' }
+        elseif ($ew -like 'udział i NTFS (tworzenie plików)*') { $shCreate.Add("$($r.Name) ($ewWho)"); SetFlag $r 'info' }
+        elseif ($ew -like 'tylko udział*') { SetFlag $r 'info' }
+        elseif ($ew -eq 'Tak') { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): Wszyscy mają zapis na poziomie udziału – sprawdź NTFS" 'Shares'; SetFlag $r 'info' }   # migawki sprzed sprawdzania NTFS
+        elseif ($ew) { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): zapis dla wszystkich na poziomie udziału ($ewWho), nie udało się odczytać uprawnień NTFS – sprawdź NTFS" 'Shares'; SetFlag $r 'info' }
+    }
+    if ($shCreate.Count) { AddI 'Info' 'Udziały' "Udziały, w których każdy użytkownik może tworzyć nowe pliki i foldery (bez zmiany cudzych plików): $(Join-Short $shCreate 4)" 'Shares' }
     # Po ręcznym odnowieniu stary certyfikat zostaje w magazynie obok nowego – najdłuższa ważność wg podmiotu i wystawcy
     # (bez pustych podmiotów: np. certyfikaty DC z samym SAN z różnych szablonów nie są swoimi następcami)
     $certBest = @{}
@@ -4512,6 +4609,23 @@ function Invoke-ServerAnalysis {
         AddI 'Ostrzeżenie' 'Sieć' ("Karta w profilu sieci Publicznym ($(Join-Short ($pubNics | ForEach-Object { $_.Adapter }) 3)), a zapora wpuszcza porty wrażliwe z dowolnego adresu: " + (Join-Short ($expo | ForEach-Object { "$($_.Ports) ($($_.Rule))" }) 4)) 'Exposure'
         foreach ($r in $expo) { SetFlag $r 'warn' }
     } else { foreach ($r in $expo) { SetFlag $r 'info' } }
+    # Konfiguracja działających kart sieciowych. Karty USB do kontrolera zarządzania (iDRAC, XCC: Remote NDIS) i karta klastra mają
+    # z założenia adresy 169.254.x.x – pomijane. 168.63.129.16 to wewnętrzny DNS Azure.
+    $nicUp = @($D.Network | Where-Object { $_ -and "$($_.Status)" -eq 'Up' -and "$($_.Description)" -notmatch 'Remote NDIS|USB|Failover Cluster' })
+    $inDom = $s -and "$($s.DomainRoleId)" -in '1', '3', '4', '5'
+    foreach ($r in $nicUp) {
+        if ("$($r.IPv4)" -match '(^|,\s*)169\.254\.') { AddI 'Ostrzeżenie' 'Sieć' "Karta $($r.Adapter) ma adres APIPA (169.254.x.x) – serwer DHCP nie odpowiada albo adres IP jest w konflikcie z innym urządzeniem" 'Network'; SetFlag $r 'warn' }
+        $pubDns = @("$($r.DNS)" -split ',\s*' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notmatch $privRx -and $_ -ne '168.63.129.16' })
+        if ($inDom -and $pubDns.Count) { AddI 'Ostrzeżenie' 'Sieć' "Karta $($r.Adapter): publiczny serwer DNS ($($pubDns -join ', ')) na serwerze w domenie – nie zna stref domeny; gdy klient DNS przełączy się na niego, serwer przestanie znajdować kontrolery domeny (logowanie, GPO, Kerberos)" 'Network'; SetFlag $r 'warn' }
+        elseif ($r.Gateway -and -not "$($r.DNS)".Trim()) { AddI 'Info' 'Sieć' "Karta $($r.Adapter) ma bramę domyślną, ale nie ma serwerów DNS" 'Network'; SetFlag $r 'info' }
+        # maszyny wirtualne pomijane (starsza emulowana karta Hyper-V zgłasza 100 Mb/s); karta bez bramy to zwykle sieć zarządzania – informacja
+        if ($s -and $s.IsVirtual -eq $false -and "$($r.Speed)" -match '^(10|100) Mbps$') {
+            $sv = if ($r.Gateway) { 'Ostrzeżenie' } else { 'Info' }
+            AddI $sv 'Sieć' "Karta $($r.Adapter) pracuje z prędkością $($r.Speed) – sprawdź kabel, port przełącznika i autonegocjację" 'Network'; SetFlag $r $(if ($r.Gateway) { 'warn' } else { 'info' })
+        }
+    }
+    $gwNics = @($nicUp | Where-Object { $_.Gateway })
+    if ($gwNics.Count -gt 1) { AddI 'Info' 'Sieć' "Brama domyślna ustawiona na $($gwNics.Count) kartach ($(Join-Short ($gwNics | ForEach-Object { $_.Adapter }) 3)) – odpowiedzi mogą wychodzić inną kartą niż przyszło zapytanie (routing asymetryczny); bramę zwykle ustawia się na jednej karcie" 'Network'; foreach ($r in $gwNics) { SetFlag $r 'info' } }
 
     # Mechanizmy trwałości
     $ign = @($C.IgnoredWmiConsumers)
