@@ -4389,9 +4389,32 @@ function Test-LinuxGuest([string]$Name) {
 # Motyw (ciemny, spójny z AD-ManagerDiamond / Domain Ops). New-UiElement wstrzykuje go do zasobów każdego okna.
 $script:ThemeXaml = @'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:sys="clr-namespace:System;assembly=mscorlib">
   <SolidColorBrush x:Key="Muted" Color="#8791A5"/>
-  <SolidColorBrush x:Key="Faint" Color="#5E6779"/>
+  <!-- podpowiedzi i opisy: kontrast ok. 4,6–5:1 na tłach okna i kart (wcześniej #5E6779, ok. 3:1) -->
+  <SolidColorBrush x:Key="Faint" Color="#7B8496"/>
+  <!-- minimalna długość suwaka paska przewijania: Track bierze połowę tej wartości (domyślnie ok. 8 px) -->
+  <sys:Double x:Key="{x:Static SystemParameters.VerticalScrollBarButtonHeightKey}">44</sys:Double>
+  <sys:Double x:Key="{x:Static SystemParameters.HorizontalScrollBarButtonWidthKey}">44</sys:Double>
+  <!-- obwódka fokusu klawiatury (FocusVisualStyle – tylko przy nawigacji klawiaturą, bez zmiany rozmiaru kontrolki) -->
+  <Style x:Key="FocusRing">
+    <Setter Property="Control.Template">
+      <Setter.Value>
+        <ControlTemplate>
+          <Border CornerRadius="7" BorderThickness="1" BorderBrush="#4C7DF0" Margin="-1" SnapsToDevicePixels="True"/>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style x:Key="FocusRingPill">
+    <Setter Property="Control.Template">
+      <Setter.Value>
+        <ControlTemplate>
+          <Border CornerRadius="11" BorderThickness="1" BorderBrush="#4C7DF0" Margin="-1" SnapsToDevicePixels="True"/>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
 
   <Style x:Key="Card" TargetType="Border">
     <Setter Property="Background" Value="#161B22"/>
@@ -4405,6 +4428,15 @@ $script:ThemeXaml = @'
     <Style.Triggers>
       <Trigger Property="IsMouseOver" Value="True"><Setter Property="BorderBrush" Value="#2F4478"/></Trigger>
     </Style.Triggers>
+  </Style>
+  <!-- podpis kafelka: w wąskim oknie wielokropek zamiast ucięcia w pół słowa -->
+  <Style x:Key="TileLabel" TargetType="TextBlock">
+    <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+    <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+  </Style>
+  <!-- kafelek bez własnej podpowiedzi: pełny podpis w podpowiedzi -->
+  <Style x:Key="TileLabelTip" TargetType="TextBlock" BasedOn="{StaticResource TileLabel}">
+    <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}"/>
   </Style>
   <Style x:Key="SegmentHost" TargetType="Border">
     <Setter Property="Background" Value="#161B22"/>
@@ -4423,8 +4455,22 @@ $script:ThemeXaml = @'
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="Thumb">
-          <Border CornerRadius="4" Background="#39414F"/>
+          <Border x:Name="t" CornerRadius="4" Background="#39414F"/>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="t" Property="Background" Value="#4A5465"/></Trigger>
+            <Trigger Property="IsDragging" Value="True"><Setter TargetName="t" Property="Background" Value="#566176"/></Trigger>
+          </ControlTemplate.Triggers>
         </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <!-- pusty tor nad i pod suwakiem: kliknięcie przewija o stronę -->
+  <Style x:Key="ScrollPage" TargetType="RepeatButton">
+    <Setter Property="Focusable" Value="False"/>
+    <Setter Property="IsTabStop" Value="False"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate>
       </Setter.Value>
     </Setter>
   </Style>
@@ -4437,6 +4483,8 @@ $script:ThemeXaml = @'
         <ControlTemplate TargetType="ScrollBar">
           <Grid Background="Transparent">
             <Track x:Name="PART_Track" IsDirectionReversed="True">
+              <Track.DecreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageUpCommand}"/></Track.DecreaseRepeatButton>
+              <Track.IncreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageDownCommand}"/></Track.IncreaseRepeatButton>
               <Track.Thumb><Thumb Style="{StaticResource ScrollThumb}" Margin="2"/></Track.Thumb>
             </Track>
           </Grid>
@@ -4454,6 +4502,8 @@ $script:ThemeXaml = @'
             <ControlTemplate TargetType="ScrollBar">
               <Grid Background="Transparent">
                 <Track x:Name="PART_Track" IsDirectionReversed="False">
+                  <Track.DecreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageLeftCommand}"/></Track.DecreaseRepeatButton>
+                  <Track.IncreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageRightCommand}"/></Track.IncreaseRepeatButton>
                   <Track.Thumb><Thumb Style="{StaticResource ScrollThumb}" Margin="2"/></Track.Thumb>
                 </Track>
               </Grid>
@@ -4545,7 +4595,7 @@ $script:ThemeXaml = @'
                   BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7">
             <Grid Margin="{TemplateBinding Padding}">
               <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-              <TextBlock x:Name="wm" Text="{TemplateBinding Tag}" Foreground="#5E6779" Margin="2,0,0,0"
+              <TextBlock x:Name="wm" Text="{TemplateBinding Tag}" Foreground="#6E778A" Margin="2,0,0,0"
                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}" IsHitTestVisible="False" Visibility="Collapsed"/>
             </Grid>
           </Border>
@@ -4595,7 +4645,7 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#8791A5"/>
     <Setter Property="Padding" Value="14,5"/>
     <Setter Property="Cursor" Value="Hand"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="RadioButton">
@@ -4618,7 +4668,7 @@ $script:ThemeXaml = @'
     <Setter Property="FontSize" Value="11.5"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="Margin" Value="0,0,5,5"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRingPill}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="RadioButton">
@@ -4641,7 +4691,7 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#D5DAE3"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="VerticalAlignment" Value="Center"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="CheckBox">
@@ -4676,7 +4726,7 @@ $script:ThemeXaml = @'
     <Setter Property="Margin" Value="0,1"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="ListBoxItem">
@@ -4721,6 +4771,57 @@ $script:ThemeXaml = @'
     </Setter>
   </Style>
 
+  <!-- Nagłówek kolumny tabeli: własny szablon, bo przy ustawionym tle i ramce domyślny (DataGridHeaderBorder) nie rysuje strzałki sortowania -->
+  <Style x:Key="GridHeaderGripper" TargetType="Thumb">
+    <Setter Property="Width" Value="8"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Cursor" Value="SizeWE"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Thumb"><Border Background="{TemplateBinding Background}"/></ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style x:Key="GridHeader" TargetType="DataGridColumnHeader">
+    <Setter Property="Background" Value="#1B212A"/>
+    <Setter Property="Foreground" Value="#8791A5"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="Padding" Value="10,8"/>
+    <Setter Property="BorderBrush" Value="#252C38"/>
+    <Setter Property="BorderThickness" Value="0,0,1,1"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="DataGridColumnHeader">
+          <Grid>
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+              <DockPanel>
+                <Path x:Name="arrow" DockPanel.Dock="Right" Width="8" Height="5" Margin="6,0,0,0" Stretch="Fill" Fill="#8CB0FF" VerticalAlignment="Center" Visibility="Collapsed" Data="M0,5 L4,0 L8,5 Z"/>
+                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" RecognizesAccessKey="True" SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+              </DockPanel>
+            </Border>
+            <Thumb x:Name="PART_LeftHeaderGripper" HorizontalAlignment="Left" Style="{StaticResource GridHeaderGripper}"/>
+            <Thumb x:Name="PART_RightHeaderGripper" HorizontalAlignment="Right" Style="{StaticResource GridHeaderGripper}"/>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="SortDirection" Value="Ascending"><Setter TargetName="arrow" Property="Visibility" Value="Visible"/></Trigger>
+            <Trigger Property="SortDirection" Value="Descending">
+              <Setter TargetName="arrow" Property="Visibility" Value="Visible"/>
+              <Setter TargetName="arrow" Property="Data" Value="M0,0 L8,0 L4,5 Z"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <!-- tabele z sortowaniem (Invoke-GridSort); bez sortowania (np. Wyciszone problemy) – sam GridHeader -->
+  <Style x:Key="SortGridHeader" TargetType="DataGridColumnHeader" BasedOn="{StaticResource GridHeader}">
+    <Setter Property="ToolTip" Value="Kliknij, aby sortować: rosnąco → malejąco → bez sortowania. Shift+klik dodaje kolejną kolumnę."/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="#C9D0DC"/></Trigger>
+    </Style.Triggers>
+  </Style>
   <Style x:Key="DarkGrid" TargetType="DataGrid">
     <Style.Resources>
       <SolidColorBrush x:Key="{x:Static SystemColors.ControlBrushKey}" Color="#161B22"/>
@@ -4743,20 +4844,7 @@ $script:ThemeXaml = @'
     <Setter Property="EnableRowVirtualization" Value="True"/>
     <Setter Property="EnableColumnVirtualization" Value="True"/>
     <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
-    <Setter Property="ColumnHeaderStyle">
-      <Setter.Value>
-        <Style TargetType="DataGridColumnHeader">
-          <Setter Property="Background" Value="#1B212A"/>
-          <Setter Property="Foreground" Value="#8791A5"/>
-          <Setter Property="FontWeight" Value="SemiBold"/>
-          <Setter Property="FontSize" Value="12"/>
-          <Setter Property="Padding" Value="10,8"/>
-          <Setter Property="BorderBrush" Value="#252C38"/>
-          <Setter Property="BorderThickness" Value="0,0,1,1"/>
-          <Setter Property="ToolTip" Value="Kliknij, aby sortować: rosnąco → malejąco → bez sortowania. Shift+klik dodaje kolejną kolumnę."/>
-        </Style>
-      </Setter.Value>
-    </Setter>
+    <Setter Property="ColumnHeaderStyle" Value="{StaticResource SortGridHeader}"/>
     <Setter Property="CellStyle">
       <Setter.Value>
         <Style TargetType="DataGridCell">
@@ -4887,43 +4975,49 @@ $script:MainXaml = @'
     <Border Grid.Row="0" Background="#12171D" BorderBrush="#1E242E" BorderThickness="0,0,0,1" Padding="16,10">
       <Grid>
         <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-          <Border Width="36" Height="36" CornerRadius="10">
-            <Border.Background>
-              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-                <GradientStop Color="#4C7DF0" Offset="0"/>
-                <GradientStop Color="#2FB38A" Offset="1"/>
-              </LinearGradientBrush>
-            </Border.Background>
-            <TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="17" Foreground="White" HorizontalAlignment="Center"/>
-          </Border>
-          <StackPanel Margin="11,0,0,0" VerticalAlignment="Center">
-            <StackPanel Orientation="Horizontal">
-              <TextBlock Text="Przegląd serwerów" FontSize="15" FontWeight="SemiBold" Foreground="White"/>
-              <TextBlock x:Name="txtVersion" Foreground="#5E6779" FontSize="11" Margin="7,3,0,0"/>
+        <!-- Wąskie okno (1366 px albo 1920 px przy 150 %): skraca się tytuł i podtytuł (wielokropek), przełącznik widoków i przyciski z prawej zostają.
+             Grid z HorizontalAlignment=Left: kolumna * dostaje szerokość tytułu, więc przełącznik stoi tuż za nim jak dotąd. -->
+        <Grid HorizontalAlignment="Left">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <DockPanel VerticalAlignment="Center">
+            <Border DockPanel.Dock="Left" Width="36" Height="36" CornerRadius="10">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                  <GradientStop Color="#4C7DF0" Offset="0"/>
+                  <GradientStop Color="#2FB38A" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+              <TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="17" Foreground="White" HorizontalAlignment="Center"/>
+            </Border>
+            <StackPanel Margin="11,0,0,0" VerticalAlignment="Center">
+              <DockPanel>
+                <TextBlock DockPanel.Dock="Left" Text="Przegląd serwerów" FontSize="15" FontWeight="SemiBold" Foreground="White" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtVersion" Foreground="{StaticResource Faint}" FontSize="11" Margin="7,3,0,0" TextTrimming="CharacterEllipsis"/>
+              </DockPanel>
+              <TextBlock x:Name="txtSubtitle" Foreground="#7B8496" FontSize="11.5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
             </StackPanel>
-            <TextBlock x:Name="txtSubtitle" Foreground="#7B8496" FontSize="11.5"/>
-          </StackPanel>
-        </StackPanel>
-        <Border Grid.Column="1" Style="{StaticResource SegmentHost}" Margin="28,0,0,0" VerticalAlignment="Center">
-          <StackPanel Orientation="Horizontal">
-            <RadioButton x:Name="rbOverview" GroupName="view" IsChecked="True" ToolTip="Wszystkie serwery (Ctrl+1)">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE80F;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Wszystkie serwery"/></StackPanel>
-            </RadioButton>
-            <RadioButton x:Name="rbVms" GroupName="view" ToolTip="Hosty i maszyny wirtualne Hyper-V ze wszystkich hostów (Ctrl+2)">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE8FD;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Hyper-V"/></StackPanel>
-            </RadioButton>
-            <RadioButton x:Name="rbServer" GroupName="view" ToolTip="Szczegóły wybranego serwera (Ctrl+3)">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Szczegóły serwera"/></StackPanel>
-            </RadioButton>
-          </StackPanel>
-        </Border>
-        <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+          </DockPanel>
+          <Border Grid.Column="1" Style="{StaticResource SegmentHost}" Margin="28,0,0,0" VerticalAlignment="Center">
+            <StackPanel Orientation="Horizontal">
+              <RadioButton x:Name="rbOverview" GroupName="view" IsChecked="True" ToolTip="Wszystkie serwery (Ctrl+1)">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE80F;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Wszystkie serwery"/></StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="rbVms" GroupName="view" ToolTip="Hosty i maszyny wirtualne Hyper-V ze wszystkich hostów (Ctrl+2)">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE8FD;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Hyper-V"/></StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="rbServer" GroupName="view" ToolTip="Szczegóły wybranego serwera (Ctrl+3)">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Szczegóły serwera"/></StackPanel>
+              </RadioButton>
+            </StackPanel>
+          </Border>
+        </Grid>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
           <TextBlock Text="Zdarzenia z" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,7,0"/>
           <TextBox x:Name="txtDays" Width="44" TextAlignment="Center" Padding="4,5" ToolTip="Zakres zdarzeń tylko dla bieżącego skanu (1–180 dni); domyślny – w Ustawieniach"/>
           <TextBlock Text="dni" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="7,0,10,0"/>
@@ -4933,7 +5027,7 @@ $script:MainXaml = @'
                 <TextBlock Style="{StaticResource Glyph}" Text="&#xE77B;" FontSize="12" Foreground="#8CB0FF" HorizontalAlignment="Center"/>
               </Border>
               <StackPanel VerticalAlignment="Center">
-                <TextBlock x:Name="txtCredUser" Foreground="#E4E8EF" FontSize="12.5"/>
+                <TextBlock x:Name="txtCredUser" Foreground="#E4E8EF" FontSize="12.5" MaxWidth="170" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="txtCredMode" Foreground="#7B8496" FontSize="11"/>
               </StackPanel>
             </StackPanel>
@@ -5012,25 +5106,40 @@ $script:MainXaml = @'
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                   </Grid.ColumnDefinitions>
-                  <Ellipse Width="9" Height="9" Fill="{Binding Color}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                  <!-- serwer bez połączenia: pierścień zamiast kropki (kształt, nie tylko kolor) -->
+                  <Ellipse x:Name="dot" Width="9" Height="9" Fill="{Binding Color}" Stroke="{Binding Color}" StrokeThickness="2" VerticalAlignment="Center" Margin="0,0,10,0"/>
                   <StackPanel Grid.Column="1">
-                    <StackPanel Orientation="Horizontal">
-                      <TextBlock Text="{Binding Display}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                      <Border Background="#1E2A44" CornerRadius="5" Padding="5,0" Margin="6,1,0,0" Visibility="{Binding KindVis}" VerticalAlignment="Center">
+                    <!-- Grid zamiast poziomego StackPanel: nazwa skraca się wielokropkiem, a plakietka HV/VM zostaje tuż za nią -->
+                    <Grid HorizontalAlignment="Left">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Display}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/>
+                      <Border Grid.Column="1" Background="#1E2A44" CornerRadius="5" Padding="5,0" Margin="6,1,0,0" Visibility="{Binding KindVis}" VerticalAlignment="Center">
                         <TextBlock Text="{Binding Kind}" Foreground="#8CB0FF" FontSize="10" FontWeight="SemiBold"/>
                       </Border>
-                    </StackPanel>
-                    <TextBlock Text="{Binding Sub}" Foreground="#8791A5" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                    <TextBlock Text="{Binding Sub}" Foreground="#8791A5" FontSize="11" TextTrimming="CharacterEllipsis" ToolTip="{Binding Sub}"/>
                   </StackPanel>
                   <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Border Background="#2EFF5C6C" CornerRadius="8" Padding="7,1" Margin="4,0,0,0" Visibility="{Binding CritVis}">
-                      <TextBlock Text="{Binding Crit}" Foreground="#FF7A86" FontSize="11" FontWeight="Bold"/>
+                    <Border Background="#2EFF5C6C" CornerRadius="8" Padding="6,1,7,1" Margin="4,0,0,0" Visibility="{Binding CritVis}" ToolTip="Problemy krytyczne">
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource Glyph}" Text="&#xEA39;" FontSize="9" Foreground="#FF7A86" Margin="0,0,3,0"/>
+                        <TextBlock Text="{Binding Crit}" Foreground="#FF7A86" FontSize="11" FontWeight="Bold"/>
+                      </StackPanel>
                     </Border>
-                    <Border Background="#2EFFB547" CornerRadius="8" Padding="7,1" Margin="4,0,0,0" Visibility="{Binding WarnVis}">
-                      <TextBlock Text="{Binding Warn}" Foreground="#FFC46B" FontSize="11" FontWeight="Bold"/>
+                    <Border Background="#2EFFB547" CornerRadius="8" Padding="6,1,7,1" Margin="4,0,0,0" Visibility="{Binding WarnVis}" ToolTip="Ostrzeżenia">
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource Glyph}" Text="&#xE7BA;" FontSize="9" Foreground="#FFC46B" Margin="0,0,3,0"/>
+                        <TextBlock Text="{Binding Warn}" Foreground="#FFC46B" FontSize="11" FontWeight="Bold"/>
+                      </StackPanel>
                     </Border>
                   </StackPanel>
                 </Grid>
+                <DataTemplate.Triggers>
+                  <DataTrigger Binding="{Binding Status}" Value="offline">
+                    <Setter TargetName="dot" Property="Fill" Value="Transparent"/>
+                    <Setter TargetName="dot" Property="ToolTip" Value="Bez połączenia"/>
+                  </DataTrigger>
+                </DataTemplate.Triggers>
               </DataTemplate>
             </ListBox.ItemTemplate>
           </ListBox>
@@ -5051,27 +5160,39 @@ $script:MainXaml = @'
             </Grid.RowDefinitions>
             <UniformGrid Grid.Row="0" Columns="6" Margin="0,0,0,16">
               <Border x:Name="tileTotal" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż wszystkie serwery">
-                <StackPanel><TextBlock Text="Serwery na liście" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tTotal" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Serwery na liście" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tTotal" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileOnline" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Serwery, z których zebrano dane">
-                <StackPanel><TextBlock Text="Odpowiada" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tOnline" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Odpowiada" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tOnline" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileOffline" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż serwery bez połączenia (z diagnozą przyczyny)">
-                <StackPanel><TextBlock Text="Bez połączenia" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tOffline" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Bez połączenia" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tOffline" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileCrit" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż problemy krytyczne">
-                <StackPanel><TextBlock Text="Problemy krytyczne" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tCrit" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FF7A86" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Problemy krytyczne" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tCrit" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FF7A86" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileWarn" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż ostrzeżenia">
-                <StackPanel><TextBlock Text="Ostrzeżenia" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tWarn" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Ostrzeżenia" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tWarn" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileHv" Style="{StaticResource Tile}" ToolTip="Hosty Hyper-V i maszyny wirtualne (działające / wszystkie)">
-                <StackPanel><TextBlock Text="Hyper-V: hosty / VM" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tHv" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#8CB0FF" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Hyper-V: hosty / VM" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tHv" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#8CB0FF" Margin="0,2,0,0"/></StackPanel>
               </Border>
             </UniformGrid>
 
-            <DockPanel Grid.Row="1" Margin="0,0,0,10">
-              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+            <!-- Grid zamiast DockPanel: w wąskim oknie skraca się tytuł z podpowiedzią i pole filtru (do 100 px), a przyciski zostają widoczne -->
+            <Grid Grid.Row="1" Margin="0,0,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*" MinWidth="100" MaxWidth="230"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <DockPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                <TextBlock x:Name="txtIssuesTitle" DockPanel.Dock="Left" Text="Wykryte problemy" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtIssuesCount" DockPanel.Dock="Left" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Text="dwuklik otwiera serwer, prawy klik – wycisz" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+              </DockPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal">
                 <CheckBox x:Name="chkIgnored" Content="Wyciszone" Margin="0,0,12,0" ToolTip="Pokaż problemy wyciszone (prawy klik na problemie – wycisz / przywróć)"/>
                 <Border Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
                   <StackPanel Orientation="Horizontal">
@@ -5081,17 +5202,12 @@ $script:MainXaml = @'
                     <RadioButton x:Name="rbSevInfo" GroupName="sev" Content="Info" Padding="10,4"/>
                   </StackPanel>
                 </Border>
-                <TextBox x:Name="txtIssueFilter" Width="230" Tag="Filtruj problemy (Ctrl+F)"/>
-                <Button x:Name="btnIssuesCsv" Style="{StaticResource GhostButton}" Margin="6,0,0,0" Padding="9,5" ToolTip="Eksport widocznych problemów do CSV">
-                  <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
-                </Button>
               </StackPanel>
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock x:Name="txtIssuesTitle" Text="Wykryte problemy" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock x:Name="txtIssuesCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-                <TextBlock Text="dwuklik otwiera serwer, prawy klik – wycisz" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
-            </DockPanel>
+              <TextBox x:Name="txtIssueFilter" Grid.Column="2" Tag="Filtruj problemy (Ctrl+F)"/>
+              <Button x:Name="btnIssuesCsv" Grid.Column="3" Style="{StaticResource GhostButton}" Margin="6,0,0,0" Padding="9,5" ToolTip="Eksport widocznych problemów do CSV">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
+              </Button>
+            </Grid>
 
             <Border Grid.Row="2" Style="{StaticResource Card}" Padding="1">
               <DockPanel>
@@ -5132,10 +5248,10 @@ $script:MainXaml = @'
                   <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
                 </Button>
               </StackPanel>
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="Stan serwerów" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock Text="dostępność z dziennika – ostatnie 30 dni" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
+              <DockPanel VerticalAlignment="Center">
+                <TextBlock DockPanel.Dock="Left" Text="Stan serwerów" FontSize="15" FontWeight="SemiBold"/>
+                <TextBlock Text="dostępność z dziennika – ostatnie 30 dni" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis"/>
+              </DockPanel>
             </DockPanel>
             <Border Grid.Row="4" Style="{StaticResource Card}" Padding="1">
               <DataGrid x:Name="gridServers" Style="{StaticResource DarkGrid}"/>
@@ -5153,45 +5269,56 @@ $script:MainXaml = @'
             </Grid.RowDefinitions>
             <UniformGrid Grid.Row="0" Columns="6" Margin="0,0,0,16">
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="Hosty Hyper-V" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vHosts" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Hosty Hyper-V" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vHosts" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="Maszyny działające / wszystkie" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vVms" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="VM działające / wszystkie" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vVms" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="vCPU działających maszyn" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vCpu" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="vCPU działających maszyn" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vCpu" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="RAM przydzielony [GB]" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vRam" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="RAM przydzielony [GB]" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vRam" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="Stare checkpointy" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vCheckpoints" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Stare checkpointy" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vCheckpoints" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}">
-                <StackPanel><TextBlock Text="Linux (nie skanujemy)" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vLinux" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#8791A5" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Linux (nie skanujemy)" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vLinux" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#8791A5" Margin="0,2,0,0"/></StackPanel>
               </Border>
             </UniformGrid>
             <DockPanel Grid.Row="1" Margin="0,0,0,10">
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="Hosty i pojemność" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock Text="z ostatniego skanu każdego hosta; dwuklik otwiera host" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
+              <DockPanel VerticalAlignment="Center">
+                <TextBlock DockPanel.Dock="Left" Text="Hosty i pojemność" FontSize="15" FontWeight="SemiBold"/>
+                <TextBlock Text="z ostatniego skanu każdego hosta; dwuklik otwiera host" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+              </DockPanel>
             </DockPanel>
             <Border Grid.Row="2" Style="{StaticResource Card}" Padding="1">
               <DataGrid x:Name="gridHosts" Style="{StaticResource DarkGrid}"/>
             </Border>
-            <DockPanel Grid.Row="3" Margin="0,16,0,10">
-              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-                <Border Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
-                  <StackPanel Orientation="Horizontal">
-                    <RadioButton x:Name="vfAll" GroupName="vf" Content="Wszystkie" IsChecked="True" Padding="10,4"/>
-                    <RadioButton x:Name="vfRunning" GroupName="vf" Content="Działające" Padding="10,4"/>
-                    <RadioButton x:Name="vfOff" GroupName="vf" Content="Wyłączone" Padding="10,4"/>
-                    <RadioButton x:Name="vfProblems" GroupName="vf" Content="Do sprawdzenia" Padding="10,4"/>
-                    <RadioButton x:Name="vfNotListed" GroupName="vf" Content="Spoza listy" Padding="10,4"/>
-                  </StackPanel>
-                </Border>
-                <TextBox x:Name="txtVmFilter" Width="220" Tag="Filtruj maszyny"/>
+            <!-- jak nagłówek „Wykryte problemy”: w wąskim oknie skraca się tytuł i pole filtru, „Dodaj do listy” i CSV zostają widoczne -->
+            <Grid Grid.Row="3" Margin="0,16,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*" MinWidth="80" MaxWidth="220"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <DockPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                <TextBlock DockPanel.Dock="Left" Text="Maszyny wirtualne" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtVmCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis"/>
+              </DockPanel>
+              <Border Grid.Column="1" Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="vfAll" GroupName="vf" Content="Wszystkie" IsChecked="True" Padding="10,4"/>
+                  <RadioButton x:Name="vfRunning" GroupName="vf" Content="Działające" Padding="10,4"/>
+                  <RadioButton x:Name="vfOff" GroupName="vf" Content="Wyłączone" Padding="10,4"/>
+                  <RadioButton x:Name="vfProblems" GroupName="vf" Content="Do sprawdzenia" Padding="10,4"/>
+                  <RadioButton x:Name="vfNotListed" GroupName="vf" Content="Spoza listy" Padding="10,4"/>
+                </StackPanel>
+              </Border>
+              <TextBox x:Name="txtVmFilter" Grid.Column="2" Tag="Filtruj maszyny"/>
+              <StackPanel Grid.Column="3" Orientation="Horizontal">
                 <Button x:Name="btnVmAdd" Style="{StaticResource GhostButton}" Margin="6,0,0,0" Padding="9,5" ToolTip="Dodaj do listy serwerów maszyny Windows spoza listy (zaznaczone albo wszystkie widoczne); Linux jest pomijany">
                   <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE710;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="Dodaj do listy"/></StackPanel>
                 </Button>
@@ -5199,11 +5326,7 @@ $script:MainXaml = @'
                   <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
                 </Button>
               </StackPanel>
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="Maszyny wirtualne" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock x:Name="txtVmCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
-            </DockPanel>
+            </Grid>
             <Border Grid.Row="4" Style="{StaticResource Card}" Padding="1">
               <DataGrid x:Name="gridVms" Style="{StaticResource DarkGrid}"/>
             </Border>
@@ -5326,7 +5449,7 @@ $script:MainXaml = @'
         </Grid.RowDefinitions>
         <Grid Margin="18,6,10,2">
           <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-            <TextBlock Text="DZIENNIK OPERACJI" Foreground="#5E6779" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            <TextBlock Text="DZIENNIK OPERACJI" Foreground="{StaticResource Faint}" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
             <Border Style="{StaticResource SegmentHost}" Padding="2" Margin="14,0,0,0">
               <StackPanel Orientation="Horizontal">
                 <RadioButton x:Name="lfAll" GroupName="lf" Content="Wszystko" IsChecked="True" Padding="8,1" FontSize="11.5"/>
@@ -5358,14 +5481,15 @@ $script:MainXaml = @'
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="62"/>
                   <ColumnDefinition Width="70"/>
-                  <ColumnDefinition Width="Auto" MaxWidth="230"/>
+                  <!-- stała szerokość kolumny modułu: treść wpisów zaczyna się w każdym wierszu w tym samym miejscu -->
+                  <ColumnDefinition Width="88"/>
                   <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
-                <TextBlock Text="{Binding Time}" Foreground="#5E6779" FontFamily="Consolas" VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding Time}" Foreground="{StaticResource Faint}" FontFamily="Consolas" VerticalAlignment="Center"/>
                 <Border x:Name="pill" Grid.Column="1" CornerRadius="8" Padding="7,0" HorizontalAlignment="Left" Background="#1E252F" VerticalAlignment="Center">
                   <TextBlock x:Name="lvl" Text="{Binding Level}" FontSize="10.5" FontWeight="SemiBold" Foreground="#AEB6C4"/>
                 </Border>
-                <TextBlock Grid.Column="2" Text="{Binding Module}" Foreground="#8CB0FF" Margin="0,0,12,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="2" Text="{Binding Module}" Foreground="#8CB0FF" Margin="0,0,12,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" ToolTip="{Binding Module}"/>
                 <TextBlock Grid.Column="3" Text="{Binding Message}" TextWrapping="Wrap" VerticalAlignment="Center"/>
               </Grid>
               <DataTemplate.Triggers>
@@ -5523,7 +5647,7 @@ $script:SettingsXamlText = @'
               </StackPanel>
               <StackPanel>
                 <TextBlock Text="Zakres skanu" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock Text="Odznaczone sekcje nie są zbierane ani porównywane" Foreground="#5E6779" FontSize="11.5" TextWrapping="Wrap"/>
+                <TextBlock Text="Odznaczone sekcje nie są zbierane ani porównywane" Foreground="{StaticResource Faint}" FontSize="11.5" TextWrapping="Wrap"/>
               </StackPanel>
             </DockPanel>
             <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="sSections" Margin="0,0,8,0"/></ScrollViewer>
@@ -5545,7 +5669,7 @@ $script:SettingsXamlText = @'
         <DockPanel>
           <StackPanel DockPanel.Dock="Top" Margin="0,0,0,6">
             <TextBlock Text="Parametry i progi" FontSize="15" FontWeight="SemiBold"/>
-            <TextBlock Text="Pole „Zdarzenia z … dni” w głównym oknie zmienia zakres tylko dla bieżącego skanu" Foreground="#5E6779" FontSize="11.5" TextWrapping="Wrap"/>
+            <TextBlock Text="Pole „Zdarzenia z … dni” w głównym oknie zmienia zakres tylko dla bieżącego skanu" Foreground="{StaticResource Faint}" FontSize="11.5" TextWrapping="Wrap"/>
           </StackPanel>
           <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="sParams" Margin="0,0,10,0"/></ScrollViewer>
         </DockPanel>
@@ -5651,6 +5775,19 @@ function Get-NamedElements($Root, [string]$Xaml) {
     $h
 }
 function Get-Glyph([string]$Code) { if ($Code) { [string][char][Convert]::ToInt32($Code, 16) } else { '' } }
+# Ikony to font Segoe Fluent Icons / Segoe MDL2 Assets (Windows 10 / Server 2016 i nowsze). Bez niego (np. stacja 2012 R2 z WMF 5.1)
+# ikony są puste: przyciski z samą ikoną (dziennik) dostają krótki opis, a w dzienniku pojawia się jedno ostrzeżenie.
+$script:IconFontOk = $null
+$script:GlyphText = @{ E8C8 = 'Kopiuj'; E8E5 = 'Plik'; E838 = 'Folder'; E894 = 'Wyczyść'; E70D = 'Ukryj' }
+function Test-IconFont {
+    if ($null -eq $script:IconFontOk) {
+        $found = $true
+        try { $found = (Test-Path -LiteralPath "$env:windir\Fonts\segmdl2.ttf") -or (Test-Path -LiteralPath "$env:windir\Fonts\SegoeIcons.ttf") -or (@([System.Windows.Media.Fonts]::SystemFontFamilies | Where-Object { $_.Source -in 'Segoe MDL2 Assets', 'Segoe Fluent Icons' }).Count -gt 0) } catch { $found = $true }
+        $script:IconFontOk = [bool]$found
+        if (-not $found) { Write-Log 'Brak fontu ikon Segoe MDL2 Assets / Segoe Fluent Icons (Windows 10 / Server 2016 i nowsze) – ikony w oknach będą puste, przyciski dziennika mają opis tekstowy.' 'WARN' 'Program' }
+    }
+    $script:IconFontOk
+}
 function New-GlyphBlock([string]$Code, [double]$Size = 13, [string]$Color = '') {
     $t = New-Object System.Windows.Controls.TextBlock
     $t.Text = Get-Glyph $Code
@@ -5662,6 +5799,7 @@ function New-GlyphBlock([string]$Code, [double]$Size = 13, [string]$Color = '') 
 }
 function New-IconContent([string]$Text, [string]$Icon, [double]$IconSize = 13) {
     if (-not $Icon) { return $Text }
+    if (-not $Text -and $script:GlyphText[$Icon] -and -not (Test-IconFont)) { return $script:GlyphText[$Icon] }
     $sp = New-Object System.Windows.Controls.StackPanel
     $sp.Orientation = 'Horizontal'
     $g = New-GlyphBlock -Code $Icon -Size $IconSize
@@ -5770,7 +5908,8 @@ function Close-Dialog($Window, [bool]$Ok) {
 }
 function Show-Message([string]$Text, [string]$Title = 'Przegląd serwerów', [ValidateSet('info', 'ok', 'warn', 'crit')][string]$Tone = 'info') {
     if ($script:Headless -or -not $window) { Write-Log "$Title`: $Text" $(if ($Tone -eq 'crit') { 'ERROR' } elseif ($Tone -eq 'warn') { 'WARN' } else { 'INFO' }); return }
-    $body = '<ScrollViewer MaxHeight="420" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="msgText" TextWrapping="Wrap" Foreground="#C9D0DC" LineHeight="19"/></ScrollViewer>'
+    # pole tylko do odczytu zamiast TextBlock: treść (np. błąd AD) da się zaznaczyć i skopiować (Ctrl+A, Ctrl+C)
+    $body = '<TextBox x:Name="msgText" IsReadOnly="True" TextWrapping="Wrap" MaxHeight="420" VerticalScrollBarVisibility="Auto" BorderThickness="0" Background="Transparent" Padding="0" VerticalContentAlignment="Top" Foreground="#C9D0DC" TextBlock.LineHeight="19"/>'
     $w = New-Dialog -Title $Title -Body $body -Tone $Tone -NoCancel -Width 520
     $w.FindName('msgText').Text = $Text
     [void](Invoke-Dialog $w)
@@ -7737,6 +7876,9 @@ function Show-SettingsDialog {
     if ($script:UnlockState.Locked) { Wait-Unlocked }
     Register-IdleActivity -Window $dlg
     $dlg.Owner = $window
+    # jak okno główne: nie większe niż obszar roboczy (1366x768, 150 %), żeby „Zapisz” nie chowało się pod paskiem zadań; obie kolumny się przewijają
+    $wa = [System.Windows.SystemParameters]::WorkArea
+    $dlg.Width = [Math]::Min($dlg.Width, $wa.Width); $dlg.Height = [Math]::Min($dlg.Height, $wa.Height); $dlg.MinWidth = [Math]::Min($dlg.MinWidth, $wa.Width); $dlg.MinHeight = [Math]::Min($dlg.MinHeight, $wa.Height)
     [void]$dlg.ShowDialog()
     if ($script:SetDlg -and $script:SetDlg.Saved) {
         $ui.txtDays.Text = "$($Config.EventDays)"
@@ -7796,7 +7938,7 @@ function Show-IgnoredIssuesDialog {
     $body = @'
 <Grid Height="380">
   <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-  <Border Style="{StaticResource Card}" Padding="1"><DataGrid x:Name="igGrid" Style="{StaticResource DarkGrid}"/></Border>
+  <Border Style="{StaticResource Card}" Padding="1"><DataGrid x:Name="igGrid" Style="{StaticResource DarkGrid}" ColumnHeaderStyle="{StaticResource GridHeader}"/></Border>
   <TextBlock x:Name="igInfo" Grid.Row="1" Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="2,8,0,0"/>
 </Grid>
 '@
@@ -7930,11 +8072,22 @@ function Set-OtherCredential {
     Show-Toast "Konto: $($c.UserName)" 'ok'
 }
 
+function Get-LogMaxHeight {
+    # Najwyższy dziennik, przy którym pasek stanu (postęp, „Przerwij”) zostaje w oknie: wysokość okna minus pasek górny,
+    # minimum widoku głównego, rozdzielacz (5 px) i pasek stanu; 0 – układ jeszcze nie policzony
+    $g = $ui.rootGrid
+    if (-not $g -or $g.ActualHeight -le 0) { return 0 }
+    $rows = $g.RowDefinitions
+    [Math]::Max(90, $g.ActualHeight - $rows[0].ActualHeight - $rows[1].MinHeight - 5 - $rows[4].ActualHeight)
+}
 function Set-LogVisible([bool]$Visible) {
     if (-not $Visible -and $script:UiState.LogVisible -and $ui.logRow.ActualHeight -gt 60) { $script:UiState.LogHeight = [int]$ui.logRow.ActualHeight }
     $script:UiState.LogVisible = $Visible
     if ($Visible) {
-        $ui.logRow.Height = New-Object System.Windows.GridLength ([double][Math]::Max(90, [int]$script:UiState.LogHeight))
+        # zapamiętana wysokość (np. z większego monitora) nie może wypchnąć paska stanu poza okno
+        $h = [double][Math]::Max(90, [int]$script:UiState.LogHeight); $max = Get-LogMaxHeight
+        if ($max -gt 0) { $h = [Math]::Min($h, $max) }
+        $ui.logRow.Height = New-Object System.Windows.GridLength $h
         $ui.logPanel.Visibility = 'Visible'; $ui.logSplitter.Visibility = 'Visible'
         $script:LogUnread = 0; Update-LogBadge
         if ($script:LogItems.Count) { $ui.logList.ScrollIntoView($script:LogItems[$script:LogItems.Count - 1]) }
@@ -7943,6 +8096,8 @@ function Set-LogVisible([bool]$Visible) {
         $ui.logPanel.Visibility = 'Collapsed'; $ui.logSplitter.Visibility = 'Collapsed'
     }
 }
+# zmniejszenie okna przy otwartym dzienniku: dziennik się skraca, pasek stanu zostaje w oknie
+$ui.rootGrid.Add_SizeChanged({ if ($script:UiState.LogVisible) { $m = Get-LogMaxHeight; if ($m -gt 0 -and $ui.logRow.ActualHeight -gt $m) { $ui.logRow.Height = New-Object System.Windows.GridLength ([double]$m) } } })
 function Update-LogFilter {
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:LogItems)
     $t = $ui.txtLogFilter.Text.Trim().ToLowerInvariant()
