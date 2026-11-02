@@ -2768,9 +2768,9 @@ function Invoke-ConnectionDiagnostics {
     if ($class -eq 'TrustedHosts' -and -not $isIp) {
         # ten sam błąd WinRM dla serwera dodanego po nazwie: spoza domeny stacji (albo stacja poza domeną) – uwierzytelnianie inne niż Kerberos
         $cause = 'Serwer spoza domeny stacji (albo bez relacji zaufania) – logowanie inne niż Kerberos (NTLM, konto lokalne serwera) wymaga wpisu nazwy serwera w TrustedHosts stacji i jawnego konta'
-        $remedy = "Na stacji (jako administrator): Set-Item WSMan:\localhost\Client\TrustedHosts -Value $Target -Concatenate i wybierz konto przyciskiem „Konto”."
+        $remedy = "Na stacji (jako administrator): Set-Item WSMan:\localhost\Client\TrustedHosts -Value $Target -Concatenate i wybierz konto przyciskiem " + '„Konto”.'
     }
-    if ($class -eq 'TrustedHosts' -and $inTh) { $remedy = "$Target jest już na liście TrustedHosts stacji – wybierz jawne konto przyciskiem „Konto” (konto lokalne serwera albo konto jego domeny)." }
+    if ($class -eq 'TrustedHosts' -and $inTh) { $remedy = "$Target jest już na liście TrustedHosts stacji – wybierz jawne konto przyciskiem " + '„Konto” (konto lokalne serwera albo konto jego domeny).' }
     if ($class -in 'Timeout', 'Remote' -and $ErrorId -match '^(SrTimeout|CollectorFatal)' -and $alive) { }
     elseif (-not $isIp -and -not $dnsOk) {
         $class = 'Dns'; $cause = 'Nazwa serwera nie jest rozwiązywana w DNS'
