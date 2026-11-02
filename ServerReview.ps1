@@ -246,13 +246,40 @@ $Collector = {
     # Hasła podane w linii poleceń (usługi, zadania, autostart, WMI) nie trafiają do migawek, raportów ani CSV
     function Hide-Secret([string]$s) {
         if (-not $s) { return $s }
-        $s = [regex]::Replace($s, '(?i)((?:^|\s)[-/](?:p|pw|pwd|pass|passwd|password|secret|token|apikey)(?::|=|\s+))(?!\d)("[^"]*"|\S+)', '$1***')
-        [regex]::Replace($s, '(?i)((?:password|passwd|pwd|secret|token|apikey)\s*=\s*)("[^"]*"|[^;\s"]+)', '$1***')
+        # hasło doklejone do -p (mysql, mysqldump, 7-Zip, RAR: -pHASLO; samo -p to pytanie o hasło)
+        $s = [regex]::Replace($s, '(?i)(\b(?:mysql\w*|7z[ar]?|(?:un|win)?rar)(?:\.exe)?"?\s(?:[^|]*?\s)?(?-i:-p))(?!\s)("[^"]*"|\S+)', '$1***')
+        # przełącznik z hasłem (-P x, --password x, /rp x, -SqlPassword x, --client-secret x); -p z numerem portu, kolejnym przełącznikiem, ścieżką albo /p:Nazwa=wartość zostaje
+        $s = [regex]::Replace($s, '(?i)((?:^|\s)(?:--?|/)(?:(?:[\w-]{2,}?)?(?:password|passwd|passphrase|secret|token|api[-_]?key)|p(?![:=\s]+(?:\d{1,5}(?:\s|$)|[-/]\w|"?[a-z]:\\|"?\\\\)|:\w+=)|pw|pwd|pass|rp)(?::|=|\s+))(''[^'']*''|"[^"]*"|\S+)', '$1***')
+        # hasło pozycyjne net use (\\serwer\udział HASLO, także po /user:)
+        $s = [regex]::Replace($s, '(?i)(\bnet(?:\.exe)?\s+use\s+(?:[a-z]:\s+|\*\s+)?(?:"\\\\[^"]+"|\\\\\S+)\s+(?:/u(?:ser)?:(?:"[^"]*"|\S+)\s+)?)(?![/-])(''[^'']*''|"[^"]*"|\S+)', '$1***')
+        # adres z poświadczeniami (https://login:HASLO@host)
+        $s = [regex]::Replace($s, '(?i)(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^\s/]+(@)', '$1***$2')
+        # skrypty WMI (VBS/JS): czwarty argument ConnectServer(serwer, przestrzeń nazw, login, HASLO)
+        $s = [regex]::Replace($s, '(?i)(\bConnectServer\s*\((?:[^,()]*,){3}\s*)("[^"]*"|[^,()\s]+)', '$1***')
+        # przypisanie: Password=x, w ciągu połączenia także ze spacją (Password=a b;), -Dpassword=x -jar – tylko wartość
+        [regex]::Replace($s, '(?i)((?:password|passwd|passphrase|pwd|secret|token|api[-_]?key)\s*=\s*)("[^"]*"|''[^'']*''|[^;"=\s&|]+(?:\s+[^;"=\s&|/-][^;"=\s&|]*)*(?=;)|[^;\s"]+)', '$1***')
     }
     # Wartość z rejestru albo $null (brak klucza lub wartości)
     function RegV([string]$Path, [string]$Name) { try { $k = Get-Item -LiteralPath $Path -ErrorAction Stop; return $k.GetValue($Name) } catch { return $null } }
     # Pola EventData zdarzenia jako tabela nazwa → wartość (niezależne od języka systemu)
     function EvMap($e) { $h = @{}; try { $x = [xml]$e.ToXml(); foreach ($n in @($x.Event.EventData.Data)) { if ($n.Name) { $h["$($n.Name)"] = "$($n.'#text')" } } } catch { }; $h }
+    # Zdarzenia wprost przez EventLogReader, od najnowszych (z -Oldest: od najstarszego). Get-WinEvent formatuje treść każdego rekordu,
+    # a sekcje czytające dane z ToXml() jej nie używają (Zdarzenia formatują tylko pokazywaną: FormatDescription()). Brak dostępu do dziennika
+    # zgłasza wyjątek – Get-WinEvent -FilterHashtable zwraca wtedy pusty wynik, nie do odróżnienia od braku zdarzeń
+    function EvRead([string]$Log, [int[]]$Id, [int[]]$Level, $Since, [int]$Max = 1, [switch]$Oldest) {
+        $c = @()
+        if ($Since) { $c += "TimeCreated[@SystemTime>='" + ([datetime]$Since).ToUniversalTime().ToString('yyyy-MM-dd''T''HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + "Z']" }
+        if ($Id) { $c += '(' + (@($Id | ForEach-Object { "EventID=$_" }) -join ' or ') + ')' }
+        if ($Level) { $c += '(' + (@($Level | ForEach-Object { "Level=$_" }) -join ' or ') + ')' }
+        $xp = if ($c.Count) { '*[System[' + ($c -join ' and ') + ']]' } else { '*' }
+        $q = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery -ArgumentList $Log, ([System.Diagnostics.Eventing.Reader.PathType]::LogName), $xp
+        $q.ReverseDirection = -not $Oldest
+        $rd = New-Object System.Diagnostics.Eventing.Reader.EventLogReader -ArgumentList $q
+        $n = 0
+        try { while ($n -lt $Max) { $e = $rd.ReadEvent(); if (-not $e) { break }; $e; $n++ } }
+        catch { if (-not $n) { throw $_ }; $errs.Add("Dziennik $Log`: odczyt przerwany po $n zdarzeniach – $($_.Exception.Message)") }
+        finally { $rd.Dispose() }
+    }
 
     # ── System ──
     $sys = [ordered]@{}
@@ -364,6 +391,9 @@ $Collector = {
     $sys.IsHyperV  = [bool](Get-Service vmms -ErrorAction SilentlyContinue)
     try { $sys.TimeZone = [TimeZoneInfo]::Local.Id } catch { $sys.TimeZone = '' }   # Get-TimeZone jest dopiero w PS 5.1
     $sys.PSVersion = $PSVersionTable.PSVersion.ToString()
+    # Win32_Service raz na skan: konfiguracja bezpieczeństwa, usługi według PID i sekcja Usługi (wyliczenie usług trwa w starszych systemach do 1,5 s)
+    $svcCim = @(); $svcCimErr = $null
+    try { $svcCim = @(Get-CimInstance Win32_Service) } catch { $svcCimErr = $_ }
 
     # ── Konfiguracja bezpieczeństwa ──
     $hard = New-Object System.Collections.Generic.List[object]
@@ -381,7 +411,7 @@ $Collector = {
             Add-Check 'Defender – ochrona w czasie rzeczywistym' $(if ($mp.RealTimeProtectionEnabled) { 'włączona' } else { 'WYŁĄCZONA' }) $(if ($mp.RealTimeProtectionEnabled) { 'OK' } else { 'Krytyczne' })
             $age = [int64]$mp.AntivirusSignatureAge   # UInt32; 4294967295 = brak daty aktualizacji (rzutowanie na [int] rzuciłoby wyjątek)
             Add-Check 'Defender – wiek sygnatur [dni]' $(if ($age -ge 65535) { 'brak daty aktualizacji' } else { $age }) $(if ($age -le 3) { 'OK' } elseif ($age -le 7) { 'Uwaga' } else { 'Krytyczne' })
-            Add-Check 'Defender – dni od szybkiego skanu' $mp.QuickScanAge $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })
+            Add-Check 'Defender – dni od szybkiego skanu' $(if ([int64]$mp.QuickScanAge -ge 65535) { 'nigdy' } else { $mp.QuickScanAge }) $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })   # 4294967295 = skanu nie było
             if ($null -ne $mp.IsTamperProtected) { Add-Check 'Defender – ochrona przed naruszeniami' $(if ($mp.IsTamperProtected) { 'włączona' } else { 'wyłączona' }) $(if ($mp.IsTamperProtected) { 'OK' } else { 'Info' }) }
         }
     } catch { $sys.AV = 'brak danych z Defendera'; Add-Check 'Antywirus' 'Defender niedostępny (inny AV lub starszy system)' 'Info' }
@@ -426,7 +456,10 @@ $Collector = {
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $wd = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -ErrorAction SilentlyContinue
-        Add-Check 'WDigest – hasła w pamięci' $(if ($wd.UseLogonCredential -eq 1) { 'WŁĄCZONE' } else { 'wyłączone' }) $(if ($wd.UseLogonCredential -eq 1) { 'Krytyczne' } else { 'OK' })
+        # bez wartości UseLogonCredential WDigest przechowuje hasła w systemach starszych niż Windows Server 2012 R2 (kompilacja 9600), także z KB2871997
+        $wdv  = $wd.UseLogonCredential
+        $wdOn = if ($null -ne $wdv) { "$wdv" -eq '1' } else { $sys.BuildNumber -and [int]$sys.BuildNumber -lt 9600 }
+        Add-Check 'WDigest – hasła w pamięci' $(if ($wdOn -and $null -eq $wdv) { 'WŁĄCZONE (domyślnie przed Windows Server 2012 R2 – ustaw UseLogonCredential = 0)' } elseif ($wdOn) { 'WŁĄCZONE' } else { 'wyłączone' }) $(if ($wdOn) { 'Krytyczne' } else { 'OK' })
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
@@ -464,7 +497,7 @@ $Collector = {
     # ── Dalsze utwardzenie: tylko odczyt rejestru, usług i WMI. Status 'Zalecenie' = warto poprawić (w analizie jedna zbiorcza informacja
     #    na serwer), 'Uwaga'/'Krytyczne' = realne ryzyko. Brak wpisu w rejestrze oceniamy według domyślnego zachowania danej wersji systemu.
     $osB = [int]$sys.BuildNumber   # 9600 = 2012 R2, 14393 = 2016, 17763 = 2019, 20348 = 2022, 26100 = 2025
-    $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName)
+    $svcAll = $svcCim
     function Svc([string]$Name) { $svcAll | Where-Object { $_.Name -eq $Name } | Select-Object -First 1 }
     function HErr([string]$What, $E) { $errs.Add("Konfiguracja bezpieczeństwa ($What): $($E.Exception.Message) [linia $($E.InvocationInfo.ScriptLineNumber)]") }
     function Is1($v) { "$v" -eq '1' }
@@ -694,10 +727,14 @@ $Collector = {
     $network = @(S 'Network' 'Sieć' {
         $np = @{}
         try { foreach ($c in @(Get-NetConnectionProfile -ErrorAction Stop)) { $np[[int]$c.InterfaceIndex] = "$($c.NetworkCategory)" } } catch {}
+        # adresy, bramy i serwery DNS – po jednym zapytaniu dla wszystkich kart (zamiast trzech na każdą kartę)
+        $ipAll  = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        $gwAll  = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+        $dnsAll = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
         foreach ($a in (Get-NetAdapter)) {
-            $ips = @(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
-            $gw  = @(Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop)
-            $dns = @((Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses)
+            $ips = @($ipAll | Where-Object { $_.InterfaceIndex -eq $a.ifIndex })
+            $gw  = @($gwAll | Where-Object { $_.InterfaceIndex -eq $a.ifIndex } | Select-Object -ExpandProperty NextHop)
+            $dns = @($dnsAll | Where-Object { $_.InterfaceIndex -eq $a.ifIndex } | ForEach-Object { $_.ServerAddresses })
             [pscustomobject]@{
                 Adapter = $a.Name; Description = $a.InterfaceDescription; Status = "$($a.Status)"; Profile = "$($np[[int]$a.ifIndex])"
                 MAC = $a.MacAddress; Speed = "$($a.LinkSpeed)"
@@ -711,16 +748,19 @@ $Collector = {
     # ── Procesy / usługi wg PID ──
     $procNames = @{}; try { Get-Process | ForEach-Object { $procNames[[int]$_.Id] = $_.ProcessName } } catch {}
     $svcByPid  = @{}
-    try { Get-CimInstance Win32_Service -Filter 'ProcessId > 0' | Group-Object ProcessId | ForEach-Object { $svcByPid[[int]$_.Name] = ($_.Group.Name -join ',') } } catch {}
+    foreach ($s in $svcCim) { $spid = [int]$s.ProcessId; if ($spid -gt 0) { if ($svcByPid.ContainsKey($spid)) { $svcByPid[$spid] += ",$($s.Name)" } else { $svcByPid[$spid] = "$($s.Name)" } } }
     function PName($id) { $n = $procNames[[int]$id]; if ($n) { $n } else { "PID $id" } }
     function PSvc($id)  { Short $svcByPid[[int]$id] 80 }
 
     # ── Porty nasłuchujące ──
     $listenPorts = @{}
     # potrzebne do ustalenia kierunku połączeń także wtedy, gdy sekcja Listening jest pominięta
-    try { foreach ($lc in @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)) { $listenPorts[[int]$lc.LocalPort] = $true } } catch {}
+    $listenTcp = @(); $listenErr = $null   # jedno zapytanie także dla sekcji Porty; jej błąd zgłasza sama sekcja
+    try { $listenTcp = @(Get-NetTCPConnection -State Listen) } catch { $listenErr = $_ }
+    foreach ($lc in $listenTcp) { $listenPorts[[int]$lc.LocalPort] = $true }
     $listening = @(S 'Listening' 'Porty' {
-        Get-NetTCPConnection -State Listen | Group-Object LocalPort, OwningProcess | ForEach-Object {
+        if ($listenErr) { throw $listenErr }
+        $listenTcp | Group-Object LocalPort, OwningProcess | ForEach-Object {
             $f = $_.Group[0]
             $listenPorts[[int]$f.LocalPort] = $true
             $addrs = @($_.Group.LocalAddress | Sort-Object -Unique)
@@ -764,7 +804,8 @@ $Collector = {
     # ── Usługi ──
     $vendorCache = @{}
     $services = @(S 'Services' 'Usługi' {
-        foreach ($s in (Get-CimInstance Win32_Service)) {
+        if ($svcCimErr) { throw $svcCimErr }
+        foreach ($s in $svcCim) {
             $raw = "$($s.PathName)"
             $exe = $raw
             if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
@@ -800,8 +841,24 @@ $Collector = {
         '0x800710E0' = 'Odmowa (warunki lub uprawnienia)'; '0x80070002' = 'Nie znaleziono pliku'; '0x80070005' = 'Odmowa dostępu'
         '0x8007052E' = 'Błędny login lub hasło'; '0xC000013A' = 'Przerwane (zamknięcie aplikacji)'; '0xFFFD0000' = 'Błąd skryptu PowerShell'
     }
+    # Zadania z \Microsoft\ (setki wbudowanych) pomijamy – poza tymi, które nie wyglądają na wbudowane: host skryptów
+    # (np. zadania Register-ScheduledJob) albo program spoza katalogu Windows bez metadanych Microsoftu. Tam też bywa ukryte obce zadanie
+    function MsTaskOdd($t) {
+        foreach ($a in @($t.Actions)) {
+            if (-not $a.Execute) { continue }   # obsługa COM
+            $x = "$($a.Execute) $($a.Arguments)"
+            if ($x -match '\\system32\\(silcollector\.cmd|calluxxprovider\.vbs)\b' -and $x -notmatch '[&|]') { continue }   # wbudowane: Software Inventory Logging, Menedżer serwera
+            if ($x -match '(^|[\\"\s])(powershell|pwsh|wscript|cscript|mshta|cmd)(\.exe)?("|\s|$)') { return $true }
+            $exe = [Environment]::ExpandEnvironmentVariables("$($a.Execute)".Trim().Trim('"'))
+            if ($exe -notmatch '\\') { $exe = "$env:SystemRoot\System32\$exe" }
+            if ($exe -like "$env:SystemRoot\*") { continue }
+            if (-not $vendorCache.ContainsKey($exe)) { $v = ''; try { $v = (Get-Item -LiteralPath $exe -ErrorAction Stop).VersionInfo.CompanyName } catch {}; $vendorCache[$exe] = "$v" }
+            if ($vendorCache[$exe] -notmatch 'Microsoft') { return $true }
+        }
+        $false
+    }
     $tasks = @(S 'Tasks' 'Zadania' {
-        Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } | ForEach-Object {
+        Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' -or (MsTaskOdd $_) } | ForEach-Object {
             $t = $_
             $info = $null; try { $info = $t | Get-ScheduledTaskInfo -ErrorAction Stop } catch {}
             $hex = ''
@@ -828,7 +885,8 @@ $Collector = {
         if ($sys.IsHyperV) { foreach ($l in 'Microsoft-Windows-Hyper-V-VMMS-Admin', 'Microsoft-Windows-Hyper-V-Worker-Admin') { try { if (Get-WinEvent -ListLog $l -ErrorAction Stop) { $evLogs += $l } } catch {} } }
         # osobny limit dla każdego dziennika – zalew błędów w System (np. DCOM 10016) nie ukryje błędów Application i Hyper-V
         $ev = @(foreach ($l in $evLogs) {
-            $part = @(Get-WinEvent -FilterHashtable @{ LogName = $l; Level = $levels; StartTime = $since } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
+            # dziennik, którego nie da się odczytać (brak uprawnień, uszkodzenie), trafia do błędów i nie zatrzymuje pozostałych
+            $part = @(try { EvRead -Log $l -Level $levels -Since $since -Max $MaxEvents } catch { $errs.Add("Zdarzenia – dziennik $l`: $($_.Exception.Message)") })
             if ($part.Count -ge $MaxEvents) { $truncated.Add("$l (od $(D $part[-1].TimeCreated))") }
             $part
         })
@@ -839,7 +897,7 @@ $Collector = {
                 Log = $f.LogName
                 Level = $(switch ($f.Level) { 1 { 'Krytyczny' } 2 { 'Błąd' } 3 { 'Ostrzeżenie' } default { "$($f.Level)" } })
                 Source = $f.ProviderName; Id = $f.Id; Count = $g.Count
-                First = $(D $g[-1].TimeCreated); Last = $(D $f.TimeCreated); Message = $(Short $f.Message 400)
+                First = $(D $g[-1].TimeCreated); Last = $(D $f.TimeCreated); Message = $(Short $(try { $f.FormatDescription() } catch { '' }) 400)
             }
         } | Sort-Object @{ e = { if ($_.Level -eq 'Krytyczny') { 0 } else { 1 } } }, @{ e = 'Count'; Descending = $true }
     })
@@ -876,7 +934,7 @@ $Collector = {
         }
         # czas w EventData ma do 9 cyfr ułamka sekundy – .NET przyjmuje najwyżej 7
         $parseTime = { param($t) if ("$t") { try { ([datetime]::Parse(("$t" -replace '(\.\d{7})\d+', '$1'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime() } catch { $null } } else { $null } }
-        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 12, 13, 41, 1074, 6005, 6006, 6008; StartTime = $since.AddDays(-2) } -MaxEvents 3000 -ErrorAction SilentlyContinue | Sort-Object TimeCreated)
+        $ev = @(EvRead -Log 'System' -Id 12, 13, 41, 1074, 6005, 6006, 6008 -Since ($since.AddDays(-2)) -Max 3000 | Sort-Object TimeCreated)
         $boots = New-Object System.Collections.Generic.List[object]
         $stops = New-Object System.Collections.Generic.List[object]
         $crash = New-Object System.Collections.Generic.List[object]
@@ -965,12 +1023,17 @@ $Collector = {
     $secEvents = @(S 'SecurityEvents' 'Bezpieczeństwo' {
         $list = @()
         # rzadkie, ważne zdarzenia osobno – atak na hasła (tysiące 4625/4771) nie może wypchnąć z limitu np. wyczyszczenia dziennika (1102)
-        $list += @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4740, 4720, 4726, 4722, 4724, 4728, 4732, 4756, 1102, 4698, 4697; StartTime = $since } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
-        $noisy = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625, 4771; StartTime = $since } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
+        $rare = @(EvRead -Log 'Security' -Id 4740, 4720, 4726, 4722, 4724, 4728, 4732, 4756, 1102, 4698, 4697 -Since $since -Max $MaxEvents)
+        if ($rare.Count -ge $MaxEvents) { $truncated.Add("Security – zmiany kont i grup, usługi, zadania (od $(D $rare[-1].TimeCreated))") }
+        # po wyczyszczeniu dziennika 1102 jest jego najstarszym rekordem (pierwszym odciętym przez limit) – odczyt jednego rekordu od początku nie zależy od limitu
+        if (-not @($rare | Where-Object { $_.Id -eq 1102 }).Count) { $rare += @(EvRead -Log 'Security' -Oldest | Where-Object { $_.Id -eq 1102 -and $_.TimeCreated -ge $since }) }
+        $list += $rare
+        $noisy = @(EvRead -Log 'Security' -Id 4625, 4771 -Since $since -Max $MaxEvents)
         if ($noisy.Count -ge $MaxEvents) { $truncated.Add("Security 4625/4771 (od $(D $noisy[-1].TimeCreated))") }
         $list += $noisy
-        $list += @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7045, 104; StartTime = $since } -MaxEvents 300 -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Id -eq 7045 -or $_.ProviderName -eq 'Microsoft-Windows-Eventlog' })
+        # wyczyszczenie dziennika (104) osobno – seria instalacji usług (7045) nie wypchnie go z limitu
+        $list += @(EvRead -Log 'System' -Id 104 -Since $since -Max 300 | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Eventlog' })
+        $list += @(EvRead -Log 'System' -Id 7045 -Since $since -Max 300)
         $fails = New-Object System.Collections.Generic.List[object]; $rows = New-Object System.Collections.Generic.List[object]
         foreach ($e in $list) {
             $d = EvData $e
@@ -982,22 +1045,26 @@ $Collector = {
                 $fails.Add([pscustomobject]@{ Id = 4771; Account = "$($d.TargetUserName)"; Source = ("$($d.IpAddress)" -replace '^::ffff:', ''); T = $e.TimeCreated; Detail = "status $($d.Status)" })
                 continue
             }
-            $acc = ''; $by = "$($d.SubjectUserName)"; $src = ''; $det = ''
+            $acc = ''; $by = "$($d.SubjectUserName)"; $src = ''; $det = ''; $gsid = ''
             switch ($e.Id) {
                 { $_ -in 4720, 4726, 4722, 4724 } { $acc = "$($d.TargetDomainName)\$($d.TargetUserName)" }
                 4740 { $acc = "$($d.TargetUserName)"; $src = "$($d.TargetDomainName)" }
-                { $_ -in 4728, 4732, 4756 } { $acc = $(if ($d.MemberName -and $d.MemberName -ne '-') { $d.MemberName } else { $d.MemberSid }); $det = "grupa: $($d.TargetUserName)" }
+                { $_ -in 4728, 4732, 4756 } { $acc = $(if ($d.MemberName -and $d.MemberName -ne '-') { $d.MemberName } else { $d.MemberSid }); $det = "grupa: $($d.TargetUserName)"; $gsid = "$($d.TargetSid)" }
                 104  { $det = "dziennik: $($d.Channel)" }
                 4698 { $det = "$($d.TaskName)" }
-                4697 { $det = "$($d.ServiceName) -> $($d.ServiceFileName)" }
-                7045 { $det = "$($d.ServiceName) -> $($d.ImagePath)"; $acc = "$($d.AccountName)"; $by = '' }
+                4697 { $det = "$($d.ServiceName) -> " + (Hide-Secret "$($d.ServiceFileName)") }
+                7045 { $det = "$($d.ServiceName) -> " + (Hide-Secret "$($d.ImagePath)"); $acc = "$($d.AccountName)"; $by = '' }
             }
-            $rows.Add([pscustomobject]@{ Time = $(D $e.TimeCreated); Id = $e.Id; Event = $secNames[$e.Id]; Account = $acc; By = $by; Source = $src; Count = 1; Detail = $det })
+            # _GroupSid (pole wewnętrzne, niewidoczne w tabelach): analiza odróżnia po nim grupy uprzywilejowane od zwykłych niezależnie od języka nazw
+            $rows.Add([pscustomobject]@{ Time = $(D $e.TimeCreated); Id = $e.Id; Event = $secNames[$e.Id]; Account = $acc; By = $by; Source = $src; Count = 1; Detail = $det; _GroupSid = $gsid })
         }
-        $grp = @($fails | Group-Object Id, Account, Source | ForEach-Object {
-            $g = @($_.Group | Sort-Object T -Descending)
-            [pscustomobject]@{ Time = $(D $g[0].T); Id = $g[0].Id; Event = $secNames[$g[0].Id]; Account = $g[0].Account; By = ''; Source = $g[0].Source; Count = $g.Count; Detail = "$($g[0].Detail); pierwsze: $(D $g[-1].T)" }
-        })
+        # Agregacja przez hashtabelę (O(n)) – Group-Object w PowerShell 4/5.1 bardzo zwalnia przy tysiącach różnych par konto/źródło (rozpylanie haseł)
+        $agg = @{}
+        foreach ($f in $fails) {
+            $k = "$($f.Id)|$($f.Account)|$($f.Source)"; $g = $agg[$k]
+            if ($g) { $g.N++; if ($f.T -gt $g.Last.T) { $g.Last = $f }; if ($f.T -lt $g.First) { $g.First = $f.T } } else { $agg[$k] = @{ Last = $f; First = $f.T; N = 1 } }
+        }
+        $grp = @(foreach ($g in $agg.Values) { [pscustomobject]@{ Time = $(D $g.Last.T); Id = $g.Last.Id; Event = $secNames[$g.Last.Id]; Account = $g.Last.Account; By = ''; Source = $g.Last.Source; Count = $g.N; Detail = "$($g.Last.Detail); pierwsze: $(D $g.First)" } })
         foreach ($x in $grp) { $rows.Add($x) }
         $rows | Sort-Object @{ e = { if ($_.Id -in 4625, 4771) { 1 } else { 0 } } }, @{ e = 'Count'; Descending = $true }
     })
@@ -1788,7 +1855,7 @@ $Collector = {
             $cls = $c.CimClass.CimClassName
             $det = switch ($cls) {
                 'CommandLineEventConsumer'  { Hide-Secret ("$($c.CommandLineTemplate) $($c.ExecutablePath)".Trim()) }
-                'ActiveScriptEventConsumer' { if ($c.ScriptFileName) { "$($c.ScriptFileName)" } else { Short $c.ScriptText 300 } }
+                'ActiveScriptEventConsumer' { if ($c.ScriptFileName) { "$($c.ScriptFileName)" } else { Short (Hide-Secret "$($c.ScriptText)") 300 } }
                 default                     { '' }
             }
             [pscustomobject]@{ Type = "WMI – konsument ($cls)"; Name = "$($c.Name)"; Detail = "$det" }
@@ -2835,7 +2902,7 @@ $script:Headers = @{
     Server = 'Serwer'; OS = 'System'; RAM = 'RAM [%]'; MinDiskPct = 'Min. wolne na dysku [%]'; Crit = 'Krytyczne'; Warn = 'Ostrzeżenia'; PatchDays = 'Dni od aktualizacji'
     ScanSec = 'Skan [s]'; Scanned = 'Skanowano'
     ComputerName = 'Nazwa komputera'; FQDN = 'FQDN'; Build = 'Kompilacja'; OSInstallDate = 'Instalacja systemu'; LastBoot = 'Ostatni start'
-    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
+    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU (chwilowe) [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
     LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Host Hyper-V'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
@@ -3451,12 +3518,20 @@ function Invoke-ServerAnalysis {
         AddI 'Krytyczny' 'Bezpieczeństwo' "Nieudane logowania z adresów publicznych: $pn prób z $($ips.Count) adresów (np. $(Join-Short $ips 3)) – logowanie (RDP/SMB) jest prawdopodobnie dostępne z internetu" 'SecurityEvents'
         foreach ($r in $pubFails) { SetFlag $r 'crit' }
     }
-    $n = 0
-    foreach ($r in @($sec | Where-Object { $_.Id -in 1102, 104, 4720, 4726, 4728, 4732, 4756 })) {
-        $n++; if ($n -gt 25) { break }
-        if ($r.Id -in 1102, 104) { AddI 'Krytyczny' 'Bezpieczeństwo' "$($r.Event) – wykonał: $($r.By), $($r.Time) $($r.Detail)" 'SecurityEvents'; SetFlag $r 'crit' }
-        else { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "$($r.Event): $($r.Account) $($r.Detail) (wykonał: $($r.By), $($r.Time))" 'SecurityEvents'; SetFlag $r 'warn' }
+    # Wyczyszczenie dziennika – zawsze i bez limitu: żadna liczba zmian kont i grup nie może go ukryć
+    foreach ($r in @($sec | Where-Object { $_.Id -in 1102, 104 })) { AddI 'Krytyczny' 'Bezpieczeństwo' "$($r.Event) – wykonał: $($r.By), $($r.Time) $($r.Detail)" 'SecurityEvents'; SetFlag $r 'crit' }
+    # Utworzenie/usunięcie konta i zmiany w grupach uprzywilejowanych (po SID; migawki sprzed _GroupSid – każda grupa): do 10 osobno, reszta zbiorczo.
+    # Zmiany członkostwa w zwykłych grupach – jedna informacja (każda osobno zasypywała listę, a różne treści nie dawały się wyciszyć jedną regułą)
+    $privGrpRx = '-(512|518|519|520|526|527)$|^S-1-5-32-(544|548|549|550|551|555|578|580)$'
+    $chgHot = New-Object System.Collections.Generic.List[object]; $chgPlain = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($sec | Where-Object { $_.Id -in 4720, 4726, 4728, 4732, 4756 })) {
+        $gsid = "$($r.PSObject.Properties['_GroupSid'].Value)"
+        if (($r.Id -in 4720, 4726) -or -not $gsid -or $gsid -match $privGrpRx -or "$($r.Detail)" -match 'grupa: DnsAdmins$') { $chgHot.Add($r) } else { $chgPlain.Add($r) }
     }
+    foreach ($r in @($chgHot | Select-Object -First 10)) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "$($r.Event): $($r.Account) $($r.Detail) (wykonał: $($r.By), $($r.Time))" 'SecurityEvents' }
+    if ($chgHot.Count -gt 10) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Kolejne zmiany kont i grup uprzywilejowanych w $days dni: $($chgHot.Count - 10) – pełna lista w sekcji Zdarzenia bezpieczeństwa" 'SecurityEvents' }
+    foreach ($r in $chgHot) { SetFlag $r 'warn' }
+    if ($chgPlain.Count) { AddI 'Info' 'Bezpieczeństwo' "Zmiany członkostwa w zwykłych grupach w $days dni: $($chgPlain.Count) – lista w sekcji Zdarzenia bezpieczeństwa" 'SecurityEvents'; foreach ($r in $chgPlain) { SetFlag $r 'info' } }
     $inst = @($sec | Where-Object { $_.Id -in 4697, 7045 })
     if ($inst.Count) { AddI 'Info' 'Bezpieczeństwo' ("Zainstalowane usługi w $days dni: " + (Join-Short ($inst | ForEach-Object { $_.Detail }) 3)) 'SecurityEvents' }
     foreach ($r in @($sec | Where-Object { $_.Id -in 4697, 7045, 4698, 4740, 4722, 4724 })) { SetFlag $r 'info' }
