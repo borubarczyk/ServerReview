@@ -1,9 +1,9 @@
 ﻿<#
     Kontrole CI dla ServerReview.ps1 (uruchamiane przez .github/workflows/ci.yml na windows-latest, Windows PowerShell 5.1).
     Plik musi być zapisany jako UTF-8 z BOM – inaczej Windows PowerShell 5.1 źle odczyta polskie znaki.
-    Użycie: powershell.exe -NoProfile -File tools\ci.ps1 -Step Encoding|Syntax|Analyzer|Collector
+    Użycie: powershell.exe -NoProfile -File tools\ci.ps1 -Step Encoding|Syntax|Content|Analyzer|Collector
 #>
-param([Parameter(Mandatory)][ValidateSet('Encoding', 'Syntax', 'Analyzer', 'Collector')][string]$Step)
+param([Parameter(Mandatory)][ValidateSet('Encoding', 'Syntax', 'Content', 'Analyzer', 'Collector')][string]$Step)
 $ErrorActionPreference = 'Stop'
 $file = Join-Path (Split-Path $PSScriptRoot -Parent) 'ServerReview.ps1'
 function Fail([string]$Msg, [int]$Line = 0) { Write-Output "::error file=ServerReview.ps1$(if ($Line) { ",line=$Line" })::$Msg" }
@@ -23,6 +23,33 @@ switch ($Step) {
         foreach ($e in $errs) { Fail $e.Message $e.Extent.StartLineNumber }
         if ($errs) { exit 1 }
         "PowerShell $($PSVersionTable.PSVersion): bez błędów składni"
+    }
+    'Content' {
+        # Treść kolektora i $boot (wykonywanych na serwerach): bez treści, którą PowerShell uznaje za podejrzaną (zdarzenie 4104
+        # na każdym serwerze, alarmy SIEM), kod wątków tła ($script:WorkerBody, tekst w here-stringu) bez błędów składni, XAML jako poprawny XML
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$null)
+        $bad = 0
+        $sus = [scriptblock].GetMethod('CheckSuspiciousContent', [Reflection.BindingFlags]'NonPublic,Static')
+        $col = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$Collector' }, $true)
+        $wb = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:WorkerBody' }, $true)
+        if (-not $col -or -not $wb) { Fail 'Nie znaleziono $Collector albo $script:WorkerBody'; exit 1 }
+        $we = $null; $wbAst = [System.Management.Automation.Language.Parser]::ParseInput($wb.Right.Expression.Value, [ref]$null, [ref]$we)
+        foreach ($e in $we) { Fail "WorkerBody: $($e.Message)" ($wb.Extent.StartLineNumber + $e.Extent.StartLineNumber); $bad++ }
+        $boot = $wbAst.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$boot' }, $true)
+        if (-not $sus) { Write-Output '::warning::Brak ScriptBlock.CheckSuspiciousContent w tej wersji PowerShell – pominięto kontrolę treści podejrzanej' }
+        else {
+            foreach ($x in @(@{ N = 'kolektor ($Collector)'; A = $col.Right.Expression.ScriptBlock; L = $col.Extent.StartLineNumber }, @{ N = '$boot'; A = $(if ($boot) { $boot.Right.Expression.ScriptBlock }); L = $wb.Extent.StartLineNumber })) {
+                if (-not $x.A) { Fail "Nie znaleziono: $($x.N)"; $bad++; continue }
+                $t = $x.A.Extent.Text
+                $hit = $sus.Invoke($null, @(([scriptblock]::Create($t.Substring(1, $t.Length - 2))).Ast))
+                if ($hit) { Fail "$($x.N) zawiera treść uznawaną przez PowerShell za podejrzaną: '$hit' (także w komentarzach)" $x.L; $bad++ }
+            }
+        }
+        foreach ($x in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -match '^\s*<' -and $n.Value -match 'xmlns' }, $true)) {
+            try { [void][xml]$x.Value } catch { Fail "XAML nie jest poprawnym XML: $($_.Exception.Message)" $x.Extent.StartLineNumber; $bad++ }
+        }
+        if ($bad) { exit 1 }
+        'Kolektor i $boot bez treści podejrzanej, WorkerBody bez błędów składni, XAML poprawny'
     }
     'Analyzer' {
         Set-PSRepository PSGallery -InstallationPolicy Trusted
