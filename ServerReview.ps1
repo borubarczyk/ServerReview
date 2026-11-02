@@ -403,7 +403,7 @@ $Collector = {
             $m = [regex]::Match("$($lic.Description)", '([A-Z_]+) channel')
             $sys.LicenseChannel  = if ($m.Success) { $m.Groups[1].Value } else { Short "$($lic.Description)" 80 }
             if ([int64]$lic.GracePeriodRemaining -gt 0) { $sys.LicenseGraceDays = [math]::Round([int64]$lic.GracePeriodRemaining / 1440, 1) }
-            $sys.KmsHost = if ($lic.KeyManagementServiceMachine) { "$($lic.KeyManagementServiceMachine)" } elseif ($lic.PSObject.Properties['DiscoveredKeyManagementServiceMachineName'] -and $lic.DiscoveredKeyManagementServiceMachineName) { "$($lic.DiscoveredKeyManagementServiceMachineName)" } else { '' }
+            $sys.KmsHost = if ($lic.KeyManagementServiceMachine) { "$($lic.KeyManagementServiceMachine)" } elseif ($lic.DiscoveredKeyManagementServiceMachineName) { "$($lic.DiscoveredKeyManagementServiceMachineName)" } else { '' }
         }
     } catch { $errs.Add("Aktywacja Windows: $($_.Exception.Message)") }
     $timings['Aktywacja Windows'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
@@ -1568,9 +1568,10 @@ $Collector = {
         # SQL Server: instancje z rejestru, wersja i koniec wsparcia, usługi; bazy i kopie z msdb, jeśli konto skanujące ma login w SQL
         $sqlEnd = @{ 10 = '2019-07-09'; 11 = '2022-07-12'; 12 = '2024-07-09'; 13 = '2026-07-14'; 14 = '2027-10-12'; 15 = '2030-01-08'; 16 = '2033-01-11' }
         $sqlNames = @{ 10 = '2008/2008 R2'; 11 = '2012'; 12 = '2014'; 13 = '2016'; 14 = '2017'; 15 = '2019'; 16 = '2022'; 17 = '2025' }
-        $inst = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction SilentlyContinue
-        foreach ($p in @($inst.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' })) {
-            $in = $p.Name; $id = "$($p.Value)"
+        # nazwy instancji to nazwy wartości klucza rejestru (GetValueNames), bez wyliczania właściwości obiektu
+        $ik = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction SilentlyContinue
+        foreach ($in in @(if ($ik) { $ik.GetValueNames() })) {
+            $id = "$($ik.GetValue($in))"
             $setup = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$id\Setup" -ErrorAction SilentlyContinue
             $ver = "$($setup.PatchLevel)"; if (-not $ver) { $ver = "$($setup.Version)" }
             $maj = 0; [void][int]::TryParse(("$ver" -split '\.')[0], [ref]$maj)
