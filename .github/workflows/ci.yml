@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Kontrola skryptu
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Kontrole są w tools/ci.ps1 (UTF-8 z BOM) – skrypty wpisane tutaj GitHub zapisuje bez BOM i Windows PowerShell 5.1 psuje polskie znaki
+      - name: Encoding (UTF-8 BOM, CRLF)
+        shell: powershell
+        run: .\tools\ci.ps1 -Step Encoding
+
+      - name: Syntax (Windows PowerShell 5.1 parser)
+        shell: powershell
+        run: .\tools\ci.ps1 -Step Syntax
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: .\tools\ci.ps1 -Step Analyzer
+
+      - name: Collector run on the runner
+        shell: powershell
+        run: .\tools\ci.ps1 -Step Collector

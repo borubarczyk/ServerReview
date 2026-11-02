@@ -64,7 +64,8 @@ param(
     [string]$ServerListFile,
     [switch]$Scan,
     [ValidateSet('Summary', 'Full')][string]$ReportMode = 'Summary',
-    [switch]$NoReport
+    [switch]$NoReport,
+    [switch]$TestNotify
 )
 
 #region ── Konfiguracja ─────────────────────────────────────────────────────────
@@ -90,6 +91,13 @@ $Config = [ordered]@{
     DiskWearWarnPct        = 90       # zużycie SSD wg licznika niezawodności [%]
     DiskRetryWarn          = 10       # tyle zdarzeń 129/153/157 (reset/ponowienie I/O) w okresie = ostrzeżenie
     BugCheckCritCount      = 2        # tyle awarii BSOD w okresie = problem krytyczny
+    DiskForecastDays       = 30       # prognoza: dysk spadnie poniżej progu krytycznego w ciągu tylu dni = ostrzeżenie
+    DiskForecastCritDays   = 7        # prognoza: dysk zapełni się w ciągu tylu dni = problem krytyczny
+    BackupWarnDays         = 2        # ostatnia udana kopia zapasowa starsza niż tyle dni = ostrzeżenie
+    BackupCritDays         = 7        # ... = problem krytyczny (także bazy SQL bez kopii danych)
+    SqlLogBackupHours      = 24       # baza SQL w modelu FULL/BULK_LOGGED bez kopii dziennika od tylu godzin = ostrzeżenie (dziennik rośnie)
+    DhcpWarnPct            = 85       # zajętość zakresu DHCP: ostrzeżenie od [%]
+    DhcpCritPct            = 95       # ... krytyczne od [%]
     ThrottleLimit          = 25       # ile serwerów skanować równolegle
     ServerTimeoutSec       = 300      # limit czasu zbierania danych z JEDNEGO serwera (liczony od chwili, gdy jego skan ruszył)
     ConnectTimeoutSec      = 30       # limit nawiązania połączenia WinRM
@@ -147,6 +155,17 @@ $Config = [ordered]@{
     CveProxy               = ''      # serwer proxy dla pobierania, np. http://proxy:8080 (puste = ustawienia systemowe)
     # Koniec rozszerzonego wsparcia Microsoft wg numeru kompilacji (bez płatnego ESU)
     OsSupportEnd           = @{ '9200' = '2023-10-10'; '9600' = '2023-10-10'; '14393' = '2027-01-12'; '17763' = '2029-01-09'; '20348' = '2031-10-14'; '26100' = '2034-10-10' }
+    # Powiadomienia po skanie bez okna (-Scan): e-mail (SMTP) i/lub webhook (Slack, Mattermost, Microsoft Teams – Workflows)
+    NotifyOnlyNew          = $true   # tylko gdy pojawiły się nowe problemy krytyczne (względem poprzedniego powiadomienia)
+    NotifyWarnings         = $false  # także nowe ostrzeżenia
+    SmtpServer             = ''      # puste = bez e-maila
+    SmtpPort               = 25
+    SmtpUseSsl             = $false
+    SmtpFrom               = ''
+    SmtpTo                 = @()
+    SmtpAttachReport       = $true   # dołącz raport HTML
+    WebhookUrl             = ''      # puste = bez webhooka
+    WebhookTeams           = $false  # format karty adaptacyjnej (Teams Workflows) zamiast {"text": …}
     # Sekcje pomijane podczas skanu – ustawiane w oknie Ustawienia (puste = skanuj wszystko)
     SkipSections           = @()
     ServerListFile         = Join-Path $Base 'servers.txt'
@@ -165,7 +184,8 @@ $script:AppVersion = '2.0'
 # Tryb bez okna (-Scan) nie potrzebuje STA, ale z PowerShell 7 też przechodzi na 5.1 (czeka na wynik i oddaje kod wyjścia).
 $isCore = $PSVersionTable.PSEdition -eq 'Core'
 $isSta  = [Threading.Thread]::CurrentThread.GetApartmentState() -eq 'STA'
-if ($isCore -or (-not $Scan -and -not $isSta)) {
+$noGui  = $Scan -or $TestNotify   # tryby bez okna nie potrzebują STA
+if ($isCore -or (-not $noGui -and -not $isSta)) {
     if (-not $PSCommandPath) { throw 'Uruchom skrypt jako plik: powershell.exe -STA -File .\ServerReview.ps1' }
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $argList = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
@@ -176,13 +196,14 @@ if ($isCore -or (-not $Scan -and -not $isSta)) {
     if ($isCore) { $env:PSModulePath = $null }
     $p = $null
     try {
-        if ($Scan) {
-            $argList += @('-Scan', '-ReportMode', $ReportMode)
+        if ($noGui) {
+            if ($Scan) { $argList += @('-Scan', '-ReportMode', $ReportMode) }
             if ($NoReport) { $argList += '-NoReport' }
+            if ($TestNotify) { $argList += '-TestNotify' }
             $p = Start-Process -FilePath $exe -ArgumentList $argList -Wait -PassThru -NoNewWindow
         } else { Start-Process -FilePath $exe -ArgumentList $argList }
     } finally { if ($isCore) { $env:PSModulePath = $pmp } }
-    if ($Scan) { exit $p.ExitCode }
+    if ($noGui) { exit $p.ExitCode }
     return
 }
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
@@ -221,6 +242,10 @@ $Collector = {
         Import-Module $m -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null
     }
     if (Get-Service vmms -ErrorAction SilentlyContinue) { Import-Module Hyper-V -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service W3SVC -ErrorAction SilentlyContinue) { Import-Module WebAdministration -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service DHCPServer -ErrorAction SilentlyContinue) { Import-Module DhcpServer -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service DNS -ErrorAction SilentlyContinue) { Import-Module DnsServer -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
+    if (Get-Service wbengine -ErrorAction SilentlyContinue) { Import-Module WindowsServerBackup -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
     if (Get-Service ClusSvc -ErrorAction SilentlyContinue) { Import-Module FailoverClusters -ErrorAction SilentlyContinue -WarningAction SilentlyContinue 2>$null }
 
     $ErrorActionPreference = 'Stop'
@@ -364,6 +389,24 @@ $Collector = {
     $sys.IsHyperV  = [bool](Get-Service vmms -ErrorAction SilentlyContinue)
     try { $sys.TimeZone = [TimeZoneInfo]::Local.Id } catch { $sys.TimeZone = '' }   # Get-TimeZone jest dopiero w PS 5.1
     $sys.PSVersion = $PSVersionTable.PSVersion.ToString()
+    # Aktywacja Windows (licencja systemu): stan, kanał (Retail/OEM/KMS/MAK/AVMA) i dni do końca okresu (KMS: do wygaśnięcia aktywacji)
+    $sys.LicenseStatus = ''; $sys.LicenseStatusId = $null; $sys.LicenseChannel = ''; $sys.LicenseGraceDays = $null; $sys.KmsHost = ''
+    $t0 = $sw.Elapsed.TotalSeconds
+    try {
+        $lp = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL" -ErrorAction Stop |
+                Where-Object { "$($_.Name)" -like 'Windows*' } | Sort-Object LicenseStatus -Descending)
+        $lic = @($lp | Where-Object { [int]$_.LicenseStatus -eq 1 }) + @($lp) | Select-Object -First 1
+        if ($lic) {
+            $lsMap = @{ 0 = 'brak aktywacji'; 1 = 'aktywowany'; 2 = 'okres prolongaty (OOB)'; 3 = 'okres prolongaty (zmiana sprzętu)'; 4 = 'okres prolongaty (nieoryginalny)'; 5 = 'powiadomienia (brak aktywacji)'; 6 = 'przedłużona prolongata' }
+            $sys.LicenseStatusId = [int]$lic.LicenseStatus
+            $sys.LicenseStatus   = if ($lsMap.ContainsKey([int]$lic.LicenseStatus)) { $lsMap[[int]$lic.LicenseStatus] } else { "kod $($lic.LicenseStatus)" }
+            $m = [regex]::Match("$($lic.Description)", '([A-Z_]+) channel')
+            $sys.LicenseChannel  = if ($m.Success) { $m.Groups[1].Value } else { Short "$($lic.Description)" 80 }
+            if ([int64]$lic.GracePeriodRemaining -gt 0) { $sys.LicenseGraceDays = [math]::Round([int64]$lic.GracePeriodRemaining / 1440, 1) }
+            $sys.KmsHost = if ($lic.KeyManagementServiceMachine) { "$($lic.KeyManagementServiceMachine)" } elseif ($lic.DiscoveredKeyManagementServiceMachineName) { "$($lic.DiscoveredKeyManagementServiceMachineName)" } else { '' }
+        }
+    } catch { $errs.Add("Aktywacja Windows: $($_.Exception.Message)") }
+    $timings['Aktywacja Windows'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
 
     # ── Konfiguracja bezpieczeństwa ──
     $hard = New-Object System.Collections.Generic.List[object]
@@ -1387,6 +1430,46 @@ $Collector = {
         }
     })
 
+    # ── Kopie zapasowe: Windows Server Backup (Get-WBSummary) i zadania Veeam (zdarzenie 190 w dziennikach Veeam) ──
+    # Wynik zadania Veeam z poziomu zdarzenia (4 = sukces, 3 = ostrzeżenie, 2 = błąd) – niezależnie od języka; okres co najmniej 31 dni
+    $backups = @(S 'Backup' 'Kopie zapasowe' {
+        if (Get-Command Get-WBSummary -ErrorAction SilentlyContinue) {
+            $wb = $null; try { $wb = Get-WBSummary } catch {}   # usługa kopii nieskonfigurowana – brak danych to nie błąd sekcji
+            $pol = $null; try { $pol = Get-WBPolicy } catch {}
+            if ($wb -and ($pol -or $wb.LastBackupTime -gt [datetime]'2000-01-01')) {
+                $okT  = if ($wb.LastSuccessfulBackupTime -gt [datetime]'2000-01-01') { $wb.LastSuccessfulBackupTime } else { $null }
+                $runT = if ($wb.LastBackupTime -gt [datetime]'2000-01-01') { $wb.LastBackupTime } else { $null }
+                $nxT  = if ($wb.NextBackupTime -gt [datetime]'2000-01-01') { $wb.NextBackupTime } else { $null }
+                $hr   = [int64]$wb.LastBackupResultHR
+                [pscustomobject]@{
+                    Product = 'Windows Server Backup'; Job = $(if ($pol) { 'harmonogram' } else { 'kopia jednorazowa' })
+                    LastRun = $(D $runT); LastResult = $(if (-not $runT) { '' } elseif ($hr -eq 0) { 'Sukces' } else { 'Błąd' })
+                    LastSuccess = $(D $okT); SuccessAgeDays = $(if ($okT) { [math]::Round(($now - $okT).TotalDays, 1) } else { $null })
+                    RunAgeDays = $(if ($runT) { [math]::Round(($now - $runT).TotalDays, 1) } else { $null })
+                    Runs = $null; Failures = $null; NextRun = $(D $nxT); Target = Short "$($wb.LastBackupTarget)" 120
+                    Detail = $(if ($hr -ne 0 -and $runT) { 'kod błędu 0x{0:X8}' -f ($hr -band 0xFFFFFFFFL) } else { "wersje kopii: $($wb.NumberOfVersions)" })
+                }
+            }
+        }
+        $bSince = $now.AddDays(-[math]::Max($Days, 31))
+        foreach ($ln in 'Veeam Agent', 'Veeam Backup') {
+            if (-not (Get-WinEvent -ListLog $ln -ErrorAction SilentlyContinue)) { continue }
+            $ev = @(Get-WinEvent -FilterHashtable @{ LogName = $ln; Id = 190; StartTime = $bSince } -MaxEvents 2000 -ErrorAction SilentlyContinue)
+            $ev | Group-Object { $m = [regex]::Match("$($_.Message)", "'([^']+)'"); if ($m.Success) { $m.Groups[1].Value } else { '(zadanie)' } } | ForEach-Object {
+                $g    = @($_.Group | Sort-Object TimeCreated -Descending)
+                $ok   = @($g | Where-Object { $_.Level -eq 4 } | Select-Object -First 1)
+                $last = $g[0]
+                [pscustomobject]@{
+                    Product = $(if ($ln -eq 'Veeam Agent') { 'Veeam Agent' } else { 'Veeam Backup & Replication' }); Job = $_.Name
+                    LastRun = $(D $last.TimeCreated); LastResult = $(switch ([int]$last.Level) { 4 { 'Sukces' } 3 { 'Ostrzeżenie' } default { 'Błąd' } })
+                    LastSuccess = $(if ($ok.Count) { D $ok[0].TimeCreated } else { '' }); SuccessAgeDays = $(if ($ok.Count) { [math]::Round(($now - $ok[0].TimeCreated).TotalDays, 1) } else { $null })
+                    RunAgeDays = [math]::Round(($now - $last.TimeCreated).TotalDays, 1)
+                    Runs = $g.Count; Failures = @($g | Where-Object { $_.Level -le 2 }).Count; NextRun = ''; Target = ''; Detail = $(Short $last.Message 300)
+                }
+            }
+        }
+    })
+
     # ── Zdrowie dysków: dyski fizyczne (Storage) i zdarzenia błędów dyskowych ──
     # Moduł Storage zamienia kody na angielskie nazwy (niezależne od języka systemu); obsługujemy oba warianty
     $hsMap = @{ '0' = 'OK'; 'Healthy' = 'OK'; '1' = 'Ostrzeżenie'; 'Warning' = 'Ostrzeżenie'; '2' = 'Awaria'; 'Unhealthy' = 'Awaria'; '5' = 'Nieznany'; 'Unknown' = 'Nieznany' }
@@ -1475,6 +1558,113 @@ $Collector = {
             }
         })
     }
+
+    # ── Role aplikacyjne: SQL Server, IIS, DHCP, DNS (tylko gdy rola jest zainstalowana) ──
+    # _Kind: Check = sprawdzenie ze statusem; SqlDb = baza SQL (status ustala stacja wg progów kopii); DhcpScope = zakres DHCP (zajętość, progi na stacji)
+    $appRoles = @(S 'AppRoles' 'Role aplikacyjne' {
+        $ar = { param($role, $c, $v, $st, $kind = 'Check', $pct = $null, $bd = $null, $lh = $null, $rec = '', $state = '')
+                [pscustomobject]@{ Role = $role; Check = $c; Value = "$v"; Status = $st; _Kind = $kind; _Pct = $pct; _BackupDays = $bd; _LogHours = $lh; _Recovery = $rec; _DbState = $state } }
+
+        # SQL Server: instancje z rejestru, wersja i koniec wsparcia, usługi; bazy i kopie z msdb, jeśli konto skanujące ma login w SQL
+        $sqlEnd = @{ 10 = '2019-07-09'; 11 = '2022-07-12'; 12 = '2024-07-09'; 13 = '2026-07-14'; 14 = '2027-10-12'; 15 = '2030-01-08'; 16 = '2033-01-11' }
+        $sqlNames = @{ 10 = '2008/2008 R2'; 11 = '2012'; 12 = '2014'; 13 = '2016'; 14 = '2017'; 15 = '2019'; 16 = '2022'; 17 = '2025' }
+        # nazwy instancji to nazwy wartości klucza rejestru (GetValueNames), bez wyliczania właściwości obiektu
+        $ik = Get-Item -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL' -ErrorAction SilentlyContinue
+        foreach ($in in @(if ($ik) { $ik.GetValueNames() })) {
+            $id = "$($ik.GetValue($in))"
+            $setup = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$id\Setup" -ErrorAction SilentlyContinue
+            $ver = "$($setup.PatchLevel)"; if (-not $ver) { $ver = "$($setup.Version)" }
+            $maj = 0; [void][int]::TryParse(("$ver" -split '\.')[0], [ref]$maj)
+            $label = if ($in -eq 'MSSQLSERVER') { 'SQL (domyślna)' } else { "SQL\$in" }
+            $endTxt = ''; $st = 'OK'
+            if ($sqlEnd.ContainsKey($maj)) {
+                $end = [datetime]::ParseExact($sqlEnd[$maj], 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture)
+                $dl = [int]($end - $now).TotalDays
+                $endTxt = if ($dl -lt 0) { "; wsparcie zakończone $($sqlEnd[$maj])" } else { "; wsparcie do $($sqlEnd[$maj])" }
+                $st = if ($dl -lt 0) { 'Krytyczne' } elseif ($dl -le 365) { 'Uwaga' } else { 'OK' }
+            }
+            & $ar 'SQL Server' "$label – wersja" "SQL Server $($sqlNames[$maj]) $($setup.Edition), $ver$endTxt" $st
+            $svc = if ($in -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$in" }
+            $agt = if ($in -eq 'MSSQLSERVER') { 'SQLSERVERAGENT' } else { "SQLAgent`$$in" }
+            foreach ($sn in $svc, $agt) {
+                $sv = Get-CimInstance Win32_Service -Filter "Name='$($sn -replace "'", "''")'" -ErrorAction SilentlyContinue
+                if (-not $sv) { continue }
+                $bad = "$($sv.StartMode)" -eq 'Auto' -and "$($sv.State)" -ne 'Running'
+                $exp = "$($setup.Edition)" -like 'Express*' -and $sn -eq $agt
+                & $ar 'SQL Server' "$label – usługa $sn" "$($sv.State), uruchamianie $($sv.StartMode), konto $($sv.StartName)" $(if ($bad -and -not $exp) { if ($sn -eq $svc) { 'Krytyczne' } else { 'Uwaga' } } else { 'OK' })
+            }
+            $dbs = $null
+            try {
+                $srvName = if ($in -eq 'MSSQLSERVER') { '.' } else { ".\$in" }
+                $cn = New-Object System.Data.SqlClient.SqlConnection "Server=$srvName;Integrated Security=SSPI;Connect Timeout=5;Application Name=ServerReview"
+                try {
+                    $cn.Open()
+                    $cmd = $cn.CreateCommand(); $cmd.CommandTimeout = 30
+                    $cmd.CommandText = "SELECT d.name, d.state_desc, d.recovery_model_desc, " +
+                        "(SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type IN ('D','I')) AS last_data, " +
+                        "(SELECT MAX(b.backup_finish_date) FROM msdb.dbo.backupset b WHERE b.database_name = d.name AND b.type = 'L') AS last_log " +
+                        "FROM sys.databases d WHERE d.name <> 'tempdb' AND d.source_database_id IS NULL"
+                    $dbs = New-Object System.Data.DataTable
+                    [void](New-Object System.Data.SqlClient.SqlDataAdapter $cmd).Fill($dbs)
+                } finally { $cn.Dispose() }
+            } catch { & $ar 'SQL Server' "$label – bazy danych" "nie odczytano (konto skanujące bez loginu w SQL albo instancja zatrzymana): $(Short $_.Exception.Message 160)" 'Info' }
+            foreach ($r in @($dbs.Rows)) {
+                if (-not $r) { continue }
+                $ld = if ($r['last_data'] -is [DBNull]) { $null } else { [datetime]$r['last_data'] }
+                $ll = if ($r['last_log'] -is [DBNull]) { $null } else { [datetime]$r['last_log'] }
+                $rec = "$($r['recovery_model_desc'])"
+                $val = "stan $($r['state_desc']), model $rec, kopia danych: $(if ($ld) { D $ld } else { 'nigdy' })$(if ($rec -ne 'SIMPLE') { ", kopia dziennika: $(if ($ll) { D $ll } else { 'nigdy' })" })"
+                & $ar 'SQL Server' "$label – baza $($r['name'])" $val '' 'SqlDb' $null $(if ($ld) { [math]::Round(($now - $ld).TotalDays, 1) } else { $null }) $(if ($ll) { [math]::Round(($now - $ll).TotalHours, 1) } else { $null }) $rec "$($r['state_desc'])"
+            }
+        }
+
+        # IIS: witryny i pule aplikacji (stan), certyfikaty powiązań HTTPS
+        if ((Get-Service W3SVC -ErrorAction SilentlyContinue) -and (Get-Command Get-Website -ErrorAction SilentlyContinue)) {
+            foreach ($ws in @(Get-Website)) {
+                $auto = $true; try { $auto = [bool]$ws.serverAutoStart } catch {}
+                $bs = @($ws.bindings.Collection | ForEach-Object { "$($_.protocol) $($_.bindingInformation)" })
+                & $ar 'IIS' "Witryna $($ws.name)" "$($ws.state); $(Short ($bs -join ', ') 160)" $(if ("$($ws.state)" -ne 'Started' -and $auto) { 'Uwaga' } else { 'OK' })
+                foreach ($b in @($ws.bindings.Collection | Where-Object { $_.protocol -eq 'https' -and $_.certificateHash })) {
+                    $store = if ($b.certificateStoreName) { "$($b.certificateStoreName)" } else { 'My' }
+                    $cert = Get-Item -LiteralPath "Cert:\LocalMachine\$store\$($b.certificateHash)" -ErrorAction SilentlyContinue
+                    if (-not $cert) { & $ar 'IIS' "Witryna $($ws.name) – certyfikat $($b.bindingInformation)" "brak certyfikatu $($b.certificateHash) w magazynie $store" 'Krytyczne'; continue }
+                    $dl = [int]($cert.NotAfter - $now).TotalDays
+                    & $ar 'IIS' "Witryna $($ws.name) – certyfikat $($b.bindingInformation)" "$(Short $cert.Subject 100), ważny do $(D $cert.NotAfter) ($dl dni)" $(if ($dl -lt 0) { 'Krytyczne' } elseif ($dl -le 30) { 'Uwaga' } else { 'OK' })
+                }
+            }
+            foreach ($ap in @(Get-ChildItem IIS:\AppPools -ErrorAction SilentlyContinue)) {
+                $auto = $true; try { $auto = [bool]$ap.autoStart } catch {}
+                & $ar 'IIS' "Pula aplikacji $($ap.Name)" "$($ap.State), .NET $($ap.managedRuntimeVersion), tożsamość $($ap.processModel.identityType)" $(if ("$($ap.State)" -ne 'Started' -and $auto) { 'Uwaga' } else { 'OK' })
+            }
+        }
+
+        # DHCP: zajętość zakresów (progi na stacji) i stan przełączania awaryjnego
+        if ((Get-Service DHCPServer -ErrorAction SilentlyContinue) -and (Get-Command Get-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
+            $stats = @{}; foreach ($x in @(Get-DhcpServerv4ScopeStatistics -ErrorAction SilentlyContinue)) { $stats["$($x.ScopeId)"] = $x }
+            foreach ($sc in @(Get-DhcpServerv4Scope)) {
+                $x = $stats["$($sc.ScopeId)"]
+                $pct = if ($x) { [math]::Round([double]$x.PercentageInUse, 1) } else { $null }
+                $act = "$($sc.State)" -eq 'Active'
+                & $ar 'DHCP' "Zakres $($sc.ScopeId) $($sc.Name)" "$(if (-not $act) { 'nieaktywny; ' })zajęte $(if ($x) { "$pct% ($($x.InUse) z $([int64]$x.InUse + [int64]$x.Free)), wolne $($x.Free)" } else { '?' })" $(if ($act) { '' } else { 'Info' }) $(if ($act) { 'DhcpScope' } else { 'Check' }) $pct
+            }
+            foreach ($fo in @(Get-DhcpServerv4Failover -ErrorAction SilentlyContinue)) {
+                & $ar 'DHCP' "Przełączanie awaryjne $($fo.Name)" "partner $($fo.PartnerServer), tryb $($fo.Mode), stan $($fo.State)" $(if ("$($fo.State)" -eq 'Normal') { 'OK' } else { 'Uwaga' })
+            }
+        }
+
+        # DNS: przekierowania, oczyszczanie (scavenging), strefy z niezabezpieczoną aktualizacją dynamiczną
+        if ((Get-Service DNS -ErrorAction SilentlyContinue) -and (Get-Command Get-DnsServerZone -ErrorAction SilentlyContinue)) {
+            $fw = $null; try { $fw = Get-DnsServerForwarder -ErrorAction Stop } catch {}
+            if ($fw) { & $ar 'DNS' 'Przekierowania (forwarders)' $(if (@($fw.IPAddress).Count) { (@($fw.IPAddress | ForEach-Object { "$_" }) -join ', ') } else { 'brak – rozwiązywanie przez serwery główne (root hints)' }) 'OK' }
+            $scv = $null; try { $scv = Get-DnsServerScavenging -ErrorAction Stop } catch {}
+            if ($scv) { & $ar 'DNS' 'Oczyszczanie przestarzałych rekordów (scavenging)' $(if ($scv.ScavengingState) { "włączone, co $($scv.ScavengingInterval)" } else { 'wyłączone – stare rekordy dynamiczne nie są usuwane' }) $(if ($scv.ScavengingState) { 'OK' } else { 'Info' }) }
+            foreach ($z in @(Get-DnsServerZone | Where-Object { -not $_.IsAutoCreated -and "$($_.ZoneType)" -eq 'Primary' -and $_.ZoneName -ne 'TrustAnchors' })) {
+                $du = "$($z.DynamicUpdate)"
+                $ag = $null; try { $ag = (Get-DnsServerZoneAging -Name $z.ZoneName -ErrorAction Stop).AgingEnabled } catch {}
+                & $ar 'DNS' "Strefa $($z.ZoneName)" "aktualizacje dynamiczne: $du$(if ($z.IsDsIntegrated) { ', zintegrowana z AD' }), starzenie rekordów: $(if ($ag) { 'tak' } elseif ($null -eq $ag) { '?' } else { 'nie' })" $(if ($du -eq 'NonsecureAndSecure') { 'Uwaga' } else { 'OK' })
+            }
+        }
+    })
 
     # ── Active Directory: bezpieczeństwo domeny (zbiera każdy kontroler domeny; stacja ocenia raz na domenę – PDC albo pierwszy DC) ──
     # Tylko odczyt LDAP przez ADSI, bez modułu ActiveDirectory. Warunki są zapisane filtrami LDAP, a z wyników bierzemy samą ścieżkę
@@ -1847,6 +2037,8 @@ $Collector = {
         EventLogs      = $eventLogs
         AuditPolicy    = $auditPolicy
         Crashes        = $crashes
+        Backup         = $backups
+        AppRoles       = $appRoles
         DiskHealth     = $diskHealth
         DomainController = $dcRows
         ADSecurity     = $adSec
@@ -1957,6 +2149,32 @@ function Merge-PrevSections {
         $Prev | Add-Member -NotePropertyName _PrevFrom -NotePropertyValue $from -Force
     }
     $Prev
+}
+
+function Add-DiskHistory {
+    <#
+        Historia zajętości dysków zapisywana w każdej migawce (DiskHistory): punkty z poprzedniej migawki + bieżący pomiar.
+        Z historii stacja wylicza tempo ubywania miejsca i prognozę zapełnienia. Starsze dni: jeden (ostatni) punkt dysku na dzień.
+        Poprzednia migawka sprzed tej funkcji nie ma historii – jej dyski są pierwszym punktem (czas = data pliku).
+    #>
+    param($Cur, $Prev, [string]$PrevFile, [int]$MaxDays = 90)
+    $pts = New-Object System.Collections.Generic.List[object]
+    if ($Prev -and -not ($Prev.PSObject.Properties['Offline'] -and $Prev.Offline)) {
+        if ($Prev.PSObject.Properties['DiskHistory']) { foreach ($p in @($Prev.DiskHistory)) { if ($p -and $p.T) { $pts.Add($p) } } }
+        elseif ($PrevFile -and (Test-Path -LiteralPath $PrevFile)) {
+            $t = ([IO.File]::GetLastWriteTime($PrevFile)).ToString('yyyy-MM-dd HH:mm')
+            foreach ($r in @($Prev.Disks)) { if ($r -and $r.Drive) { $pts.Add([pscustomobject]@{ T = $t; Drive = "$($r.Drive)"; SizeGB = $r.SizeGB; FreeGB = $r.FreeGB }) } }
+        }
+    }
+    $now = Get-Date
+    if (@($Cur.PSObject.Properties['Skipped'].Value) -notcontains 'Disks' -and @($Cur.PSObject.Properties['Failed'].Value) -notcontains 'Disks') {
+        $t = $now.ToString('yyyy-MM-dd HH:mm')
+        foreach ($r in @($Cur.Disks)) { if ($r -and $r.Drive) { $pts.Add([pscustomobject]@{ T = $t; Drive = "$($r.Drive)"; SizeGB = $r.SizeGB; FreeGB = $r.FreeGB }) } }
+    }
+    $min = $now.AddDays(-$MaxDays).ToString('yyyy-MM-dd HH:mm'); $today = $now.ToString('yyyy-MM-dd')
+    # format yyyy-MM-dd HH:mm porównuje się poprawnie jako tekst
+    [object[]]@($pts | Where-Object { "$($_.T)" -ge $min } | Group-Object { if ("$($_.T)".StartsWith($today)) { "$($_.Drive)|$($_.T)" } else { "$($_.Drive)|$("$($_.T)".Substring(0, 10))" } } |
+        ForEach-Object { @($_.Group | Sort-Object T)[-1] } | Sort-Object Drive, T)
 }
 
 function Get-SnapshotSummary([string]$Path) {
@@ -2667,14 +2885,22 @@ try {
                         $json = ([regex]'"System":\{').Replace($json, '"System":{"TimeOffsetSec":' + $off.ToString([Globalization.CultureInfo]::InvariantCulture) + ',', 1)
                     } catch {}
                 }
+                $res.PrevFile = "$($Opt.PrevFile)"
+                if ($Opt.PrevFile) { try { $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $Opt.PrevFile) $Opt.ArrayKeys } catch {} }
+                # historia zajętości dysków (prognoza zapełnienia) przechodzi z migawki do migawki
+                try {
+                    $hist = Add-DiskHistory $d $res.Prev $Opt.PrevFile
+                    if ($hist.Count) {
+                        $d | Add-Member -NotePropertyName DiskHistory -NotePropertyValue $hist -Force
+                        $json = '{"DiskHistory":' + (ConvertTo-Json -InputObject $hist -Depth 3 -Compress) + ',' + $json.Substring(1)
+                    }
+                } catch {}
+                if ($res.Prev) { try { $res.Prev = Merge-PrevSections $d $res.Prev $Opt.OlderFiles $Opt.DiffKeys $Opt.ArrayKeys } catch {} }
                 $file = Join-Path $Opt.SnapDir ($Opt.SafeName + $(if ($Opt.Compress) { '.json.gz' } else { '.json' }))
                 # błąd zapisu na stacji (pełny dysk, brak uprawnień) nie oznacza niedostępności serwera – dane zostają w pamięci
                 try { Write-SnapshotText $file $json; $res.SnapFile = $file } catch { $res.SnapError = "$($_.Exception.Message)" }
                 $res.Data = $d
                 $res.Ok = $true
-                $res.PrevFile = "$($Opt.PrevFile)"
-                if ($Opt.PrevFile) { try { $res.Prev = ConvertFrom-ServerJson (Read-SnapshotText $Opt.PrevFile) $Opt.ArrayKeys } catch {} }
-                if ($res.Prev) { try { $res.Prev = Merge-PrevSections $d $res.Prev $Opt.OlderFiles $Opt.DiffKeys $Opt.ArrayKeys } catch {} }
             }
         }
         if (-not $res.Ok -and $res.ErrorId -in 'CollectorFatal', 'ParseError', 'NoData') {
@@ -2737,7 +2963,7 @@ try {
 $res.DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
 [pscustomobject]$res
 '@
-$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics', 'Test-RemotingTransportError', 'Add-SnapshotErrors',
+$script:WorkerFunctionNames = 'Read-SnapshotText', 'Write-SnapshotText', 'ConvertFrom-ServerJson', 'Merge-PrevSections', 'Add-DiskHistory', 'Get-SnapshotSummary', 'Get-WinRmErrorInfo', 'Get-AdComputerInfo', 'Get-HttpSpnOwners', 'Test-WinRmPort', 'Invoke-ConnectionDiagnostics', 'Test-RemotingTransportError', 'Add-SnapshotErrors',
     'ConvertTo-CveDate', 'Get-CveAgeHours', 'Invoke-CveApi', 'ConvertTo-CveRow', 'Sync-CveProduct', 'Sync-CveExploited', 'Sync-CveKev', 'New-CveIndex', 'Set-CveIndexFlags', 'Sync-CveData'
 # Pełna definicja funkcji z drzewa składni (razem z deklaracją parametrów)
 $script:WorkerScript = $script:WorkerParams + "`n" + ((@($script:WorkerFunctionNames | ForEach-Object { (Get-Item "function:$_").ScriptBlock.Ast.Extent.Text })) -join "`n`n") + "`n" + $script:WorkerBody
@@ -2762,6 +2988,7 @@ $script:Sections = @(
     @{ Key = 'Restarts';       Header = 'Restarty' }
     @{ Key = 'Downtime';       Header = 'Przestoje (wyłączenie → start)' }
     @{ Key = 'Crashes';        Header = 'Awarie systemu (BSOD)' }
+    @{ Key = 'Backup';         Header = 'Kopie zapasowe' }
     @{ Key = 'Network';        Header = 'Adresacja i karty sieciowe' }
     @{ Key = 'Listening';      Header = 'Porty nasłuchujące' }
     @{ Key = 'Connections';    Header = 'Aktywne połączenia' }
@@ -2779,6 +3006,7 @@ $script:Sections = @(
     @{ Key = 'Folders';        Header = 'Foldery' }
     @{ Key = 'DomainController'; Header = 'Kontroler domeny' }
     @{ Key = 'ADSecurity';     Header = 'Active Directory: bezpieczeństwo domeny' }
+    @{ Key = 'AppRoles';       Header = 'Role: SQL Server, IIS, DHCP, DNS' }
     @{ Key = 'HvHost';         Header = 'Hyper-V: host i pojemność'; Computed = $true }
     @{ Key = 'Cluster';        Header = 'Klaster Hyper-V' }
     @{ Key = 'HyperV';         Header = 'Hyper-V: maszyny' }
@@ -2839,6 +3067,7 @@ $script:Headers = @{
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
     LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Host Hyper-V'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
+    LicenseStatus = 'Aktywacja Windows'; LicenseStatusId = 'Aktywacja (kod)'; LicenseChannel = 'Kanał licencji'; LicenseGraceDays = 'Aktywacja: pozostało dni'; KmsHost = 'Serwer KMS'
     Subcategory = 'Podkategoria'; Guid = 'GUID'; Setting = 'Ustawienie'; Required = 'Wymagane'
     MaxSizeMB = 'Rozmiar maks. [MB]'; UsedMB = 'Zajęte [MB]'; Mode = 'Tryb'; Records = 'Liczba zdarzeń'; Full = 'Pełny'; Oldest = 'Najstarsze zdarzenie'; CoveredDays = 'Pokrycie [dni]'
     Code = 'Kod'; Health = 'Stan'; WearPct = 'Zużycie [%]'; TempC = 'Temp. [°C]'; UncorrectedErrors = 'Błędy nieskorygowane'; PowerOnHours = 'Godziny pracy'
@@ -2862,6 +3091,8 @@ $script:Headers = @{
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
     Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
+    Role = 'Rola'; Product = 'Produkt'; Job = 'Zadanie'; LastResult = 'Ostatni wynik'; LastSuccess = 'Ostatnia udana'; SuccessAgeDays = 'Dni od udanej'
+    GrowthGBDay = 'Ubywa [GB/dzień]'; FullInDays = 'Pełny za [dni]'; RunAgeDays = 'Dni od uruchomienia'; Runs = 'Uruchomienia'; Failures = 'Nieudane'; Target = 'Miejsce docelowe'
     # pola ze starszych migawek (wersja z sekcją Ochrona)
     AvActive = 'Antywirus aktywny'; AvThirdParty = 'Antywirus innego producenta'; FirewallManagedBy = 'Zapora zarządzana przez'; PartOfDomain = 'W domenie'
 }
@@ -3159,6 +3390,8 @@ $script:SettingDefs = @(
     @{ Group = 'Skan'; Key = 'RetryFailed';            Type = 'bool';                           Label = 'Po skanie ponów raz serwery z błędem, który może być chwilowy (restart, przeciążony WinRM)' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskWarnPct';       Type = 'int'; Min = 1; Max = 99;     Label = 'Dysk: ostrzeżenie poniżej [% wolnego]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskCritPct';       Type = 'int'; Min = 1; Max = 99;     Label = 'Dysk: krytyczne poniżej [% wolnego]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastDays';     Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: ostrzeżenie, gdy spadnie poniżej progu krytycznego w ciągu [dni]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastCritDays'; Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: krytyczne, gdy zapełni się w ciągu [dni]' }
     @{ Group = 'Progi: system i dyski'; Key = 'RamWarnPct';        Type = 'int'; Min = 1; Max = 100;    Label = 'RAM: ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'CommitWarnPct';     Type = 'int'; Min = 1; Max = 100;    Label = 'Pamięć wirtualna (commit): ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'UptimeWarnDays';    Type = 'int'; Min = 1; Max = 3650;   Label = 'Uptime: ostrzeżenie powyżej [dni]' }
@@ -3169,6 +3402,11 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: system i dyski'; Key = 'DiskWearWarnPct';   Type = 'int'; Min = 1; Max = 100;    Label = 'Zużycie SSD: ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskRetryWarn';     Type = 'int'; Min = 1; Max = 100000; Label = 'Ponowienia/resety I/O dysku: ostrzeżenie od [liczba]' }
     @{ Group = 'Progi: system i dyski'; Key = 'BugCheckCritCount'; Type = 'int'; Min = 1; Max = 1000;   Label = 'BSOD: krytyczne od [liczba w okresie]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'BackupWarnDays';    Type = 'int'; Min = 1; Max = 365;    Label = 'Kopia zapasowa: ostrzeżenie, gdy ostatnia udana starsza niż [dni]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'BackupCritDays';    Type = 'int'; Min = 1; Max = 365;    Label = 'Kopia zapasowa: krytyczne, gdy ostatnia udana starsza niż [dni]' }
+    @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'SqlLogBackupHours'; Type = 'int'; Min = 1; Max = 8760; Label = 'SQL: baza w modelu FULL bez kopii dziennika – ostrzeżenie po [godzinach]' }
+    @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'DhcpWarnPct';       Type = 'int'; Min = 1; Max = 100;  Label = 'DHCP: zajętość zakresu – ostrzeżenie od [%]' }
+    @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'DhcpCritPct';       Type = 'int'; Min = 1; Max = 100;  Label = 'DHCP: zajętość zakresu – krytyczne od [%]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'CertWarnDays';       Type = 'int'; Min = 1; Max = 3650;    Label = 'Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'RecentSoftwareDays'; Type = 'int'; Min = 1; Max = 3650;    Label = 'Nowe oprogramowanie: z ostatnich [dni]' }
@@ -3176,6 +3414,16 @@ $script:SettingDefs = @(
     @{ Group = 'Podatności (CVE)'; Key = 'CveMonths';       Type = 'int'; Min = 1; Max = 36;  Label = 'Dane CVE z ostatnich [miesięcy]' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveRefreshHours'; Type = 'int'; Min = 1; Max = 720; Label = 'Pobieraj dane CVE ponownie po [godzinach]' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveProxy';        Type = 'string'; Hint = 'np. http://proxy.firma.local:8080'; Label = 'Serwer proxy dla pobierania danych CVE (puste = ustawienia systemowe)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'NotifyOnlyNew';    Type = 'bool';   Label = 'Powiadamiaj tylko o nowych problemach (bez powtarzania tych samych po każdym skanie)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'NotifyWarnings';   Type = 'bool';   Label = 'Powiadamiaj także o ostrzeżeniach (domyślnie tylko problemy krytyczne)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpServer';       Type = 'string'; Hint = 'np. smtp.firma.local (puste = bez e-maila)'; Label = 'Serwer SMTP' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpPort';         Type = 'int'; Min = 1; Max = 65535; Label = 'Port SMTP' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpUseSsl';       Type = 'bool';   Label = 'SMTP: szyfrowanie (STARTTLS)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpFrom';         Type = 'string'; Hint = 'np. serverreview@firma.local'; Label = 'Nadawca' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpTo';           Type = 'list';   Label = 'Odbiorcy (jeden adres na linię)' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'SmtpAttachReport'; Type = 'bool';   Label = 'Dołącz raport HTML do wiadomości' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'WebhookUrl';       Type = 'string'; Hint = 'adres webhooka Slack, Mattermost albo Teams (puste = bez webhooka)'; Label = 'Webhook' }
+    @{ Group = 'Powiadomienia (skan bez okna)'; Key = 'WebhookTeams';     Type = 'bool';   Label = 'Webhook Microsoft Teams (Workflows – karta adaptacyjna) zamiast formatu Slack' }
     @{ Group = 'Hyper-V'; Key = 'CheckpointWarnDays'; Type = 'int'; Min = 1;  Max = 3650; Label = 'Checkpoint: ostrzeżenie po [dniach]' }
     @{ Group = 'Hyper-V'; Key = 'HostRamWarnPct';     Type = 'int'; Min = 30; Max = 300;  Label = 'Host: RAM przydzielony działającym maszynom – ostrzeżenie od [% RAM hosta]' }
     @{ Group = 'Hyper-V'; Key = 'VcpuRatioWarn';      Type = 'int'; Min = 1;  Max = 64;   Label = 'Host: vCPU działających maszyn na procesor logiczny – ostrzeżenie powyżej' }
@@ -3195,10 +3443,10 @@ $script:SettingDefs = @(
     @{ Group = 'Listy'; Key = 'IgnoredWmiConsumers';    Type = 'list';    Label = 'Subskrypcje WMI traktowane jako systemowe (jedna na linię)' }
 )
 $script:SectionGroups = [ordered]@{
-    'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
+    'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Backup', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
     'Bezpieczeństwo'       = @('Hardening', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
-    'Role serwera'         = @('DomainController', 'ADSecurity', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
+    'Role serwera'         = @('DomainController', 'ADSecurity', 'AppRoles', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
 }
 # Stan okna i blokady – zapisywane razem z ustawieniami, ale nie są „ustawieniami skanu”
 $script:UiState = [ordered]@{ WindowWidth = 1540; WindowHeight = 940; WindowMaximized = $false; LogVisible = $false; LogHeight = 200 }
@@ -3376,16 +3624,61 @@ function Invoke-ServerAnalysis {
             if ($freeGB -lt $C.HvHostMinFreeGB) { AddI 'Ostrzeżenie' 'Hyper-V' "Na hoście zostało $freeGB GB wolnej pamięci (maszyny: $($s.HvRamAssignedGB) GB, system hosta: ok. $rootGB GB z $($s.RamGB) GB) – kolejne maszyny i migracje się nie uruchomią" 'HvHost' }
         }
         elseif ($s.RamUsedPct -ge $C.RamWarnPct) { AddI 'Ostrzeżenie' 'Zasoby' "Wysokie użycie RAM: $($s.RamUsedPct)% z $($s.RamGB) GB" 'System' }
+        # Aktywacja Windows: brak aktywacji lub prolongata; KMS odnawia aktywację co 7 dni (180 dni ważności) – mniej niż 150 dni = odnawianie nie działa od miesiąca
+        if ($s.PSObject.Properties['LicenseStatusId'] -and "$($s.LicenseStatusId)" -ne '') {
+            $lg = if ("$($s.LicenseGraceDays)" -ne '') { [double]$s.LicenseGraceDays } else { $null }
+            $lid = [int]$s.LicenseStatusId
+            if ($lid -ne 1) {
+                $sv = if ($null -ne $lg -and $lg -le 7) { 'Krytyczny' } else { 'Ostrzeżenie' }
+                AddI $sv 'System' "Windows nie jest aktywowany: $($s.LicenseStatus)$(if ($null -ne $lg) { ", zostało $([math]::Floor($lg)) dni" }) (kanał $($s.LicenseChannel))" 'System'
+            } elseif ("$($s.LicenseChannel)" -eq 'VOLUME_KMSCLIENT' -and $null -ne $lg -and $lg -lt 150) {
+                $sv = if ($lg -lt 30) { 'Krytyczny' } else { 'Ostrzeżenie' }
+                AddI $sv 'System' "Aktywacja KMS nie odnawia się – wygaśnie za $([math]::Floor($lg)) dni$(if ($s.KmsHost) { " (serwer KMS: $($s.KmsHost))" } else { ' (serwer KMS z DNS: rekord _vlmcs._tcp)' })" 'System'
+            }
+        }
         if ($s.IsHyperV -and $s.PSObject.Properties['HvVmms'] -and "$($s.HvVmms)" -and "$($s.HvVmms)" -ne 'Running') { AddI 'Ostrzeżenie' 'Hyper-V' "Usługa zarządzania Hyper-V (vmms) nie działa ($($s.HvVmms)) – maszyny działają, ale nie da się nimi zarządzać ani ich migrować" 'HvHost' }
     }
     # Ostatni skan nie powiódł się (limit czasu), ale są wcześniejsze dane – pokazujemy je z ostrzeżeniem
     if ($D.PSObject.Properties['_ScanNote'] -and $D._ScanNote) { AddI 'Ostrzeżenie' 'Skan' "$($D._ScanNote)" 'History' }
 
     # Dyski
+    # Prognoza: regresja liniowa wolnego miejsca z historii migawek (DiskHistory) z ostatnich 30 dni, tylko przy niezmienionym rozmiarze dysku
+    $dHist = @{}
+    foreach ($p in @($D.PSObject.Properties['DiskHistory'].Value)) { if ($p -and $p.Drive) { $k = "$($p.Drive)".ToLowerInvariant(); if (-not $dHist.ContainsKey($k)) { $dHist[$k] = New-Object System.Collections.Generic.List[object] }; $dHist[$k].Add($p) } }
+    $hNow = Get-Date
     foreach ($r in $D.Disks) {
         $msg = "Dysk $($r.Drive) $($r.Label): wolne $($r.FreePct)% ($($r.FreeGB) z $($r.SizeGB) GB)"
         if ($r.FreePct -lt $C.DiskCritPct) { AddI 'Krytyczny' 'Dyski' $msg 'Disks'; SetFlag $r 'crit' }
         elseif ($r.FreePct -lt $C.DiskWarnPct) { AddI 'Ostrzeżenie' 'Dyski' $msg 'Disks'; SetFlag $r 'warn' }
+        $full = ''; $rate = ''
+        $pts = @($dHist["$($r.Drive)".ToLowerInvariant()] | Where-Object { $_ })
+        $xs = New-Object System.Collections.Generic.List[double]; $ys = New-Object System.Collections.Generic.List[double]
+        foreach ($p in $pts) {
+            $t = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact("$($p.T)", 'yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$t)) { continue }
+            $age = ($hNow - $t).TotalDays
+            if ($age -gt 30 -or "$($p.FreeGB)" -eq '' -or [math]::Abs([double]$p.SizeGB - [double]$r.SizeGB) -gt [math]::Max(1, [double]$r.SizeGB * 0.02)) { continue }
+            $xs.Add(-$age); $ys.Add([double]$p.FreeGB)
+        }
+        if ($xs.Count -ge 3 -and (($xs | Measure-Object -Maximum -Minimum) | ForEach-Object { $_.Maximum - $_.Minimum }) -ge 2) {
+            $mx = ($xs | Measure-Object -Average).Average; $my = ($ys | Measure-Object -Average).Average
+            $sxy = 0.0; $sxx = 0.0
+            for ($i = 0; $i -lt $xs.Count; $i++) { $sxy += ($xs[$i] - $mx) * ($ys[$i] - $my); $sxx += ($xs[$i] - $mx) * ($xs[$i] - $mx) }
+            $b = if ($sxx -gt 0) { $sxy / $sxx } else { 0 }   # GB na dzień (ujemne = ubywa)
+            $span = ($xs | Measure-Object -Maximum -Minimum) | ForEach-Object { $_.Maximum - $_.Minimum }
+            if ($b -lt 0 -and -$b * $span -ge 1) {
+                $free = [double]$r.FreeGB
+                $dFull = [math]::Floor($free / -$b)
+                $dCrit = [math]::Floor(($free - [double]$r.SizeGB * $C.DiskCritPct / 100) / -$b)
+                $full = [int]$dFull; $rate = [math]::Round(-$b, 2)
+                $tm = "ubywa ok. $rate GB/dzień (trend z $([math]::Round($span)) dni), wolne $free GB"
+                if ($r.FreePct -lt $C.DiskCritPct) { }
+                elseif ($dFull -le $C.DiskForecastCritDays) { AddI 'Krytyczny' 'Dyski' "Dysk $($r.Drive) $($r.Label) zapełni się za ok. $dFull dni – $tm" 'Disks'; SetFlag $r 'crit' }
+                elseif ($dCrit -le $C.DiskForecastDays) { AddI 'Ostrzeżenie' 'Dyski' "Dysk $($r.Drive) $($r.Label) spadnie poniżej $($C.DiskCritPct)% wolnego za ok. $([math]::Max(0, $dCrit)) dni, zapełni się za ok. $dFull dni – $tm" 'Disks'; SetFlag $r 'warn' }
+            }
+        }
+        $r | Add-Member -NotePropertyName GrowthGBDay -NotePropertyValue $rate -Force
+        $r | Add-Member -NotePropertyName FullInDays -NotePropertyValue $full -Force
     }
 
     # Usługi
@@ -3572,6 +3865,35 @@ function Invoke-ServerAnalysis {
         switch ("$($r.Status)") { 'Krytyczne' { SetFlag $r 'crit' } 'Uwaga' { SetFlag $r 'warn' } 'Zalecenie' { SetFlag $r 'info' } 'Info' { SetFlag $r 'info' } }
     }
 
+    # Role aplikacyjne: sprawdzenia ze statusem z kolektora; zakresy DHCP i bazy SQL oceniane wg progów z Ustawień (jeden problem na instancję)
+    $sqlNoBak = @{}; $sqlNoLog = @{}
+    foreach ($r in $D.AppRoles) {
+        $kind = "$($r.PSObject.Properties['_Kind'].Value)"
+        if ($kind -eq 'DhcpScope') {
+            if ("$($r._Pct)" -eq '') { continue }
+            $pct = [double]$r._Pct
+            if ($pct -ge $C.DhcpCritPct) { AddI 'Krytyczny' 'DHCP' "$($r.Check): $($r.Value) – nowe urządzenia nie dostaną adresu" 'AppRoles'; SetFlag $r 'crit' }
+            elseif ($pct -ge $C.DhcpWarnPct) { AddI 'Ostrzeżenie' 'DHCP' "$($r.Check): $($r.Value)" 'AppRoles'; SetFlag $r 'warn' }
+        } elseif ($kind -eq 'SqlDb') {
+            $inst = ("$($r.Check)" -split ' – baza ', 2)[0]; $db = ("$($r.Check)" -split ' – baza ', 2)[-1]
+            $dst = "$($r._DbState)"
+            if ($dst -in 'SUSPECT', 'RECOVERY_PENDING', 'EMERGENCY') { AddI 'Krytyczny' 'SQL Server' "$($r.Check): stan $dst – baza niedostępna" 'AppRoles'; SetFlag $r 'crit'; continue }
+            if ($dst -ne 'ONLINE') { SetFlag $r 'info'; continue }   # OFFLINE, RESTORING (log shipping, AG) – zwykle celowo
+            if ($db -in 'model') { continue }
+            if ("$($r._BackupDays)" -eq '' -or [double]$r._BackupDays -gt $C.BackupCritDays) { if (-not $sqlNoBak.ContainsKey($inst)) { $sqlNoBak[$inst] = New-Object System.Collections.Generic.List[string] }; $sqlNoBak[$inst].Add($db); SetFlag $r 'warn' }
+            elseif ("$($r._Recovery)" -ne 'SIMPLE' -and ("$($r._LogHours)" -eq '' -or [double]$r._LogHours -gt $C.SqlLogBackupHours)) { if (-not $sqlNoLog.ContainsKey($inst)) { $sqlNoLog[$inst] = New-Object System.Collections.Generic.List[string] }; $sqlNoLog[$inst].Add($db); SetFlag $r 'warn' }
+        } else {
+            $cat = if ("$($r.Role)") { "$($r.Role)" } else { 'Role' }
+            switch ($r.Status) {
+                'Krytyczne' { AddI 'Krytyczny' $cat "$($r.Check): $($r.Value)" 'AppRoles'; SetFlag $r 'crit' }
+                'Uwaga'     { AddI 'Ostrzeżenie' $cat "$($r.Check): $($r.Value)" 'AppRoles'; SetFlag $r 'warn' }
+                'Info'      { SetFlag $r 'info' }
+            }
+        }
+    }
+    foreach ($k in $sqlNoBak.Keys) { AddI 'Ostrzeżenie' 'SQL Server' "$k – bazy bez kopii danych od ponad $($C.BackupCritDays) dni ($($sqlNoBak[$k].Count)): $(Join-Short $sqlNoBak[$k] 8)" 'AppRoles' }
+    foreach ($k in $sqlNoLog.Keys) { AddI 'Ostrzeżenie' 'SQL Server' "$k – bazy w modelu FULL bez kopii dziennika od ponad $($C.SqlLogBackupHours) h, dziennik transakcji rośnie ($($sqlNoLog[$k].Count)): $(Join-Short $sqlNoLog[$k] 8)" 'AppRoles' }
+
     # Kontroler domeny (ten sam układ co konfiguracja bezpieczeństwa)
     foreach ($r in $D.DomainController) {
         switch ($r.Status) {
@@ -3641,6 +3963,25 @@ function Invoke-ServerAnalysis {
     $newDumps = @($D.Crashes | Where-Object { "$($_.Type)" -notlike 'BSOD*' -and "$($_.AgeDays)" -ne '' -and [double]$_.AgeDays -le $days })
     if ($newDumps.Count -and -not $bsod.Count) { AddI 'Ostrzeżenie' 'Stabilność' "Nowe pliki zrzutu pamięci z ostatnich $days dni: $(Join-Short ($newDumps | ForEach-Object { "$($_.Type) $($_.Time)" }) 3)" 'Crashes' }
     foreach ($r in $newDumps) { SetFlag $r 'warn' }
+
+    # Kopie zapasowe (Windows Server Backup, Veeam): wiek ostatniej udanej kopii i wynik ostatniego uruchomienia
+    foreach ($r in $D.Backup) {
+        $job = "$($r.Product)$(if ("$($r.Job)" -notin '', 'harmonogram') { " – $($r.Job)" })"
+        $ok  = if ("$($r.SuccessAgeDays)" -ne '') { [double]$r.SuccessAgeDays } else { $null }
+        $run = if ("$($r.RunAgeDays)" -ne '') { [double]$r.RunAgeDays } else { $null }
+        $okTxt = if ($null -ne $ok) { "ostatnia udana $($r.LastSuccess) ($([math]::Floor($ok)) dni temu)" } else { 'brak udanej kopii w dostępnej historii' }
+        if ("$($r.Job)" -eq 'kopia jednorazowa') {
+            AddI 'Info' 'Kopie zapasowe' "$($r.Product) bez harmonogramu – kopie tylko ręczne; $okTxt" 'Backup'; SetFlag $r 'info'
+        } elseif ($r.Product -eq 'Veeam Backup & Replication' -and $null -ne $run -and $run -ge $C.BackupCritDays) {
+            AddI 'Info' 'Kopie zapasowe' "Zadanie $job nie było uruchamiane od $([math]::Floor($run)) dni (wyłączone lub usunięte?); $okTxt" 'Backup'; SetFlag $r 'info'
+        } elseif ($null -eq $ok -or $ok -ge $C.BackupCritDays) {
+            AddI 'Krytyczny' 'Kopie zapasowe' "$job`: $okTxt; ostatnie uruchomienie $($r.LastRun): $($r.LastResult)" 'Backup'; SetFlag $r 'crit'
+        } elseif ($ok -ge $C.BackupWarnDays) {
+            AddI 'Ostrzeżenie' 'Kopie zapasowe' "$job`: $okTxt; ostatnie uruchomienie $($r.LastRun): $($r.LastResult)" 'Backup'; SetFlag $r 'warn'
+        } elseif ($r.LastResult -eq 'Błąd') {
+            AddI 'Ostrzeżenie' 'Kopie zapasowe' "$job`: ostatnie uruchomienie $($r.LastRun) zakończone błędem; $okTxt" 'Backup'; SetFlag $r 'warn'
+        } elseif ($r.LastResult -eq 'Ostrzeżenie') { SetFlag $r 'info' }
+    }
 
     # Zdrowie dysków
     foreach ($r in $D.DiskHealth) {
@@ -6812,8 +7153,9 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
     # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Backup', 'AppRoles' -and -not @($D.$Key | Where-Object { $_ }).Count) { return $false }   # brak oprogramowania kopii / ról na serwerze
     $true
 }
 function Get-WorstFlag($Rows) {
@@ -7838,6 +8180,80 @@ function Enter-InstanceMutex([string]$Kind) {
     $null
 }
 function Wait-Operations { while ($script:Ops.Count -or $script:Abandoned.Count) { Update-Operations; if (-not $script:Ops.Count) { break }; Start-Sleep -Milliseconds 300 } }
+# ── Powiadomienia po skanie bez okna: e-mail (SMTP) i webhook ──
+# Stan ostatniego powiadomienia (klucze problemów) w Cache\notify_state.json – „nowe” = nieobecne w poprzednim powiadomieniu
+function Get-NotifyFile { Join-Path $Config.CacheDir 'notify_state.json' }
+function Test-NotifyConfigured { [bool](($Config.SmtpServer -and $Config.SmtpFrom -and @($Config.SmtpTo | Where-Object { $_ }).Count) -or $Config.WebhookUrl) }
+function Send-Notification([string]$Subject, [string]$Body, [string]$Attachment = '') {
+    # Zwraca listę błędów (pusta = wysłano wszystkimi skonfigurowanymi kanałami)
+    $errs = New-Object System.Collections.Generic.List[string]
+    if ($Config.SmtpServer -and $Config.SmtpFrom -and @($Config.SmtpTo | Where-Object { $_ }).Count) {
+        try {
+            $m = @{ SmtpServer = $Config.SmtpServer; Port = $Config.SmtpPort; From = $Config.SmtpFrom; To = [string[]]@($Config.SmtpTo | Where-Object { $_ })
+                    Subject = $Subject; Body = $Body; Encoding = [Text.Encoding]::UTF8; ErrorAction = 'Stop' }
+            if ($Config.SmtpUseSsl) { $m.UseSsl = $true }
+            if ($Attachment -and (Test-Path -LiteralPath $Attachment) -and (Get-Item -LiteralPath $Attachment).Length -lt 10MB) { $m.Attachments = $Attachment }
+            Send-MailMessage @m -WarningAction SilentlyContinue
+            Write-Log "Wysłano powiadomienie e-mail do: $(@($m.To) -join ', ')" 'OK' 'Powiadomienia'
+        } catch { $errs.Add("e-mail: $($_.Exception.Message)") }
+    }
+    if ($Config.WebhookUrl) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $payload = if ($Config.WebhookTeams) {
+                $blocks = @(@{ type = 'TextBlock'; text = $Subject; weight = 'Bolder'; size = 'Medium'; wrap = $true }) +
+                          @($Body -split "`r?`n" | Where-Object { $_ } | Select-Object -First 60 | ForEach-Object { @{ type = 'TextBlock'; text = $_; wrap = $true; spacing = 'None' } })
+                @{ type = 'message'; attachments = @(@{ contentType = 'application/vnd.microsoft.card.adaptive'; content = @{ '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'; type = 'AdaptiveCard'; version = '1.4'; body = $blocks } }) }
+            } else { @{ text = "*$Subject*`n$Body" } }
+            $p = @{ Uri = $Config.WebhookUrl; Method = 'Post'; ContentType = 'application/json; charset=utf-8'; Body = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress)); UseBasicParsing = $true; TimeoutSec = 60; ErrorAction = 'Stop' }
+            if ($Config.CveProxy) { $p.Proxy = $Config.CveProxy; $p.ProxyUseDefaultCredentials = $true }
+            else { try { [Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials } catch { } }
+            [void](Invoke-WebRequest @p)
+            Write-Log 'Wysłano powiadomienie webhook' 'OK' 'Powiadomienia'
+        } catch { $errs.Add("webhook: $($_.Exception.Message)") }
+    }
+    foreach ($e in $errs) { Write-Log "Nie wysłano powiadomienia – $e" 'ERROR' 'Powiadomienia' }
+    $errs.ToArray()
+}
+function Send-ScanNotification([string]$ReportPath) {
+    if (-not (Test-NotifyConfigured)) { return }
+    $maxRank = if ($Config.NotifyWarnings) { 1 } else { 0 }
+    $cur = [ordered]@{}
+    foreach ($k in @($script:Data.Keys)) {
+        $d = $script:Data[$k]
+        foreach ($i in @($d.PSObject.Properties['_Issues'].Value)) { if ($i -and $i.Rank -le $maxRank) { $cur["$k|$($i.IssueKey)"] = $i } }
+    }
+    $old = @{}
+    $f = Get-NotifyFile
+    if (Test-Path -LiteralPath $f) { try { foreach ($x in @((Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json).Keys)) { $old["$x"] = $true } } catch { } }
+    $send = @(foreach ($key in $cur.Keys) { if (-not $Config.NotifyOnlyNew -or -not $old.ContainsKey($key)) { $cur[$key] } })
+    $gone = @($old.Keys | Where-Object { -not $cur.Contains($_) }).Count
+    if ($send.Count) {
+        $crit = @($send | Where-Object { $_.Rank -eq 0 }).Count
+        $srv  = @($send | ForEach-Object { $_.ServerKey } | Select-Object -Unique).Count
+        $what = if ($Config.NotifyOnlyNew) { 'nowe problemy' } else { 'problemy' }
+        $subject = "Przegląd serwerów: $what – krytyczne $crit$(if ($send.Count -gt $crit) { ", ostrzeżenia $($send.Count - $crit)" }) ($srv serw.)"
+        $lines = @($send | Sort-Object Rank, Server | Select-Object -First 100 | ForEach-Object { "[$($_.Severity)] $($_.Server) – $($_.Category): $($_.Message)" })
+        $body = ($lines -join "`r`n")
+        if ($send.Count -gt 100) { $body += "`r`n… i $($send.Count - 100) więcej" }
+        $tot = @($script:Data.Values | ForEach-Object { [int]$_.PSObject.Properties['_Crit'].Value } | Measure-Object -Sum).Sum
+        $body += "`r`n`r`nWszystkich serwerów: $($script:Data.Count), aktywnych problemów krytycznych: $tot$(if ($Config.NotifyOnlyNew -and $gone) { ", rozwiązanych od poprzedniego powiadomienia: $gone" })."
+        if ($ReportPath) { $body += "`r`nRaport: $ReportPath" }
+        $errs = @(Send-Notification $subject $body $(if ($Config.SmtpAttachReport) { $ReportPath } else { '' }))
+        if ($errs.Count) { return }   # stan bez zmian – przy następnym skanie powiadomienie zostanie wysłane ponownie
+    } else { Write-Log "Brak $(if ($Config.NotifyOnlyNew) { 'nowych ' })problemów do powiadomienia" 'INFO' 'Powiadomienia' }
+    try {
+        New-Item -ItemType Directory -Force -Path $Config.CacheDir | Out-Null
+        [IO.File]::WriteAllText($f, ([pscustomobject]@{ Sent = (Get-Date).ToString('s'); Keys = [string[]]@($cur.Keys) } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding $false))
+    } catch { Write-Log "Nie zapisano stanu powiadomień: $($_.Exception.Message)" 'WARN' 'Powiadomienia' }
+}
+function Invoke-TestNotification {
+    $script:Headless = $true
+    if (-not (Test-NotifyConfigured)) { Write-Log 'Powiadomienia nie są skonfigurowane (Ustawienia → Powiadomienia).' 'ERROR' 'Powiadomienia'; return 2 }
+    $errs = @(Send-Notification 'Przegląd serwerów: wiadomość testowa' "Powiadomienia działają. Wysłano z $env:COMPUTERNAME ($env:USERDOMAIN\$env:USERNAME), $(Get-NowText).")
+    if ($errs.Count) { return 1 } else { return 0 }
+}
+
 function Invoke-HeadlessScan {
     $script:Headless = $true
     $mx = Enter-InstanceMutex 'Scan'
@@ -7858,13 +8274,16 @@ function Invoke-HeadlessScan {
         Start-Scan @($script:Servers | ForEach-Object { $_.Name }); Wait-Operations
         $st = $script:LastScanState
         if (-not $st) { Write-Log 'Skan się nie odbył.' 'ERROR' 'Skan'; return 2 }
-        if (-not $NoReport) { try { [void](Export-HtmlReport -Mode $ReportMode -NoOpen) } catch { Write-Log "Nie utworzono raportu: $($_.Exception.Message)" 'ERROR' 'Raport' } }
+        $rep = ''
+        if (-not $NoReport) { try { $rep = "$(@(Export-HtmlReport -Mode $ReportMode -NoOpen)[-1])" } catch { Write-Log "Nie utworzono raportu: $($_.Exception.Message)" 'ERROR' 'Raport' } }
+        try { Send-ScanNotification $rep } catch { Write-Log "Błąd powiadomień: $($_.Exception.Message)" 'ERROR' 'Powiadomienia' }
         Remove-OldLogs
         if ($st.Offline -or $st.Timeout -or $st.Cancelled) { return 1 }   # Cancelled: limit czasu całego skanu
         return 0
     } catch { Write-Log "Błąd skanu bez okna: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program'; return 2 }
     finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
 }
+if ($TestNotify) { exit (Invoke-TestNotification) }
 if ($Scan) { exit (Invoke-HeadlessScan) }
 #endregion
 

@@ -15,6 +15,8 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Interfejs](#interfejs)
 - [Niedostępne serwery](#niedostępne-serwery)
 - [Hyper-V i klastry](#hyper-v-i-klastry)
+- [Kopie zapasowe](#kopie-zapasowe)
+- [Role aplikacyjne: SQL Server, IIS, DHCP, DNS](#role-aplikacyjne-sql-server-iis-dhcp-dns)
 - [Bezpieczeństwo: utwardzenie, Active Directory](#bezpieczeństwo-utwardzenie-active-directory)
 - [Podatności (CVE)](#podatności-cve)
 - [Wykrywane problemy](#wykrywane-problemy)
@@ -33,17 +35,18 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 
 | Obszar | Zbierane dane |
 |---|---|
-| **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, host Hyper-V, na którym działa maszyna |
-| **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
+| **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU, użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, aktywacja Windows (stan, kanał licencji, serwer KMS), host Hyper-V, na którym działa maszyna |
+| **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, kopie zapasowe (Windows Server Backup, Veeam), zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych i błędy dyskowe, rozmiar dzienników i okres, który obejmują |
 | **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-active-directory)), zdarzenia bezpieczeństwa (nieudane logowania, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty, udziały, autostart |
 | **Podatności (CVE)** | brakujące poprawki Windows: CVE, dla których Microsoft wydał poprawkę nowszą niż zainstalowana, z wyróżnieniem krytycznych i aktywnie wykorzystywanych (Microsoft, CISA KEV) – wylicza stacja z danych pobranych z internetu, [szczegóły](#podatności-cve) |
 | **Usługi, sieć i pliki** | usługi (spoza Microsoft, zatrzymane automatyczne, działające na kontach użytkowników, z niecytowaną ścieżką), zadania harmonogramu spoza `\Microsoft\` z wynikiem ostatniego uruchomienia, karty sieciowe i adresacja, porty nasłuchujące i aktywne połączenia (z procesem i usługą), sesje użytkowników, zawartość wskazanych folderów |
 | **Oprogramowanie** | zainstalowane programy, ostatnie aktualizacje (KB) |
 | **Kontroler domeny** | SYSVOL/DFSR, replikacja AD, podpisywanie LDAP i channel binding, wyjątki bezpiecznego kanału Netlogon, konta i usługi wymagające Kerberos RC4 (zdarzenia KDCSVC 201–209) |
 | **Active Directory** | ocena raz na domenę: krbtgt, delegowanie, prawa replikacji (DCSync), AS-REP roasting i Kerberoasting kont uprzywilejowanych, grupy uprzywilejowane, LAPS, zaufania, hasła w SYSVOL (GPP cpassword i skrypty), zasady haseł, sIDHistory i inne |
+| **Role aplikacyjne** | SQL Server (wersja i koniec wsparcia, usługi, bazy danych: stan, model odzyskiwania, ostatnia kopia danych i dziennika), IIS (witryny, pule aplikacji, certyfikaty powiązań HTTPS), DHCP (zajętość zakresów, przełączanie awaryjne), DNS (przekierowania, oczyszczanie rekordów, strefy z niezabezpieczoną aktualizacją dynamiczną) – [szczegóły](#role-aplikacyjne-sql-server-iis-dhcp-dns) |
 | **Hyper-V** | pojemność hosta (vCPU na procesor logiczny, RAM przydzielony maszynom, wolna pamięć), maszyny wirtualne ze stanem, heartbeatem, systemem gościa i adresami IP (z usług integracji), checkpointy, dyski VM i zapas miejsca na ich wzrost, replikacja, ustawienia startu, klaster pracy awaryjnej (węzły, wolumeny CSV, role maszyn, kworum) |
 
-Sekcje kontrolera domeny, Active Directory i Hyper-V pokazują się tylko na serwerach z tą rolą. Hasła wpisane w linię poleceń usług, zadań, autostartu i subskrypcji WMI (np. `-P haslo`, `password=…`) są maskowane już na serwerze i nie trafiają do migawek, raportów ani plików CSV.
+Sekcje kontrolera domeny, Active Directory, ról aplikacyjnych i Hyper-V pokazują się tylko na serwerach z tą rolą. Hasła wpisane w linię poleceń usług, zadań, autostartu i subskrypcji WMI (np. `-P haslo`, `password=…`) są maskowane już na serwerze i nie trafiają do migawek, raportów ani plików CSV.
 
 ## Wymagania
 
@@ -89,8 +92,26 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Narzedzia\ServerRevie
 | `-ReportMode Summary` | raport podsumowujący: problemy, niedostępność, Hyper-V i wiersze wymagające uwagi (domyślnie) |
 | `-ReportMode Full` | raport pełny ze wszystkimi sekcjami każdego serwera |
 | `-NoReport` | bez raportu HTML |
+| `-TestNotify` | tylko wysyła wiadomość testową na skonfigurowane kanały powiadomień i kończy pracę (kod 0 – wysłano, 1 – błąd, 2 – brak konfiguracji) |
 
 Kod wyjścia: **0** – wszystkie serwery odpowiedziały, **1** – część serwerów bez połączenia lub z przekroczonym limitem czasu, **2** – skan się nie odbył (np. brak listy serwerów albo inny skan bez okna z tego folderu jeszcze trwa). Zadanie musi działać na koncie z uprawnieniami administratora na serwerach. Wyniki skanu bez okna widać po otwarciu programu.
+
+### Powiadomienia (e-mail, webhook)
+
+Po skanie bez okna program może wysłać powiadomienie e-mailem (SMTP) i/lub webhookiem – do Slacka, Mattermosta albo Microsoft Teams (przepływ Workflows „Post to a channel when a webhook request is received”). Konfiguracja jest w Ustawieniach, w grupie **Powiadomienia (skan bez okna)**.
+
+- Domyślnie powiadomienie dotyczy tylko **nowych** problemów krytycznych, czyli takich, których nie było w poprzednim powiadomieniu. Ten sam problem nie przychodzi po każdym skanie, a gdy zniknie i wróci, przyjdzie ponownie. Wyciszone problemy są pomijane.
+- Opcjonalnie powiadomienie obejmuje też ostrzeżenia albo wszystkie aktywne problemy przy każdym skanie (wyłącz „tylko o nowych”).
+- Wiadomość zawiera listę problemów (do 100), liczbę wszystkich aktywnych problemów krytycznych i liczbę rozwiązanych od poprzedniego powiadomienia. Do e-maila można dołączyć raport HTML (do 10 MB).
+- Stan ostatniego powiadomienia jest w pliku `Cache\notify_state.json`. Gdy wysyłka się nie uda, stan się nie zmienia i te same problemy zostaną wysłane przy następnym skanie.
+- Serwer SMTP musi przyjmować pocztę bez logowania (typowy wewnętrzny przekaźnik); szyfrowanie STARTTLS jest opcjonalne. Webhook korzysta z proxy ustawionego dla danych CVE albo z proxy systemowego.
+- Adres webhooka zawiera klucz dostępu i jest zapisany w `settings.json` – chroń ten plik jak hasło.
+
+Konfigurację sprawdzisz poleceniem:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\ServerReview.ps1 -TestNotify
+```
 
 ## Pierwsze kroki
 
@@ -196,6 +217,36 @@ Niedostępność jest zapamiętywana: po ponownym uruchomieniu programu serwer n
 - **Kontrolery domeny.** Ostrzeżenie, gdy wszystkie skanowane kontrolery domeny działają na jednym hoście.
 - **Duplikaty.** Ta sama maszyna dodana pod dwiema nazwami (alias DNS, adres IP, nazwa klastra) jest wykrywana.
 
+## Kopie zapasowe
+
+Sekcja **Kopie zapasowe** pokazuje się tylko na serwerach, na których program znalazł oprogramowanie do kopii:
+
+- **Windows Server Backup** – stan z `Get-WBSummary`: ostatnia kopia i jej wynik, ostatnia udana kopia, następna zaplanowana, miejsce docelowe i liczba wersji;
+- **Veeam Agent for Windows** i **Veeam Backup & Replication** – zadania z dziennika zdarzeń Veeam (zdarzenie 190, zakończenie sesji zadania) z ostatnich 31 dni (albo dłużej, jeśli zakres zdarzeń jest większy): ostatni wynik, ostatnia udana kopia, liczba uruchomień i nieudanych.
+
+Wynik zadania Veeam program odczytuje z poziomu zdarzenia (informacja, ostrzeżenie, błąd), więc nie zależy od języka komunikatów. Na serwerze Veeam Backup & Replication każde zadanie ma osobny wiersz.
+
+Maszyny wirtualne kopiowane na poziomie hosta (np. przez Veeam B&R albo kopię Hyper-V) nie mają w sobie śladu kopii i sekcji nie pokazują – brak sekcji nie jest problemem. Kopii migawkowych woluminów (VSS) program celowo nie odczytuje: takie zapytania są typowe dla złośliwego oprogramowania i bywają blokowane przez antywirusy.
+
+## Role aplikacyjne: SQL Server, IIS, DHCP, DNS
+
+Sekcja **Role: SQL Server, IIS, DHCP, DNS** zbiera dane tylko z ról zainstalowanych na serwerze.
+
+**SQL Server.** Instancje i wersje program odczytuje z rejestru, a stan usług (silnik i SQL Server Agent) z WMI. Wersja po końcu wsparcia Microsoft to problem krytyczny, mniej niż rok do końca – ostrzeżenie. Listę baz i historię kopii (`msdb.dbo.backupset`) program pobiera zapytaniem tylko do odczytu, z uwierzytelnianiem Windows konta skanującego. Gdy to konto nie ma loginu w SQL Server, sekcja pokazuje tylko instancje i usługi z adnotacją „nie odczytano”. Wykrywane problemy:
+
+- baza w stanie `SUSPECT`, `RECOVERY_PENDING` albo `EMERGENCY` – krytyczny;
+- bazy bez kopii danych (pełnej albo różnicowej) od ponad 7 dni (próg kopii zapasowych z Ustawień) – jedno ostrzeżenie na instancję z listą baz;
+- bazy w modelu `FULL`/`BULK_LOGGED` bez kopii dziennika od ponad 24 h – dziennik transakcji rośnie bez końca;
+- zatrzymana usługa silnika (krytyczny) albo SQL Server Agent (ostrzeżenie) z uruchamianiem automatycznym.
+
+Bazy `OFFLINE` i `RESTORING` (np. log shipping) są tylko oznaczane. Kopie robione narzędziami zgodnymi z VSS (np. Veeam) są zapisywane w `msdb`, więc się liczą. Na replikach pomocniczych grup dostępności kopie mogą być robione na innym węźle – takie ostrzeżenia można wyciszyć.
+
+**IIS.** Witryny i pule aplikacji, które powinny startować automatycznie, a są zatrzymane – ostrzeżenie. Certyfikat powiązania HTTPS wygasły albo brakujący w magazynie – krytyczny, wygasający w ciągu 30 dni – ostrzeżenie.
+
+**DHCP.** Zajętość każdego aktywnego zakresu IPv4: od 85% ostrzeżenie, od 95% krytyczny (progi w Ustawieniach). Relacja przełączania awaryjnego w stanie innym niż `Normal` – ostrzeżenie.
+
+**DNS.** Strefa podstawowa przyjmująca niezabezpieczone aktualizacje dynamiczne (`NonsecureAndSecure`) – ostrzeżenie, bo każdy komputer w sieci może podmienić w niej rekordy. Wyłączone oczyszczanie przestarzałych rekordów jest oznaczane informacyjnie; przekierowania i starzenie rekordów w strefach są widoczne w tabeli.
+
 ## Bezpieczeństwo: utwardzenie, Active Directory
 
 ### Utwardzenie i status „Zalecenie”
@@ -251,13 +302,16 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 
 - serwer nie odpowiada (z przyczyną z [diagnozy](#niedostępne-serwery)); maszyna wirtualna serwera wstrzymana (Paused) albo w stanie krytycznym na hoście;
 - host Hyper-V nie odpowiada razem z co najmniej 2 maszynami z listy, które na nim działały; nie odpowiada większość serwerów jednej podsieci; żaden serwer nie odpowiedział z powodu sieci stacji;
-- mniej niż 10% wolnego miejsca na dysku (także punkty montowania i wolumeny CSV);
+- mniej niż 10% wolnego miejsca na dysku (także punkty montowania i wolumeny CSV); dysk zapełni się w ciągu 7 dni przy obecnym tempie ([prognoza](#prognoza-zapełnienia-dysków));
 - nieudane logowania z adresów publicznych, czyli logowanie (RDP/SMB) jest prawdopodobnie dostępne z internetu;
 - wyczyszczony dziennik zdarzeń;
 - różnica czasu względem stacji co najmniej 300 s (limit Kerberos);
 - system po końcu wsparcia Microsoft;
+- Windows nieaktywowany z okresem prolongaty krótszym niż 7 dni; aktywacja KMS wygasa za mniej niż 30 dni;
 - brak poprawek Windows dla podatności aktywnie wykorzystywanych (oznaczonych przez Microsoft albo w katalogu CISA KEV);
 - dysk fizyczny w stanie awarii; co najmniej 2 awarie BSOD w analizowanym okresie;
+- role: baza SQL niedostępna (SUSPECT, RECOVERY_PENDING), zatrzymany silnik SQL Server, SQL Server po końcu wsparcia, certyfikat HTTPS witryny IIS wygasły albo brakujący, zakres DHCP zajęty w co najmniej 95%;
+- brak udanej kopii zapasowej (Windows Server Backup, zadanie Veeam) od co najmniej 7 dni albo w ogóle w dostępnej historii;
 - krytyczne ustawienia bezpieczeństwa: wyłączona ochrona w czasie rzeczywistym, sygnatury antywirusa starsze niż 7 dni, włączony WDigest, autologowanie z zapisanym hasłem, jawnie włączone SSL 2.0/3.0, Point and Print bez ostrzeżeń i uprawnień administratora, urząd certyfikacji z `EDITF_ATTRIBUTESUBJECTALTNAME2` (ESC6);
 - w grupie Administratorzy jest grupa obejmująca wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy domeny i podobne);
 - Active Directory: delegowanie nieograniczone, delegowanie albo RBCD wobec kontrolerów domeny, prawa replikacji (DCSync) poza grupami administracyjnymi, uprzywilejowane konta z SPN albo bez wstępnego uwierzytelniania Kerberos, hasła w preferencjach zasad grupy (`cpassword`), uprzywilejowany SID w sIDHistory;
@@ -268,14 +322,17 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 **Ostrzeżenie**
 
 - skan serwera przekroczył limit czasu (pokazane są poprzednie dane); serwer odpowiada, ale kolektor zakończył się błędem; maszyna wirtualna serwera wyłączona (do 30 dni) lub zapisana; niedostępny gość niedostępnego hosta Hyper-V;
-- mniej niż 20% wolnego miejsca na dysku;
+- mniej niż 20% wolnego miejsca na dysku; dysk spadnie poniżej 10% wolnego w ciągu 30 dni przy obecnym tempie;
 - uptime powyżej 45 dni, oczekujący restart, brak aktualizacji od ponad 45 dni;
+- Windows nieaktywowany albo w okresie prolongaty; aktywacja KMS nie odnawia się (zostało mniej niż 150 ze 180 dni – serwer nie odnowił jej od ok. miesiąca);
 - brak poprawek Windows dla podatności krytycznych;
 - użycie RAM lub pamięci wirtualnej co najmniej 90%, zdarzenia wyczerpania pamięci (na hoście Hyper-V zamiast progu RAM liczy się zapas wolnej pamięci: mniej niż 8 GB);
+- ostatnia udana kopia zapasowa starsza niż 2 dni, ostatnie uruchomienie zadania kopii zakończone błędem;
 - zatrzymane usługi automatyczne, niecytowane ścieżki usług, nieudane zadania harmonogramu;
 - zdarzenia krytyczne w dziennikach, nieoczekiwane wyłączenia (z odesłaniem do sekcji Przestoje), pojedyncza awaria BSOD, pliki zrzutów pamięci;
 - co najmniej 25 nieudanych logowań, utworzenie lub usunięcie konta, dodanie do grupy, włączone konto Gość;
 - certyfikaty wygasające w ciągu 30 dni;
+- role: bazy SQL bez kopii danych od tygodnia albo bez kopii dziennika od doby, zatrzymany SQL Server Agent, SQL Server z końcem wsparcia w ciągu roku, zatrzymana witryna lub pula aplikacji IIS, certyfikat HTTPS witryny wygasający w 30 dni, zakres DHCP zajęty w co najmniej 85%, przełączanie awaryjne DHCP poza stanem Normal, strefa DNS z niezabezpieczoną aktualizacją dynamiczną;
 - pełny dziennik zdarzeń, dziennik Security obejmujący krótszy okres niż analiza, niepełna polityka audytu;
 - zużycie SSD co najmniej 90%, nieskorygowane błędy dysków, błędy dysku i NTFS, co najmniej 10 ponowień lub resetów operacji dyskowych;
 - porty wrażliwe otwarte z dowolnego adresu, gdy karta sieciowa jest w profilu Publicznym;
@@ -297,6 +354,7 @@ Każdy problem ma jeden z trzech poziomów. Progi podane poniżej to wartości d
 
 **Info**
 
+- Windows Server Backup bez harmonogramu (tylko kopie ręczne), zadanie Veeam Backup & Replication nieuruchamiane od tygodnia (prawdopodobnie wyłączone);
 - zalecenie naprawy dla niedostępnego serwera; maszyna wyłączona od ponad 30 dni (prawdopodobnie wycofana); serwer z Linuksem pominięty;
 - podsumowanie błędów w dziennikach, zainstalowane usługi, nowe lub zaktualizowane oprogramowanie z ostatnich 14 dni;
 - konta z hasłem bez wygasania, osierocone SID-y w grupach, wygasłe certyfikaty;
@@ -339,6 +397,12 @@ Nowe pozycje są zgłaszane jako ostrzeżenia, a w przypadku oprogramowania jako
 **Sekcja pominięta w poprzednim skanie.** Jeśli sekcję odznaczono na jeden lub kilka skanów (albo jej zebranie się nie udało), po ponownym włączeniu program porównuje ją z ostatnim skanem, w którym była zebrana – zmiany z okresu, gdy była pominięta, nie giną. Takie zmiany są podpisane „od skanu z <data>”. Sekcja pominięta albo niezebrana w bieżącym skanie nie jest porównywana (inaczej cała jej zawartość wyglądałaby na „usuniętą”).
 
 Pierwszy skan po aktualizacji programu do nowej wersji kolektora nie jest porównywany – zmiany są pokazywane od kolejnego skanu.
+
+### Prognoza zapełnienia dysków
+
+Każda migawka przechowuje historię zajętości dysków z ostatnich 90 dni (jeden pomiar na dzień, a z dnia bieżącego wszystkie). Na jej podstawie program liczy tempo ubywania miejsca (regresja liniowa z ostatnich 30 dni) i w sekcji **Dyski** pokazuje kolumny „Ubywa [GB/dzień]” i „Pełny za [dni]”.
+
+Prognoza powstaje, gdy są co najmniej 3 pomiary z okresu dłuższego niż 2 dni, a miejsca ubyło łącznie co najmniej 1 GB. Pomiary sprzed zmiany rozmiaru dysku są pomijane. Historia zaczyna się od pierwszego skanu po aktualizacji programu (pierwszym punktem jest poprzednia migawka), więc pierwsze prognozy pojawiają się po kilku dniach skanowania.
 
 ## Raport HTML
 
@@ -405,6 +469,8 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 |---|---|
 | Dysk: ostrzeżenie poniżej [% wolnego] | 20 |
 | Dysk: krytyczne poniżej [% wolnego] | 10 |
+| Prognoza dysku: ostrzeżenie, gdy spadnie poniżej progu krytycznego w ciągu [dni] | 30 |
+| Prognoza dysku: krytyczne, gdy zapełni się w ciągu [dni] | 7 |
 | RAM: ostrzeżenie od [%] | 90 |
 | Pamięć wirtualna (commit): ostrzeżenie od [%] | 90 |
 | Uptime: ostrzeżenie powyżej [dni] | 45 |
@@ -415,6 +481,16 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | Zużycie SSD: ostrzeżenie od [%] | 90 |
 | Ponowienia/resety I/O dysku: ostrzeżenie od [liczba] | 10 |
 | BSOD: krytyczne od [liczba w okresie] | 2 |
+| Kopia zapasowa: ostrzeżenie, gdy ostatnia udana starsza niż [dni] | 2 |
+| Kopia zapasowa: krytyczne, gdy ostatnia udana starsza niż [dni] | 7 |
+
+**Progi: role (SQL, DHCP)**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| SQL: baza w modelu FULL bez kopii dziennika – ostrzeżenie po [godzinach] | 24 |
+| DHCP: zajętość zakresu – ostrzeżenie od [%] | 85 |
+| DHCP: zajętość zakresu – krytyczne od [%] | 95 |
 
 **Progi: bezpieczeństwo**
 
@@ -461,6 +537,21 @@ Przycisk ⚙ otwiera okno ustawień. Zmiany zapisują się w pliku `settings.jso
 | Pobieraj dane CVE ponownie po [godzinach] | 24 |
 | Serwer proxy dla pobierania danych CVE (puste = ustawienia systemowe) | (puste) |
 
+**Powiadomienia (skan bez okna)**
+
+| Ustawienie | Domyślnie |
+|---|---|
+| Powiadamiaj tylko o nowych problemach (bez powtarzania tych samych po każdym skanie) | tak |
+| Powiadamiaj także o ostrzeżeniach (domyślnie tylko problemy krytyczne) | nie |
+| Serwer SMTP | (puste – bez e-maila) |
+| Port SMTP | 25 |
+| SMTP: szyfrowanie (STARTTLS) | nie |
+| Nadawca | (puste) |
+| Odbiorcy (jeden adres na linię) | (puste) |
+| Dołącz raport HTML do wiadomości | tak |
+| Webhook | (puste – bez webhooka) |
+| Webhook Microsoft Teams (Workflows – karta adaptacyjna) zamiast formatu Slack | nie |
+
 **Listy**
 
 | Ustawienie | Domyślnie |
@@ -488,6 +579,7 @@ Reports\Przeglad_serwerow_RRRRMMDD_GGMM.html      raporty HTML
 Logs\ServerReview_RRRRMMDD.log                    dziennik operacji
 Logs\Availability_RRRRMM.csv                      dziennik dostępności
 Cache\cve_*.json.gz                               dane CVE pobrane przez stację (Microsoft, CISA KEV)
+Cache\notify_state.json                           problemy z ostatniego powiadomienia (e-mail, webhook)
 ```
 
 Jeśli skrypt uruchomiono bez pliku (np. wklejony do konsoli), zamiast folderu skryptu używany jest `%USERPROFILE%\Documents\ServerReview`. Jeśli folder skryptu jest tylko do odczytu (np. udział sieciowy), dane trafiają do `%LOCALAPPDATA%\ServerReview`, a lista serwerów i ustawienia są tam kopiowane przy pierwszym uruchomieniu.
