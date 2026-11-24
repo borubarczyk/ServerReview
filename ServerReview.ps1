@@ -335,6 +335,8 @@ $Collector = {
         $sys.Model         = "$($cs.Manufacturer) $($cs.Model)".Trim()
         $sys.CPUName       = ("$($cpu[0].Name)" -replace '\s+', ' ').Trim()
         $sys.Cores         = [int](($cpu | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
+        $sys.CpuSockets    = $cpu.Count   # gniazda (w maszynie wirtualnej – gniazda wirtualne); szczegóły w sekcji Sprzęt i konfiguracja
+        $sys.CpuCores      = [int](($cpu | Measure-Object NumberOfCores -Sum).Sum)
         $sys.CpuLoad       = [int](($cpu | Measure-Object LoadPercentage -Average).Average)
         $sys.RamGB         = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
         $sys.RamUsedPct    = [int](100 - ($os.FreePhysicalMemory / $os.TotalVisibleMemorySize * 100))
@@ -1486,7 +1488,7 @@ $Collector = {
                     Name = $vm.Name; State = "$($vm.State)"; Status = "$($vm.Status)"; Heartbeat = "$($vm.Heartbeat)"; UptimeDays = [math]::Round($vm.Uptime.TotalDays, 1)
                     StateSince = $(if ($since2.ContainsKey($id)) { D $since2[$id] } else { '' })
                     CPU = $vm.ProcessorCount; CpuUsage = $vm.CPUUsage; MemGB = [math]::Round($vm.MemoryAssigned / 1GB, 1); MemStartupGB = [math]::Round($vm.MemoryStartup / 1GB, 1)
-                    MemMaxGB = $(if ($vm.DynamicMemoryEnabled) { [math]::Round($vm.MemoryMaximum / 1GB, 1) } else { $null }); MemDemandGB = [math]::Round($vm.MemoryDemand / 1GB, 1)
+                    MemMinGB = $(if ($vm.DynamicMemoryEnabled) { [math]::Round($vm.MemoryMinimum / 1GB, 1) } else { $null }); MemMaxGB = $(if ($vm.DynamicMemoryEnabled) { [math]::Round($vm.MemoryMaximum / 1GB, 1) } else { $null }); MemDemandGB = [math]::Round($vm.MemoryDemand / 1GB, 1)
                     DynamicMem = $(if ($vm.DynamicMemoryEnabled) { 'Tak' } else { 'Nie' }); Gen = $vm.Generation; Version = "$($vm.Version)"
                     Replication = "$($vm.ReplicationHealth)"; ReplicationMode = "$($vm.ReplicationMode)"
                     Checkpoints = [int]$snByVm[$id]; CheckpointType = "$($vm.CheckpointType)"
@@ -1644,27 +1646,215 @@ $Collector = {
     $opMap = @{ '2' = 'OK'; 'OK' = 'OK'; '3' = 'zdegradowany'; 'Degraded' = 'zdegradowany'; '5' = 'przewidywana awaria'; 'Predictive Failure' = 'przewidywana awaria'
                 '6' = 'błąd'; 'Error' = 'błąd'; '7' = 'błąd nienaprawialny'; 'Non-Recoverable Error' = 'błąd nienaprawialny'; '10' = 'zatrzymany'; 'Stopped' = 'zatrzymany'
                 '11' = 'w serwisie'; 'In Service' = 'w serwisie'; '13' = 'utrata komunikacji'; 'Lost Communication' = 'utrata komunikacji' }
-    $diskHealth = @(S 'DiskHealth' 'Zdrowie dysków' {
-        function OpText($v) { (@(@($v) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } }) -join ', ') }
-        $pools = @()
+    # Dyski fizyczne raz na skan – dla sekcji Zdrowie dysków i Sprzęt i konfiguracja (ta sama lista i ten sam filtr S2D, liczniki niezawodności czytane raz).
+    # Storage Spaces Direct: Get-PhysicalDisk na węźle z pulą klastrową widzi dyski WSZYSTKICH węzłów – bierzemy tylko podłączone do tego węzła
+    # (jeden uszkodzony dysk nie daje problemu na każdym węźle); bez węzła magazynu albo przy błędzie – wszystkie dyski jak dotąd.
+    # Błąd wyliczenia zgłasza sekcja Zdrowie dysków; sekcja Sprzęt czyta wtedy dyski z Win32_DiskDrive
+    $pools = @(); $clPool = 0; $pdAll = @(); $pdErr = $null
+    if ((Want 'DiskHealth') -or (Want 'Hardware')) {
+        $t0 = $sw.Elapsed.TotalSeconds
         if (Get-Command Get-StoragePool -ErrorAction SilentlyContinue) { try { $pools = @(Get-StoragePool -IsPrimordial $false -ErrorAction SilentlyContinue) } catch { } }   # brak pul: błąd „nie znaleziono” modułu Storage
         $clPool = @($pools | Where-Object { $_.IsClustered }).Count
         if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
-            # Storage Spaces Direct: Get-PhysicalDisk na węźle z pulą klastrową widzi dyski WSZYSTKICH węzłów – bierzemy tylko podłączone do tego węzła
-            # (jeden uszkodzony dysk nie daje problemu na każdym węźle); bez węzła magazynu albo przy błędzie – wszystkie dyski jak dotąd
-            $pds = $null
-            if ($clPool -and (Get-Command Get-StorageNode -ErrorAction SilentlyContinue)) {
-                try {
-                    $stn = @(Get-StorageNode -ErrorAction Stop | Where-Object { "$($_.Name)" -eq $env:COMPUTERNAME -or "$($_.Name)" -like "$env:COMPUTERNAME.*" })
-                    $seen = @{}   # węzeł bywa widoczny w kilku podsystemach magazynu – bez powtórzeń dysków
-                    if ($stn.Count) { $pds = @($stn | Get-PhysicalDisk -PhysicallyConnected -ErrorAction Stop | Where-Object { $k = "$($_.UniqueId)|$($_.SerialNumber)"; if ($k -eq '|') { $k = "$($_.ObjectId)" }; if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true } }) }
-                } catch { $pds = $null }
+            try {
+                $pds = $null
+                if ($clPool -and (Get-Command Get-StorageNode -ErrorAction SilentlyContinue)) {
+                    try {
+                        $stn = @(Get-StorageNode -ErrorAction Stop | Where-Object { "$($_.Name)" -eq $env:COMPUTERNAME -or "$($_.Name)" -like "$env:COMPUTERNAME.*" })
+                        $seen = @{}   # węzeł bywa widoczny w kilku podsystemach magazynu – bez powtórzeń dysków
+                        if ($stn.Count) { $pds = @($stn | Get-PhysicalDisk -PhysicallyConnected -ErrorAction Stop | Where-Object { $k = "$($_.UniqueId)|$($_.SerialNumber)"; if ($k -eq '|') { $k = "$($_.ObjectId)" }; if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true } }) }
+                    } catch { $pds = $null }
+                }
+                if (-not $pds) { $pds = @(Get-PhysicalDisk) }
+                # licznik niezawodności (zużycie, temperatura, godziny pracy, błędy) – brak dla dysków wirtualnych i woluminów kontrolera RAID
+                $pdAll = @(foreach ($pd in $pds) { $rc = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}; @{ D = $pd; R = $rc } })
+            } catch { $pdErr = $_; $pdAll = @() }
+        }
+        $timings['Dyski fizyczne'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
+    }
+
+    # ── Sprzęt i konfiguracja: komputer, procesory, pamięć, kontrolery, dyski, karty sieciowe, system ──
+    # Value – dane stałe, porównywane ze skanem poprzednim (wymiana dysku albo modułu RAM, inny procesor, aktualizacja BIOS, nowa karta sieciowa);
+    # Live – wartości zmienne (zużycie, temperatura, stan łącza, obciążenie), bez porównania. W maszynie wirtualnej to, co widzi gość: platforma,
+    # vCPU, pamięć i dyski wirtualne (model procesora i MAC zależą od hosta – w Live). Każda grupa osobno: błąd jednej nie kasuje pozostałych,
+    # ale sekcja jest wtedy niezebrana (niepełna lista dałaby w porównaniu fałszywe „Usunięte”). Bez nawiasów klamrowych w tekstach –
+    # Get-SnapshotSummary wycina sekcję prostym wyrażeniem (ostatnie znane dane serwera bez połączenia)
+    $hardware = @(S 'Hardware' 'Sprzęt i konfiguracja' {
+        $virt = [bool]$sys.IsVirtual
+        function HwRow([string]$G, [string]$I, $V, $L = '') { [pscustomobject]@{ Group = $G; Item = ("$I" -replace '[{}]', '' -replace '\s+', ' ').Trim(); Value = ("$V" -replace '[{}]', '' -replace '\s+', ' ').Trim(); Live = ("$L" -replace '[{}]', '' -replace '\s+', ' ').Trim() } }
+        function HwPart([string]$G, [scriptblock]$B) { try { & $B } catch { $failedKeys.Add('Hardware'); $errs.Add("Sprzęt i konfiguracja ($G): $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") } }
+        function HwJ([object[]]$A, [string]$Sep = ' · ') { (@($A | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join $Sep) }
+        # pojemność: maszyna fizyczna – jednostki dziesiętne jak na etykiecie dysku (960 GB, 1.92 TB), wirtualna – binarne jak w konfiguracji maszyny (127 GB)
+        function HwSz($b) { $b = [double]$b; if ($b -le 0) { '' } elseif ($virt) { "$([math]::Round($b / 1GB)) GB" } elseif ($b -ge 1e12) { "$([math]::Round($b / 1e12, 2)) TB" } else { "$([math]::Round($b / 1e9)) GB" } }
+        # „2 × SSD 960 GB SAS” w kolejności pierwszego wystąpienia (Group-Object sortuje grupy)
+        function HwCnt([object[]]$A, [string]$Sep) { $h = [ordered]@{}; foreach ($k in @($A | Where-Object { $_ })) { $h["$k"] = 1 + [int]$h["$k"] }; (@(foreach ($k in $h.Keys) { "$($h[$k]) × $k" }) -join $Sep) }
+        function HwSn($v) { $v = "$v".Trim(); if ($v -and $v -notmatch '^(0+|None|N/A|Not Specified|Default string|To be filled.*|System Serial Number|SerNum\d*|Unknown|.*NotProvided.*)$') { $v } else { '' } }
+
+        HwPart 'Komputer' {
+            $c = if ($cs) { $cs } else { Get-CimInstance Win32_ComputerSystem }
+            $bios = @(Get-CimInstance Win32_BIOS)[0]
+            $enc = @(Get-CimInstance Win32_SystemEnclosure)[0]
+            $plat = if ($virt) { "maszyna wirtualna ($($sys.Hypervisor))" } elseif ($sys.IsHyperV) { 'serwer fizyczny, host Hyper-V' } else { 'serwer fizyczny' }
+            HwRow 'Komputer' 'Platforma' $plat $(if ($sys.HvHost) { "host: $($sys.HvHost)" })
+            HwRow 'Komputer' 'Producent' $c.Manufacturer
+            HwRow 'Komputer' 'Model' $c.Model
+            $sku = HwSn $c.SystemSKUNumber; if ($sku -and $sku -ne "$($c.Model)".Trim()) { HwRow 'Komputer' 'Numer produktu (SKU)' $sku }
+            $sn = HwSn $bios.SerialNumber; if (-not $sn) { $sn = HwSn $enc.SerialNumber }
+            HwRow 'Komputer' 'Numer seryjny' $(if ($sn) { $sn } else { 'brak' })
+            if (-not $virt) {
+                $chMap = @{ 1 = 'inna'; 2 = 'nieznany'; 3 = 'desktop'; 4 = 'desktop (niski)'; 6 = 'mini tower'; 7 = 'tower (wieża)'; 8 = 'przenośny'; 9 = 'laptop'; 10 = 'notebook'; 13 = 'all-in-one'; 15 = 'kompaktowy'; 17 = 'obudowa główna serwera'; 23 = 'rack'; 24 = 'zamknięta (sealed-case)'; 25 = 'wielowęzłowa (multi-node)'; 28 = 'blade'; 29 = 'obudowa blade'; 35 = 'mini PC' }
+                if ($enc) { HwRow 'Komputer' 'Typ obudowy' (@(@($enc.ChassisTypes) | Where-Object { $null -ne $_ } | ForEach-Object { $n = [int]$_; if ($chMap.ContainsKey($n)) { $chMap[$n] } else { "typ $n" } }) -join ', ') }
+                $bb = @(Get-CimInstance Win32_BaseBoard -ErrorAction SilentlyContinue)[0]
+                if ($bb) { HwRow 'Komputer' 'Płyta główna' (HwJ @($bb.Manufacturer, $bb.Product, $(if ("$($bb.Version)".Trim()) { "wersja $($bb.Version)" }))) }
             }
-            if (-not $pds) { $pds = @(Get-PhysicalDisk) }
-            foreach ($pd in $pds) {
+            $bd = ''; if ($bios.ReleaseDate) { try { $bd = ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } catch {} }
+            $bv = HwJ @($bios.Manufacturer, $bios.SMBIOSBIOSVersion) ' '; if ($bd) { $bv += " ($bd)" }
+            HwRow 'Komputer' 'BIOS / UEFI' $bv
+            $fwt = "$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Control' 'PEFirmwareType')"; $sbe = RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled'
+            $bm = if ($fwt -eq '2') { 'UEFI' } elseif ($fwt -eq '1') { 'BIOS (legacy)' } else { 'nieznany' }
+            if ($fwt -eq '2' -and $null -ne $sbe) { $bm += $(if ("$sbe" -eq '1') { ', Secure Boot włączony' } else { ', Secure Boot wyłączony' }) }
+            HwRow 'Komputer' 'Tryb rozruchu' $bm
+            $tpm = $null; try { $tpm = @(Get-CimInstance -Namespace 'root/cimv2/Security/MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction SilentlyContinue)[0] } catch {}
+            if ($tpm) {
+                $spec = ("$($tpm.SpecVersion)" -split ',')[0].Trim()
+                HwRow 'Komputer' 'TPM' (HwJ @("TPM $spec", $tpm.ManufacturerIdTxt, $(if ($tpm.ManufacturerVersion) { "firmware $($tpm.ManufacturerVersion)" }))) $(if ($tpm.IsEnabled_InitialValue -eq $false) { 'wyłączony' } elseif ($tpm.IsActivated_InitialValue -eq $false) { 'nieaktywny' } else { 'włączony' })
+            } else { HwRow 'Komputer' 'TPM' 'nie wykryto' }
+        }
+
+        HwPart 'Procesor' {
+            $p = @(if ($cpu) { $cpu } else { Get-CimInstance Win32_Processor })
+            $cores = [int](($p | Measure-Object NumberOfCores -Sum).Sum); $thr = [int](($p | Measure-Object NumberOfLogicalProcessors -Sum).Sum)
+            if ($virt) { HwRow 'Procesor' 'Razem' "vCPU: $thr (gniazda: $($p.Count), rdzenie: $cores)" }
+            else { HwRow 'Procesor' 'Razem' ("gniazda: $($p.Count) · rdzenie fizyczne: $cores · wątki: $thr" + $(if ($thr -gt $cores) { ' · wielowątkowość (HT/SMT) włączona' })) }
+            $i = 0
+            foreach ($x in $p) {
+                $i++
+                $it = HwSn $x.SocketDesignation; if (-not $it) { $it = "CPU $i" }
+                $cnt = "rdzenie: $($x.NumberOfCores), wątki: $($x.NumberOfLogicalProcessors)"
+                $mhz = if ($x.MaxClockSpeed) { "maks. $($x.MaxClockSpeed) MHz" } else { '' }
+                $ld = if ($null -ne $x.LoadPercentage) { "obciążenie $($x.LoadPercentage)%" } else { '' }
+                # maszyna wirtualna: model i taktowanie procesora hosta (migracja na inny host to nie zmiana konfiguracji maszyny)
+                if ($virt) { HwRow 'Procesor' $it $cnt (HwJ @($x.Name, $mhz, $ld) ', ') }
+                else { HwRow 'Procesor' $it (HwJ @($x.Name, $cnt, $mhz)) (HwJ @($(if ($x.CurrentClockSpeed) { "taktowanie $($x.CurrentClockSpeed) MHz" }), $ld) ', ') }
+            }
+        }
+
+        HwPart 'Pamięć' {
+            $mods = @(Get-CimInstance Win32_PhysicalMemory | Where-Object { [double]$_.Capacity -gt 0 })
+            $tot = [math]::Round([double](($mods | Measure-Object Capacity -Sum).Sum) / 1GB)
+            $use = "użycie $($sys.RamUsedPct)%, wolne $($sys.RamFreeGB) GB"
+            # maszyna wirtualna: bez modułów (gniazda pamięci wirtualnej nic nie mówią); gość Hyper-V – pamięć bywa dynamiczna, więc ilość w Live
+            if ($virt -and "$($sys.Hypervisor)" -eq 'Hyper-V') { HwRow 'Pamięć' 'Razem' 'przydział hosta Hyper-V (pamięć może być dynamiczna)' "$($sys.RamGB) GB widoczne w systemie, $use" }
+            elseif ($virt) { HwRow 'Pamięć' 'Razem' "$(if ($tot) { $tot } else { $sys.RamGB }) GB" $use }
+            elseif (-not $mods.Count) { HwRow 'Pamięć' 'Razem' "$($sys.RamGB) GB widoczne w systemie, moduły nieodczytane (SMBIOS)" $use }
+            else {
+                # typ: SMBIOSMemoryType (Windows Server 2016+), starsze systemy – MemoryType
+                $smt = @{ 18 = 'DDR'; 19 = 'DDR2'; 20 = 'DDR2 FB-DIMM'; 24 = 'DDR3'; 26 = 'DDR4'; 27 = 'LPDDR'; 28 = 'LPDDR2'; 29 = 'LPDDR3'; 30 = 'LPDDR4'; 34 = 'DDR5'; 35 = 'LPDDR5' }
+                $omt = @{ 20 = 'DDR'; 21 = 'DDR2'; 22 = 'DDR2 FB-DIMM'; 24 = 'DDR3'; 26 = 'DDR4' }
+                $arr = @(Get-CimInstance Win32_PhysicalMemoryArray -ErrorAction SilentlyContinue | Where-Object { $null -eq $_.Use -or [int]$_.Use -eq 3 })   # 3 = pamięć systemowa
+                $slots = [int](($arr | Measure-Object MemoryDevices -Sum).Sum)
+                $maxKb = [double]0; foreach ($a in $arr) { $maxKb += $(if ([double]$a.MaxCapacityEx -gt 0) { [double]$a.MaxCapacityEx } else { [double]$a.MaxCapacity }) }
+                $dupLoc = @($mods | Group-Object DeviceLocator | Where-Object { $_.Count -gt 1 }).Count
+                # producent jako kod JEDEC (np. 00CE00B300CE) – najczęstsi producenci po nazwie
+                $jedec = [ordered]@{ '^(00|80)?CE(00)?[0-9A-F]*$' = 'Samsung'; '^(00|80)?AD(00)?[0-9A-F]*$' = 'SK hynix'; '^(00|80)?2C(00)?[0-9A-F]*$' = 'Micron'; '^(01|80)?98(00)?[0-9A-F]*$' = 'Kingston' }
+                $rows = @(); $desc = @()
+                foreach ($m in $mods) {
+                    $t = [int]$m.SMBIOSMemoryType; $type = if ($smt.ContainsKey($t)) { $smt[$t] } elseif ($omt.ContainsKey([int]$m.MemoryType)) { $omt[[int]$m.MemoryType] } else { '' }
+                    $spd = if ([int]$m.ConfiguredClockSpeed -gt 0) { [int]$m.ConfiguredClockSpeed } else { [int]$m.Speed }
+                    $gb = [math]::Round([double]$m.Capacity / 1GB)
+                    $d1 = HwJ @("$gb GB", $type, $(if ($spd) { "$spd MT/s" })) ' '
+                    $desc += $d1
+                    $slot = if ($dupLoc) { HwJ @($m.BankLabel, $m.DeviceLocator) ' ' } else { "$($m.DeviceLocator)".Trim() }
+                    if (-not $slot) { $slot = "moduł $($desc.Count)" }
+                    $msn = HwSn $m.SerialNumber
+                    $mf = "$($m.Manufacturer)".Trim(); foreach ($j in $jedec.Keys) { if ($mf -match $j) { $mf = $jedec[$j]; break } }
+                    $rows += HwRow 'Pamięć' $slot (HwJ @($d1, $mf, $m.PartNumber, $(if ($msn) { "nr ser. $msn" })))
+                }
+                $mx = if ($maxKb -gt 0) { "maks. $([math]::Round($maxKb / 1MB)) GB" } else { '' }
+                HwRow 'Pamięć' 'Razem' (HwJ @("$tot GB", $(if ($slots) { "moduły: $($mods.Count) z $slots gniazd" } else { "moduły: $($mods.Count)" }), $mx)) $use
+                $cfg = HwCnt $desc ' + '
+                if ($cfg) { HwRow 'Pamięć' 'Moduły' ($cfg + $(if ($slots -ge $mods.Count -and $slots) { " (wolne gniazda: $($slots - $mods.Count))" })) }
+                $rows | Select-Object -First 64
+                if ($rows.Count -gt 64) { HwRow 'Pamięć' '(więcej)' "i $($rows.Count - 64) kolejnych modułów" }
+            }
+        }
+
+        HwPart 'Kontrolery dysków' {
+            # kontrolery RAID / HBA / NVMe; bez kontrolerów programowych (Storage Spaces, inicjator iSCSI); AHCI z Win32_IDEController
+            $ctl = @(@(Get-CimInstance Win32_SCSIController) + @(Get-CimInstance Win32_IDEController -ErrorAction SilentlyContinue | Where-Object { "$($_.Name)" -match 'AHCI|SATA|RAID|NVM' }) | Where-Object { $_ -and "$($_.Name)" -notmatch 'Storage Spaces|iSCSI Initiator|Virtual Drive Enumerator' })
+            $ctl | Group-Object { "$($_.Name)|$($_.Manufacturer)|$($_.DriverName)" } | Sort-Object Name | Select-Object -First 24 | ForEach-Object {
+                $x = $_.Group[0]
+                HwRow 'Kontrolery dysków' $x.Name (HwJ @($(if ("$($x.Manufacturer)" -ne "$($x.Name)") { $x.Manufacturer }), $(if ($x.DriverName) { "sterownik $($x.DriverName)" }), $(if ($_.Count -gt 1) { "liczba: $($_.Count)" }))) (@($_.Group | ForEach-Object { "$($_.Status)" } | Where-Object { $_ } | Sort-Object -Unique) -join ', ')
+            }
+        }
+
+        HwPart 'Dyski' {
+            $mtMap = @{ '0' = ''; 'Unspecified' = ''; '3' = 'HDD'; '4' = 'SSD'; '5' = 'SCM' }
+            $btMap = @{ '1' = 'SCSI'; '2' = 'ATAPI'; '3' = 'ATA'; '4' = 'IEEE 1394'; '5' = 'SSA'; '6' = 'Fibre Channel'; '7' = 'USB'; '8' = 'RAID'; '9' = 'iSCSI'; '10' = 'SAS'; '11' = 'SATA'; '12' = 'SD'; '13' = 'MMC'; '14' = 'Virtual'; '15' = 'File Backed Virtual'; '16' = 'Storage Spaces'; '17' = 'NVMe'; '18' = 'SCM'; '19' = 'UFS' }
+            $rows = @(); $sum = @()
+            if ($pdAll.Count) {
+                # dyski USB (np. rotowane dyski kopii) i zamontowane pliki VHD (kopie zapasowe hosta) to nie konfiguracja serwera – bez nich porównanie nie zgłasza każdej rotacji
+                foreach ($x in @($pdAll | Sort-Object { [double]("0" + ("$($_.D.DeviceId)" -replace '\D', '')) })) {
+                    $pd = $x.D; $rc = $x.R
+                    $mt = "$($pd.MediaType)"; $med = if ($mtMap.ContainsKey($mt)) { $mtMap[$mt] } else { $mt }
+                    $bt = "$($pd.BusType)"; $bus = if ($btMap.ContainsKey($bt)) { $btMap[$bt] } else { $bt }
+                    if ($bus -in 'USB', 'File Backed Virtual') { continue }
+                    $hs = "$($pd.HealthStatus)"; $dsn = HwSn $pd.SerialNumber
+                    $rows += HwRow 'Dyski' "Dysk $($pd.DeviceId)" (HwJ @($pd.FriendlyName, $med, $bus, (HwSz $pd.Size), $(if ($dsn) { "nr ser. $dsn" }), $(if ("$($pd.FirmwareVersion)".Trim()) { "firmware $($pd.FirmwareVersion)" }), "stan $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs })")) (HwJ @($(if ($rc -and $null -ne $rc.Wear -and $med -ne 'HDD') { "zużycie $($rc.Wear)%" }), $(if ($rc -and $rc.Temperature) { "$($rc.Temperature) °C" }), $(if ($rc -and $rc.PowerOnHours) { "$($rc.PowerOnHours) h pracy" })) ', ')
+                    $sum += HwJ @($med, (HwSz $pd.Size), $bus) ' '
+                }
+            } else {
+                # bez modułu Storage albo po błędzie Get-PhysicalDisk: dyski z WMI (typ nośnika nieznany)
+                foreach ($dd in @(Get-CimInstance Win32_DiskDrive | Where-Object { "$($_.InterfaceType)" -ne 'USB' } | Sort-Object Index)) {
+                    $dsn = HwSn $dd.SerialNumber
+                    $rows += HwRow 'Dyski' "Dysk $($dd.Index)" (HwJ @($dd.Model, $dd.InterfaceType, (HwSz $dd.Size), $(if ($dsn) { "nr ser. $dsn" }), $(if ("$($dd.FirmwareRevision)".Trim()) { "firmware $($dd.FirmwareRevision)" }), "stan $($dd.Status)"))
+                    $sum += HwJ @((HwSz $dd.Size), $dd.InterfaceType) ' '
+                }
+            }
+            HwRow 'Dyski' 'Razem' $(if ($sum.Count) { HwCnt $sum '; ' } else { 'brak' })
+            $rows | Select-Object -First 48
+            if ($rows.Count -gt 48) { HwRow 'Dyski' '(więcej)' "i $($rows.Count - 48) kolejnych dysków" }
+        }
+
+        HwPart 'Karty sieciowe' {
+            # karty fizyczne (w maszynie wirtualnej – karty syntetyczne/vmxnet); bez zespołów, vEthernet i kart wirtualnych
+            $na = @()
+            if (Get-Command Get-NetAdapter -ErrorAction SilentlyContinue) { $na = @(Get-NetAdapter -Physical | Sort-Object Name | ForEach-Object { @{ N = "$($_.Name)"; D = "$($_.InterfaceDescription)"; M = "$($_.MacAddress)"; S = "$($_.Status)"; L = "$($_.LinkSpeed)" } }) }
+            else { $na = @(Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' | Where-Object { $_.NetConnectionID } | Sort-Object NetConnectionID | ForEach-Object { @{ N = "$($_.NetConnectionID)"; D = "$($_.Name)"; M = "$($_.MACAddress)"; S = $(if ([int]$_.NetConnectionStatus -eq 2) { 'Up' } else { "kod $($_.NetConnectionStatus)" }); L = $(if ([double]$_.Speed -gt 0) { "$([math]::Round([double]$_.Speed / 1e9, 1)) Gbps" } else { '' }) } }) }
+            foreach ($a in @($na | Select-Object -First 24)) {
+                $st = switch ($a.S) { 'Up' { HwJ @('połączona', $a.L) ', ' } 'Disconnected' { 'rozłączona' } 'Disabled' { 'wyłączona' } default { $a.S } }
+                # MAC karty maszyny wirtualnej bywa dynamiczny (przydziela host) – w Live
+                if ($virt) { HwRow 'Karty sieciowe' $a.N $a.D (HwJ @($st, "MAC $($a.M)") ', ') }
+                else { HwRow 'Karty sieciowe' $a.N (HwJ @($a.D, "MAC $($a.M)")) $st }
+            }
+        }
+
+        HwPart 'System' {
+            $o = if ($os) { $os } else { Get-CimInstance Win32_OperatingSystem }
+            $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+            HwRow 'System' 'Edycja' ("$($o.Caption)" + $(if ("$($cv.InstallationType)" -eq 'Server Core') { ' (Server Core)' }))
+            $dv = if ($cv.DisplayVersion) { "$($cv.DisplayVersion)" } elseif ($cv.ReleaseId) { "$($cv.ReleaseId)" } else { '' }
+            if ($dv) { HwRow 'System' 'Wersja' $dv }
+            # numer poprawki (UBR) zmienia się co miesiąc – w Live, porównywana jest kompilacja bazowa
+            HwRow 'System' 'Kompilacja' $o.Version $(if ($sys.Build -ne "$($o.Version)") { $sys.Build })
+            HwRow 'System' 'Data instalacji' $sys.OSInstallDate
+            $lic = "$($sys.LicenseStatus)"; if ($lic -and $sys.LicenseChannel) { $lic += " ($($sys.LicenseChannel))" }
+            if ($lic) { HwRow 'System' 'Aktywacja' $lic (HwJ @($(if ($null -ne $sys.LicenseGraceDays) { "pozostało dni: $($sys.LicenseGraceDays)" }), $(if ($sys.KmsHost) { "KMS: $($sys.KmsHost)" })) ', ') }
+            $lang = "$($o.OSLanguage)"; try { $lang = [Globalization.CultureInfo]::GetCultureInfo([int]$o.OSLanguage).Name } catch {}
+            $mui = @($o.MUILanguages | Where-Object { $_ })
+            if ($mui.Count -gt 1) { $lang += ' (pakiety językowe: ' + ($mui -join ', ') + ')' }
+            HwRow 'System' 'Język systemu' $lang
+        }
+    })
+
+    $diskHealth = @(S 'DiskHealth' 'Zdrowie dysków' {
+        function OpText($v) { (@(@($v) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } }) -join ', ') }
+        if ($pdErr) { throw $pdErr }
+        if ($pdAll.Count) {
+            foreach ($x in $pdAll) {
+                $pd  = $x.D; $rc = $x.R
                 $hs  = "$($pd.HealthStatus)"
                 $ops = OpText $pd.OperationalStatus
-                $rc  = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
                 $unc = if ($rc -and ($null -ne $rc.ReadErrorsUncorrected -or $null -ne $rc.WriteErrorsUncorrected)) { [int64]$rc.ReadErrorsUncorrected + [int64]$rc.WriteErrorsUncorrected } else { $null }
                 [pscustomobject]@{
                     Source = 'Dysk fizyczny'; Id = $null; Name = "$($pd.FriendlyName) ($($pd.MediaType), $($pd.BusType), $([math]::Round($pd.Size / 1GB)) GB)"
@@ -2264,6 +2454,7 @@ $Collector = {
     $errList   = [string[]]$errs.ToArray()
     [pscustomobject]@{
         System         = [pscustomobject]$sys
+        Hardware       = $hardware
         Hardening      = $hardening
         Disks          = $disks
         Network        = $network
@@ -2455,10 +2646,15 @@ function Get-SnapshotSummary([string]$Path) {
     $m = [regex]::Match($t, '"System":(\{[^{}]*\})')
     if ($m.Success) { try { $sys = $m.Groups[1].Value | ConvertFrom-Json } catch {} }
     $ip = [regex]::Match($t, '"IPv4":"(\d[^"/]*)')
+    # sekcja Sprzęt (płaskie wiersze bez nawiasów klamrowych w tekstach) – inwentaryzacja sprzętu pokazuje ostatnie znane dane serwera bez połączenia
+    $hw = @()
+    $mh = [regex]::Match($t, '"Hardware":(\[(?:\{[^{}]*\},?)*\])')
+    if ($mh.Success) { try { $hw = @(($mh.Groups[1].Value | ConvertFrom-Json) | Where-Object { $_ }) } catch {} }
     [pscustomobject]@{
         ScannedAt = ([IO.File]::GetLastWriteTime($Path)).ToString('yyyy-MM-dd HH:mm')
         System    = $sys
         IPv4      = $(if ($ip.Success) { $ip.Groups[1].Value } else { '' })
+        Hardware  = $hw
     }
 }
 
@@ -3316,7 +3512,8 @@ $script:Sections = @(
     @{ Key = 'History';        Header = 'Historia skanów i dostępność'; Computed = $true }
     @{ Key = 'Changes';        Header = 'Zmiany od poprzedniego skanu' }
     @{ Key = 'System';         Header = 'System' }
-    @{ Key = 'Hardening';      Header = 'Konfiguracja bezpieczeństwa' }
+    @{ Key = 'Hardware';       Header = 'Sprzęt i konfiguracja' }
+    @{ Key = 'Hardening';     Header = 'Konfiguracja bezpieczeństwa' }
     @{ Key = 'EventLogs';      Header = 'Dzienniki zdarzeń' }
     @{ Key = 'AuditPolicy';    Header = 'Polityka audytu' }
     @{ Key = 'Disks';          Header = 'Dyski' }
@@ -3376,6 +3573,9 @@ $script:DiffDefs = [ordered]@{
     Software   = @{ Label = 'oprogramowanie';  KeyFn = { param($r) "$($r.Name) $($r.Version)" };   Filter = $null; Sev = 'Info' }
     Persistence = @{ Label = 'trwałość (WMI, AV)'; KeyFn = { param($r) "$($r.Type): $($r.Name)" };   Filter = $null; Sev = 'Ostrzeżenie' }
     Exposure   = @{ Label = 'reguły zapory';   KeyFn = { param($r) "$($r.Rule) [$($r.Ports)]" };    Filter = $null; Sev = 'Ostrzeżenie' }
+    # wymiana dysku, modułów RAM, procesora, karty sieciowej, aktualizacja BIOS – tylko wartości stałe (Live: zużycie, temperatura, stan łącza – bez porównania);
+    # podsumowania dysków i modułów wynikają z wierszy pojedynczych dysków i modułów – bez nich jedna wymiana to jedna zmiana, nie trzy
+    Hardware   = @{ Label = 'sprzęt';          KeyFn = { param($r) "$($r.Group) – $($r.Item): $($r.Value)" }; Filter = { -not (("$($_.Group)" -eq 'Dyski' -and "$($_.Item)" -eq 'Razem') -or ("$($_.Group)" -eq 'Pamięć' -and "$($_.Item)" -eq 'Moduły')) }; Sev = 'Info' }
 }
 
 $script:Headers = @{
@@ -3399,11 +3599,11 @@ $script:Headers = @{
     HotFixID = 'KB'; InstalledOn = 'Zainstalowano'; InstalledBy = 'Zainstalował'
     HotFixIds = 'Zainstalowane poprawki (KB)'; Cve = 'CVE'; Impact = 'Skutek'; Cvss = 'CVSS'; Exploited = 'Wykorzystywana'; Month = 'Biuletyn'
     Kb = 'Poprawka (KB)'; FixedBuild = 'Naprawiono w kompilacji'; CveMissing = 'Brakujące poprawki (CVE)'; CveExpl = 'Wykorzystywane CVE'
-    Check = 'Sprawdzenie'; Value = 'Wartość'; Severity = 'Poziom'; Category = 'Kategoria'; Section = 'Obszar'; Change = 'Zmiana'; Item = 'Pozycja'; Property = 'Właściwość'
+    Check = 'Sprawdzenie'; Value = 'Wartość'; Severity = 'Poziom'; Category = 'Kategoria'; Section = 'Obszar'; Change = 'Zmiana'; Item = 'Element'; Property = 'Właściwość'; Live = 'Bieżące'
     Server = 'Serwer'; OS = 'System'; RAM = 'RAM [%]'; MinDiskPct = 'Min. wolne na dysku [%]'; Crit = 'Krytyczne'; Warn = 'Ostrzeżenia'; PatchDays = 'Dni od aktualizacji'
     ScanSec = 'Skan [s]'; Scanned = 'Skanowano'
     ComputerName = 'Nazwa komputera'; FQDN = 'FQDN'; Build = 'Kompilacja'; OSInstallDate = 'Instalacja systemu'; LastBoot = 'Ostatni start'
-    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU (chwilowe) [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
+    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuSockets = 'Procesory (gniazda)'; CpuCores = 'Rdzenie fizyczne'; CpuLoad = 'Obciążenie CPU (chwilowe) [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
     LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Rola Hyper-V (serwer jest hostem)'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
@@ -3427,8 +3627,8 @@ $script:Headers = @{
     HvRamAssignedGB = 'RAM przydzielony maszynom [GB]'; HvRamStartupGB = 'RAM startowy wszystkich maszyn [GB]'; HvCluster = 'Klaster'; HvClusterNodes = 'Węzły klastra'
     DurationSec = 'Czas [s]'; Class = 'Rodzaj'; Kind = 'Typ'; Host = 'Host'; Availability = 'Dostępność'; OnList = 'Na liście'; GuestStatus = 'Stan gościa'
     VCpuRatio = 'vCPU : CPU'; RamPct = 'RAM przydzielony [%]'; Vms = 'Maszyny'; Nodes = 'Węzły'; Hosts = 'Hosty'; DisksGBTotal = 'Dyski VM [GB]'
-    LastOk = 'Ostatni udany skan'; Seen = 'Skany'; OkPct = 'Udane [%]'; Note = 'Uwagi'
-    Owner = 'Właściciel'; Parent = 'Checkpoint nadrzędny'; StateSince = 'W tym stanie od'; MemMaxGB = 'RAM maks. [GB]'; MemDemandGB = 'RAM zapotrzebowanie [GB]'
+    LastOk = 'Ostatni udany skan'; Seen = 'Skany'; OkPct = 'Udane [%]'; Note = 'Uwagi'; HwSummary = 'Sprzęt'
+    Owner = 'Właściciel'; Parent = 'Checkpoint nadrzędny'; StateSince = 'W tym stanie od'; MemMinGB = 'RAM min. [GB]'; MemMaxGB = 'RAM maks. [GB]'; MemDemandGB = 'RAM zapotrzebowanie [GB]'
     AutoStart = 'Przy starcie hosta'; ChainDepth = 'Głębokość łańcucha dysków'; OnSystemDrive = 'Na dysku systemowym hosta'; HvVmms = 'Usługa zarządzania Hyper-V'
     HvCpuLoad = 'Obciążenie CPU hiperwizora [%]'; HvVmReplicas = 'Repliki (Hyper-V Replica)'; HvClusterNodeCount = 'Liczba węzłów klastra'; HvVmId = 'Identyfikator maszyny'
     Truncated = 'Limit zdarzeń osiągnięty'; GroupSID = 'SID grupy'
@@ -3885,7 +4085,7 @@ $script:SettingDefs = @(
     @{ Group = 'Listy'; Key = 'IgnoredWmiConsumers';    Type = 'list';    Label = 'Subskrypcje WMI traktowane jako systemowe (jedna na linię)' }
 )
 $script:SectionGroups = [ordered]@{
-    'System i stabilność'  = @('Disks', 'DiskHealth', 'Crashes', 'Backup', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
+    'System i stabilność'  = @('Hardware', 'Disks', 'DiskHealth', 'Crashes', 'Backup', 'Events', 'Restarts', 'Downtime', 'EventLogs', 'Updates', 'Software')
     'Bezpieczeństwo'       = @('Hardening', 'SecurityEvents', 'AuditPolicy', 'Exposure', 'Persistence', 'Admins', 'LocalUsers', 'Certificates', 'Shares', 'Autostart')
     'Usługi, sieć i pliki' = @('Services', 'Tasks', 'Network', 'Listening', 'Connections', 'Sessions', 'Folders')
     'Role serwera'         = @('DomainController', 'ADSecurity', 'AppRoles', 'HyperV', 'Checkpoints', 'VMStorage', 'Cluster')
@@ -6001,7 +6201,7 @@ $script:MainXaml = @'
               </StackPanel>
             </StackPanel>
           </Button>
-          <Button x:Name="btnReport" Style="{StaticResource GhostButton}" Margin="4,0,0,0" Padding="10,7" ToolTip="Raport HTML (podsumowanie albo pełny)">
+          <Button x:Name="btnReport" Style="{StaticResource GhostButton}" Margin="4,0,0,0" Padding="10,7" ToolTip="Raport HTML (podsumowanie albo pełny) i inwentaryzacja sprzętu (CSV)">
             <StackPanel Orientation="Horizontal">
               <TextBlock Style="{StaticResource Glyph}" Text="&#xE8A5;" FontSize="14" Margin="0,0,8,0"/>
               <TextBlock Text="Raport" VerticalAlignment="Center"/>
@@ -7384,6 +7584,14 @@ function Get-DataSystem($D) {
     if ($D.PSObject.Properties['_Last'] -and $D._Last -and $D._Last.System) { return $D._Last.System }
     $null
 }
+function Get-DataHardware($D) {
+    # Wiersze sekcji Sprzęt i konfiguracja z bieżących danych albo – dla serwera bez połączenia – z ostatniej udanej migawki
+    if (-not $D) { return @() }
+    if (-not $D.Offline -and $D.PSObject.Properties['Hardware']) { return @(foreach ($r in $D.Hardware) { if ($r) { $r } }) }
+    if ($D.PSObject.Properties['_Last'] -and $D._Last -and $D._Last.PSObject.Properties['Hardware']) { return @(foreach ($r in $D._Last.Hardware) { if ($r) { $r } }) }
+    @()
+}
+function Get-HwValue($Rows, [string]$Group, [string]$Item) { foreach ($r in $Rows) { if ("$($r.Group)" -eq $Group -and "$($r.Item)" -eq $Item) { return "$($r.Value)" } }; '' }
 function Update-ServerItem([string]$Name) {
     $it = Get-ServerItem $Name
     $d  = $script:Data[$Name]
@@ -7849,6 +8057,21 @@ function Get-ServerByGuest([hashtable]$ByDisplay, $Row, [hashtable]$ByVm, [strin
     if ($it) { $gs = Get-DataSystem $script:Data[$it.Name]; if ($gs -and -not "$($gs.PSObject.Properties['HvVmId'].Value)" -and $gs.PSObject.Properties['Hypervisor'] -and "$($gs.Hypervisor)" -ne 'Hyper-V') { return $null } }
     $it
 }
+function Get-HardwareSummary($D) {
+    # Skrót sprzętu (kolumna „Sprzęt” hostów Hyper-V): model · procesory (rdzenie fizyczne) · RAM, np. Dell PowerEdge R750 · 2×Xeon Gold 6338 (64 rdz.) · 512 GB
+    $s = Get-DataSystem $D
+    if (-not $s) { return '' }
+    $hw = @(Get-DataHardware $D)
+    $mf = (Get-HwValue $hw 'Komputer' 'Producent') -replace '^Hewlett[- ]Packard Enterprise$', 'HPE' -replace '^Hewlett-Packard$', 'HP' -replace ',?\s+(Inc\.?|Corporation|Corp\.?|Co\.,?\s*Ltd\.?|Ltd\.?|GmbH|LLC)$', ''
+    $md = Get-HwValue $hw 'Komputer' 'Model'
+    $model = if (-not $md) { "$($s.Model)" -replace '^Dell Inc\.', 'Dell' } elseif ($mf -and -not $md.StartsWith($mf, [StringComparison]::OrdinalIgnoreCase)) { "$mf $md" } else { $md }
+    $cn = ("$($s.CPUName)" -replace '\((R|TM)\)', '' -replace '\s*@\s*[\d.]+\s*GHz\s*$', '' -replace '\s+CPU\b', '' -replace '\s+\d+-Core Processor$', '' -replace '^(Intel|AMD)\s+', '' -replace '\s+', ' ').Trim()
+    $n = [int]$s.PSObject.Properties['CpuSockets'].Value; $c = [int]$s.PSObject.Properties['CpuCores'].Value
+    $cpu = if ($n -gt 1) { "$n×$cn" } else { $cn }
+    if ($c) { $cpu += " ($c rdz.)" }
+    $ram = if ((Get-HwValue $hw 'Pamięć' 'Razem') -match '^(\d+(?:\.\d+)?) GB') { $Matches[1] } else { [math]::Round([double]$s.RamGB) }
+    (@($model.Trim(), $cpu, "$ram GB") | Where-Object { $_ }) -join ' · '
+}
 function Get-VmData {
     if (-not $script:VmIndex) { Update-VmIndex }
     $byDisplay = @{}; $byVm = @{}
@@ -7877,7 +8100,7 @@ function Get-VmData {
             Key = $it.Name; Host = $it.Display; HvCluster = $(if ($s.PSObject.Properties['HvCluster']) { "$($s.HvCluster)" } else { '' })
             # współczynnik na początku i zawsze z 2 miejscami po kropce – sortowanie tekstu porównuje liczby po kolei (2.50 > 2.25, 3.00 > 2.50)
             Vms = "$($s.HvVmRunning) / $($s.HvVmTotal)"; VCpuRatio = $(if ($ratio) { "$($ratio.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)) : 1 ($vr / $lp)" } else { '' }); RamPct = $pct
-            HvRamAssignedGB = $as; RamGB = $ram; Checkpoints = $cp; Crit = [int]$d._Crit; Warn = [int]$d._Warn; Scanned = $d.ScannedAt; Flag = $flag
+            HvRamAssignedGB = $as; RamGB = $ram; Checkpoints = $cp; Crit = [int]$d._Crit; Warn = [int]$d._Warn; Scanned = $d.ScannedAt; HwSummary = (Get-HardwareSummary $d); Flag = $flag
         })
     }
     # Maszyny
@@ -8021,6 +8244,46 @@ function Get-DiagnosticsRows([string]$Name, $D) {
     }
     [object[]]$rows.ToArray()
 }
+function Get-HardwareRows($D, [string]$Name) {
+    # Sekcja „Sprzęt i konfiguracja”: dane z serwera, a dla maszyny wirtualnej (za grupą Komputer) przydział zasobów – dla gościa Hyper-V z danych
+    # hosta w pamięci (wiersz maszyny z sekcji Hyper-V i jej dyski z sekcji Hyper-V: dyski VM), bez wczytywania migawek z dysku
+    $rows = @(foreach ($x in $D.Hardware) { if ($x) { $x } })
+    $s = $D.System
+    if (-not $s -or -not ($s.PSObject.Properties['IsVirtual'] -and $s.IsVirtual)) { return $rows }
+    $add = New-Object System.Collections.Generic.List[object]
+    $g = 'Przydział na hoście Hyper-V'
+    $row = { param($i, $v, $l) $add.Add([pscustomobject]@{ Group = $g; Item = "$i"; Value = "$v"; Live = "$l"; Flag = '' }) }
+    $vm = Find-VmForServer $Name $D
+    if ($vm) {
+        $r = $vm.Row
+        $cl = if ($vm.Cluster) { " (klaster $($vm.Cluster))" } else { '' }
+        & $row 'Host' "$($vm.HostDisplay)$cl" "dane hosta z $($vm.ScannedAt)"
+        & $row 'Maszyna wirtualna' "$($r.Name)" (Get-VmStateText "$($r.State)")
+        & $row 'Generacja i wersja konfiguracji' "generacja $($r.Gen), wersja $($r.Version)" ''
+        & $row 'vCPU' "$($r.CPU)" $(if ("$($r.PSObject.Properties['CpuUsage'].Value)" -ne '') { "obciążenie $($r.CpuUsage)%" })
+        $dyn = "$($r.DynamicMem)" -eq 'Tak'
+        $mn = "$($r.PSObject.Properties['MemMinGB'].Value)"; $mx = "$($r.PSObject.Properties['MemMaxGB'].Value)"
+        $mem = if (-not $dyn) { "statyczna, $($r.MemStartupGB) GB" } elseif ($mn -and $mx) { "dynamiczna, startowa $($r.MemStartupGB) GB, zakres $mn–$mx GB" } else { "dynamiczna, startowa $($r.MemStartupGB) GB$(if ($mx) { ", maks. $mx GB" })" }
+        & $row 'RAM' $mem "przydzielona $($r.MemGB) GB$(if ($dyn -and "$($r.PSObject.Properties['MemDemandGB'].Value)" -ne '') { ", zapotrzebowanie $($r.MemDemandGB) GB" })"
+        # dyski z sekcji Hyper-V: dyski VM hosta (bez dysków pass-through i na udziałach SMB, których host nie odczytuje); po samym wierszu maszyny – łączny rozmiar
+        $hd = $script:Data[$vm.Host]
+        $vd = @(if ($hd -and $hd.PSObject.Properties['VMStorage']) { foreach ($x in @($hd.VMStorage)) { if ($x -and "$($x.VM)" -eq "$($r.Name)") { $x } } })
+        $max = 0.0; foreach ($x in $vd) { $max += [double]$x.MaxGB }
+        $used = if ("$($r.DisksGB)" -ne '') { "zajęte na hoście $($r.DisksGB) GB (z checkpointami)" } else { '' }
+        & $row 'Dyski wirtualne (razem)' $(if ($vd.Count) { "liczba: $($vd.Count), maks. $([math]::Round($max, 1)) GB" } else { 'szczegóły dysków niedostępne w danych hosta' }) $used
+        $tp = @{ Dynamic = 'dynamiczny'; Fixed = 'stały'; Differencing = 'różnicowy' }
+        $i = 0
+        foreach ($x in $vd) { $i++; & $row "Dysk wirtualny $i" ((@("$($x.Disk)", $(if ($tp.ContainsKey("$($x.Type)")) { $tp["$($x.Type)"] } else { "$($x.Type)" }), $(if ("$($x.MaxGB)" -ne '') { "maks. $($x.MaxGB) GB" })) | Where-Object { $_ }) -join ' · ') ((@($(if ("$($x.CurrentGB)" -ne '') { "obecnie $($x.CurrentGB) GB" }), $(if ("$($x.VolumeFreeGB)" -ne '') { "wolne na wolumenie $($x.VolumeFreeGB) GB" })) | Where-Object { $_ }) -join ', ') }
+    } elseif ("$($s.PSObject.Properties['Hypervisor'].Value)" -eq 'Hyper-V') {
+        $hn = "$($s.PSObject.Properties['HvHost'].Value)"; $hk = Find-ServerKey $hn
+        $why = if (-not $hn) { 'host nieznany – brak danych usług integracji w systemie gościa' } elseif (-not $hk) { 'hosta nie ma na liście serwerów – dodaj go, żeby widzieć przydział zasobów' } elseif (-not $script:Data[$hk] -or $script:Data[$hk].Offline) { 'brak aktualnych danych hosta (nie skanowano albo brak połączenia)' } else { 'maszyny nie ma w danych hosta (przeniesiona albo usunięta?)' }
+        & $row 'Host' $(if ($hn) { Get-DisplayName $hn } else { 'nieznany' }) $why
+    } else {
+        $g = 'Przydział zasobów'
+        & $row 'Źródło danych' "maszyna wirtualna $($s.Hypervisor): procesory, pamięć i dyski widziane z systemu gościa" 'program nie odczytuje konfiguracji hosta tej platformy'
+    }
+    @(foreach ($x in $rows) { if ("$($x.Group)" -eq 'Komputer') { $x } }) + [object[]]$add.ToArray() + @(foreach ($x in $rows) { if ("$($x.Group)" -ne 'Komputer') { $x } })
+}
 function Get-SectionRows($D, [string]$Key, [string]$Name = $script:CurrentServer) {
     switch ($Key) {
         'Issues' {
@@ -8036,6 +8299,7 @@ function Get-SectionRows($D, [string]$Key, [string]$Name = $script:CurrentServer
         'History'     { @(Get-AvailabilityHistory $Name) }
         'HvHost'      { @(foreach ($x in $D._HvHost) { if ($x) { $x } }) }
         'Cve'         { @(Get-CveRows $D) }
+        'Hardware'    { @(Get-HardwareRows $D $Name) }
         'System'  {
             if ($D.System) {
                 foreach ($p in $D.System.PSObject.Properties) {
@@ -8069,8 +8333,8 @@ function Test-SectionShown($D, [string]$Key) {
     if ($Key -eq 'ADSecurity' -and -not $D.System.IsDC) { return $false }
     if ($Key -eq 'Cluster' -and -not ($D.System.PSObject.Properties['HvCluster'] -and $D.System.HvCluster) -and -not @($D.PSObject.Properties['Cluster'].Value | Where-Object { $_ }).Count) { return $false }
     # starsze migawki: sekcja tablicowa jest zawsze dodawana przy wczytaniu (pusta), więc o jej istnieniu mówi lista _Present
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
-    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles' -and -not $D.PSObject.Properties[$Key]) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles', 'Hardware' -and ($D.PSObject.Properties['_Present'] -and @($D._Present) -notcontains $Key)) { return $false }
+    if ($Key -in 'Downtime', 'Timings', 'ADSecurity', 'Backup', 'AppRoles', 'Hardware' -and -not $D.PSObject.Properties[$Key]) { return $false }
     if ($Key -in 'Backup', 'AppRoles' -and -not @($D.$Key | Where-Object { $_ }).Count) { return $false }   # brak oprogramowania kopii / ról na serwerze
     $true
 }
@@ -8927,6 +9191,49 @@ button{font:inherit;background:var(--panel);color:var(--text);border:1px solid v
 }
 #endregion
 
+#region ── Inwentaryzacja sprzętu (CSV) ─────────────────────────────────────────
+# Jeden wiersz na serwer z listy: sprzęt (sekcja Sprzęt i konfiguracja), system i przydział maszyny na hoście Hyper-V. Dane z pamięci (bez wczytywania
+# migawek); serwer bez połączenia – ostatnie znane dane (kolumna „Dane z”), nieskanowany – „brak danych”.
+function Get-HardwareInventory {
+    if (-not $script:VmIndex) { Update-VmIndex }
+    @(foreach ($it in @($script:Servers)) {
+        $d = $script:Data[$it.Name]
+        $s = Get-DataSystem $d
+        $hw = @(Get-DataHardware $d)
+        $vm = if ($d) { Find-VmForServer $it.Name $d } else { $null }
+        $hv = if ($s) { "$($s.PSObject.Properties['Hypervisor'].Value)" } else { '' }
+        $kind = if ($s -and -not $hv) { 'fizyczny' } elseif ($hv -eq 'Hyper-V' -or $vm) { 'maszyna Hyper-V' } elseif ($hv -eq 'VMware') { 'VMware' } elseif ($hv) { "inna platforma ($hv)" } else { 'brak danych' }
+        $ram = if ((Get-HwValue $hw 'Pamięć' 'Razem') -match '^(\d+(?:\.\d+)?) GB') { [double]$Matches[1] } elseif ($s -and "$($s.RamGB)" -ne '') { [double]$s.RamGB } else { '' }
+        $ctl = @(foreach ($r in $hw) { if ("$($r.Group)" -eq 'Kontrolery dysków') { if ("$($r.Value)" -match 'liczba: (\d+)') { "$($Matches[1]) × $($r.Item)" } else { "$($r.Item)" } } }) -join ', '
+        $at = if (-not $d) { '' } elseif ($d.Offline -and $d.PSObject.Properties['_Last'] -and $d._Last) { "$($d._Last.ScannedAt)" } elseif ($d.Offline) { '' } else { "$($d.ScannedAt)" }
+        $model = Get-HwValue $hw 'Komputer' 'Model'
+        [pscustomobject]@{
+            Serwer = $it.Display; Rodzaj = $kind; Producent = (Get-HwValue $hw 'Komputer' 'Producent'); Model = $(if ($model) { $model } elseif ($s) { "$($s.Model)" } else { '' })
+            'Numer seryjny' = (Get-HwValue $hw 'Komputer' 'Numer seryjny'); Procesor = $(if ($s) { ("$($s.CPUName)" -replace '\s+', ' ').Trim() } else { '' })
+            Gniazda = $(if ($s) { $s.PSObject.Properties['CpuSockets'].Value } else { '' }); Rdzenie = $(if ($s) { $s.PSObject.Properties['CpuCores'].Value } else { '' }); 'Wątki' = $(if ($s) { $s.Cores } else { '' })
+            'RAM GB' = $ram; 'Moduły RAM' = (Get-HwValue $hw 'Pamięć' 'Moduły'); Dyski = (Get-HwValue $hw 'Dyski' 'Razem'); Kontroler = $ctl
+            System = $(if ($s) { "$($s.OS)" } else { '' }); Kompilacja = $(if ($s) { "$($s.Build)" } else { '' })
+            'Host Hyper-V' = $(if ($vm) { $vm.HostDisplay } elseif ($s -and "$($s.PSObject.Properties['HvHost'].Value)") { Get-DisplayName "$($s.HvHost)" } else { '' })
+            'vCPU (przydział)' = $(if ($vm) { $vm.Row.CPU } else { '' }); 'RAM przydzielony GB' = $(if ($vm) { if ([double]$vm.Row.MemGB -gt 0) { $vm.Row.MemGB } else { $vm.Row.MemStartupGB } } else { '' })
+            'Dane z' = $at
+        }
+    })
+}
+function Export-HardwareInventory {
+    $rows = @(Get-HardwareInventory)
+    if (-not $rows.Count) { Show-Toast 'Lista serwerów jest pusta.' 'info'; return }
+    $dlg = New-Object Microsoft.Win32.SaveFileDialog
+    $dlg.Filter = 'CSV (*.csv)|*.csv'
+    try { New-Item -ItemType Directory -Force -Path $Config.ReportDir -ErrorAction Stop | Out-Null; $dlg.InitialDirectory = $Config.ReportDir } catch { }
+    $dlg.FileName = "Inwentaryzacja_sprzetu_$(Get-Date -Format yyyyMMdd_HHmm).csv"
+    if ($dlg.ShowDialog($script:window) -ne $true) { return }
+    Export-RowsToCsv $rows $dlg.FileName
+    $none = @($rows | Where-Object { $_.Rodzaj -eq 'brak danych' }).Count
+    Write-Log "Inwentaryzacja sprzętu ($($rows.Count) serwerów$(if ($none) { ", bez danych: $none" })): $($dlg.FileName)" 'OK' 'Eksport'
+    Show-Toast "Zapisano inwentaryzację sprzętu ($($rows.Count) serwerów): $([IO.Path]::GetFileName($dlg.FileName))" 'ok'
+}
+#endregion
+
 #region ── Okno Ustawienia ─────────────────────────────────────────────────────
 function New-SettingsDialog {
     $dlg = New-UiElement $script:SettingsXamlText
@@ -9685,6 +9992,7 @@ $ui.btnReport.Add_Click({
         $old = $window.Cursor; $window.Cursor = [System.Windows.Input.Cursors]::Wait
         try { [void](Export-HtmlReport -Mode Full) } finally { $window.Cursor = $old }
     }))
+    [void]$m.Items.Add((New-MenuItem 'Inwentaryzacja sprzętu (CSV, wszystkie serwery z listy)' 'E896' { Export-HardwareInventory }))
     [void]$m.Items.Add((New-MenuSeparator))
     [void]$m.Items.Add((New-MenuItem 'Otwórz folder raportów' 'E838' { New-Item -ItemType Directory -Force -Path $Config.ReportDir | Out-Null; Start-Process explorer.exe -ArgumentList "`"$($Config.ReportDir)`"" }))
     $m.PlacementTarget = $ui.btnReport; $m.Placement = 'Bottom'; $m.IsOpen = $true

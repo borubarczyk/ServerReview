@@ -82,8 +82,13 @@ switch ($Step) {
         $s = $d.System
         "System: $($s.OS) $($s.Build); aktywacja: $($s.LicenseStatus) ($($s.LicenseChannel)), pozostało dni: $($s.LicenseGraceDays)"
         foreach ($k in 'Disks', 'Backup', 'AppRoles') { "${k}: $(@($d.$k | Where-Object { $_ }).Count) wierszy" }
-        # nowe sekcje nie mogą kończyć się błędem na czystym systemie
-        $bad = @($d.Errors | Where-Object { "$_" -match '^(Kopie zapasowe|Role aplikacyjne|Aktywacja Windows):' })
+        # Sprzęt i konfiguracja: wiersze w grupach i podsumowania – rzeczywiste dane maszyny runnera (maszyna wirtualna)
+        $hw = @($d.Hardware | Where-Object { $_ })
+        "Sprzęt i konfiguracja: $($hw.Count) wierszy – $((@($hw | Group-Object Group | ForEach-Object { "$($_.Name): $($_.Count)" })) -join ', ')"
+        $hw | Where-Object { $_.Group -in 'Komputer', 'System' -or $_.Item -eq 'Razem' } | Select-Object -First 24 Group, Item, Value, Live | Format-Table -AutoSize -Wrap | Out-String -Width 220
+        # nowe sekcje nie mogą kończyć się błędem na czystym systemie (Sprzęt: błąd grupy ma postać „Sprzęt i konfiguracja (Pamięć): …”)
+        $bad = @($d.Errors | Where-Object { "$_" -match '^(Kopie zapasowe|Role aplikacyjne|Aktywacja Windows|Sprzęt i konfiguracja)( \([^)]*\))?:' })
+        if (-not $hw.Count) { $bad += 'Sprzęt i konfiguracja: brak wierszy' }
         foreach ($e in $bad) { Fail "Nowa sekcja zakończona błędem: $e" }
         if ($bad.Count) { exit 1 }
     }
