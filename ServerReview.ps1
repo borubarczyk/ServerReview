@@ -1649,8 +1649,8 @@ $Collector = {
     # Dyski fizyczne raz na skan – dla sekcji Zdrowie dysków i Sprzęt i konfiguracja (ta sama lista i ten sam filtr S2D, liczniki niezawodności czytane raz).
     # Storage Spaces Direct: Get-PhysicalDisk na węźle z pulą klastrową widzi dyski WSZYSTKICH węzłów – bierzemy tylko podłączone do tego węzła
     # (jeden uszkodzony dysk nie daje problemu na każdym węźle); bez węzła magazynu albo przy błędzie – wszystkie dyski jak dotąd.
-    # Błąd wyliczenia zgłasza sekcja Zdrowie dysków; sekcja Sprzęt czyta wtedy dyski z Win32_DiskDrive
-    $pools = @(); $clPool = 0; $pdAll = @(); $pdErr = $null
+    # Błąd wyliczenia zgłasza sekcja Zdrowie dysków; sekcja Sprzęt czyta wtedy dyski z Win32_DiskDrive. $pdPartial – filtr węzła S2D się nie udał (lista z dyskami wszystkich węzłów)
+    $pools = @(); $clPool = 0; $pdAll = @(); $pdErr = $null; $pdPartial = $false
     if ((Want 'DiskHealth') -or (Want 'Hardware')) {
         $t0 = $sw.Elapsed.TotalSeconds
         if (Get-Command Get-StoragePool -ErrorAction SilentlyContinue) { try { $pools = @(Get-StoragePool -IsPrimordial $false -ErrorAction SilentlyContinue) } catch { } }   # brak pul: błąd „nie znaleziono” modułu Storage
@@ -1663,7 +1663,7 @@ $Collector = {
                         $stn = @(Get-StorageNode -ErrorAction Stop | Where-Object { "$($_.Name)" -eq $env:COMPUTERNAME -or "$($_.Name)" -like "$env:COMPUTERNAME.*" })
                         $seen = @{}   # węzeł bywa widoczny w kilku podsystemach magazynu – bez powtórzeń dysków
                         if ($stn.Count) { $pds = @($stn | Get-PhysicalDisk -PhysicallyConnected -ErrorAction Stop | Where-Object { $k = "$($_.UniqueId)|$($_.SerialNumber)"; if ($k -eq '|') { $k = "$($_.ObjectId)" }; if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true } }) }
-                    } catch { $pds = $null }
+                    } catch { $pds = $null; $pdPartial = $true }
                 }
                 if (-not $pds) { $pds = @(Get-PhysicalDisk) }
                 # licznik niezawodności (zużycie, temperatura, godziny pracy, błędy) – brak dla dysków wirtualnych i woluminów kontrolera RAID
@@ -1675,7 +1675,7 @@ $Collector = {
 
     # ── Sprzęt i konfiguracja: komputer, procesory, pamięć, kontrolery, dyski, karty sieciowe, system ──
     # Value – dane stałe, porównywane ze skanem poprzednim (wymiana dysku albo modułu RAM, inny procesor, aktualizacja BIOS, nowa karta sieciowa);
-    # Live – wartości zmienne (zużycie, temperatura, stan łącza, obciążenie), bez porównania. W maszynie wirtualnej to, co widzi gość: platforma,
+    # Live – wartości zmienne (stan i zużycie dysku, temperatura, stan łącza, obciążenie), bez porównania. W maszynie wirtualnej to, co widzi gość: platforma,
     # vCPU, pamięć i dyski wirtualne (model procesora i MAC zależą od hosta – w Live). Każda grupa osobno: błąd jednej nie kasuje pozostałych,
     # ale sekcja jest wtedy niezebrana (niepełna lista dałaby w porównaniu fałszywe „Usunięte”). Bez nawiasów klamrowych w tekstach –
     # Get-SnapshotSummary wycina sekcję prostym wyrażeniem (ostatnie znane dane serwera bez połączenia)
@@ -1710,7 +1710,14 @@ $Collector = {
             $bd = ''; if ($bios.ReleaseDate) { try { $bd = ([datetime]$bios.ReleaseDate).ToString('yyyy-MM-dd') } catch {} }
             $bv = HwJ @($bios.Manufacturer, $bios.SMBIOSBIOSVersion) ' '; if ($bd) { $bv += " ($bd)" }
             HwRow 'Komputer' 'BIOS / UEFI' $bv
+            # PEFirmwareType (1 = BIOS, 2 = UEFI) zapisuje Windows PE – w zainstalowanym systemie zwykle go nie ma (np. Windows Server 2025 w Azure). Wtedy
+            # Confirm-SecureBootUEFI: wynik (Secure Boot włączony/wyłączony) tylko w UEFI, w BIOS błąd „platforma nieobsługiwana”; bez uprawnień albo modułu –
+            # wartość UEFISecureBootEnabled (klucz SecureBoot\State jest tylko przy rozruchu UEFI). $env:firmware_type to zmienna dynamiczna cmd.exe – w PowerShell pusta
             $fwt = "$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Control' 'PEFirmwareType')"; $sbe = RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled'
+            if ($fwt -ne '1' -and $fwt -ne '2') {
+                try { $sbc = Confirm-SecureBootUEFI -ErrorAction Stop; if ($sbc -is [bool]) { $fwt = '2'; if ($null -eq $sbe) { $sbe = [int]$sbc } } } catch [System.PlatformNotSupportedException] { $fwt = '1' } catch { }
+                if ($fwt -ne '1' -and $fwt -ne '2' -and $null -ne $sbe) { $fwt = '2' }
+            }
             $bm = if ($fwt -eq '2') { 'UEFI' } elseif ($fwt -eq '1') { 'BIOS (legacy)' } else { 'nieznany' }
             if ($fwt -eq '2' -and $null -ne $sbe) { $bm += $(if ("$sbe" -eq '1') { ', Secure Boot włączony' } else { ', Secure Boot wyłączony' }) }
             HwRow 'Komputer' 'Tryb rozruchu' $bm
@@ -1780,8 +1787,9 @@ $Collector = {
         }
 
         HwPart 'Kontrolery dysków' {
-            # kontrolery RAID / HBA / NVMe; bez kontrolerów programowych (Storage Spaces, inicjator iSCSI); AHCI z Win32_IDEController
-            $ctl = @(@(Get-CimInstance Win32_SCSIController) + @(Get-CimInstance Win32_IDEController -ErrorAction SilentlyContinue | Where-Object { "$($_.Name)" -match 'AHCI|SATA|RAID|NVM' }) | Where-Object { $_ -and "$($_.Name)" -notmatch 'Storage Spaces|iSCSI Initiator|Virtual Drive Enumerator' })
+            # kontrolery RAID / HBA / NVMe; bez kontrolerów programowych (Storage Spaces, inicjator iSCSI) i USB (UAS – jest tylko z podłączonym dyskiem USB, np. kopii);
+            # nazwy zależą od języka systemu, więc także według sterownika; AHCI z Win32_IDEController
+            $ctl = @(@(Get-CimInstance Win32_SCSIController) + @(Get-CimInstance Win32_IDEController -ErrorAction SilentlyContinue | Where-Object { "$($_.Name)" -match 'AHCI|SATA|RAID|NVM' }) | Where-Object { $_ -and "$($_.Name)" -notmatch 'Storage Spaces|iSCSI Initiator|Virtual Drive Enumerator' -and "$($_.DriverName)" -notmatch '^(spaceport|iScsiPrt|vdrvroot|UASPStor|USBSTOR)$' })
             $ctl | Group-Object { "$($_.Name)|$($_.Manufacturer)|$($_.DriverName)" } | Sort-Object Name | Select-Object -First 24 | ForEach-Object {
                 $x = $_.Group[0]
                 HwRow 'Kontrolery dysków' $x.Name (HwJ @($(if ("$($x.Manufacturer)" -ne "$($x.Name)") { $x.Manufacturer }), $(if ($x.DriverName) { "sterownik $($x.DriverName)" }), $(if ($_.Count -gt 1) { "liczba: $($_.Count)" }))) (@($_.Group | ForEach-Object { "$($_.Status)" } | Where-Object { $_ } | Sort-Object -Unique) -join ', ')
@@ -1792,6 +1800,9 @@ $Collector = {
             $mtMap = @{ '0' = ''; 'Unspecified' = ''; '3' = 'HDD'; '4' = 'SSD'; '5' = 'SCM' }
             $btMap = @{ '1' = 'SCSI'; '2' = 'ATAPI'; '3' = 'ATA'; '4' = 'IEEE 1394'; '5' = 'SSA'; '6' = 'Fibre Channel'; '7' = 'USB'; '8' = 'RAID'; '9' = 'iSCSI'; '10' = 'SAS'; '11' = 'SATA'; '12' = 'SD'; '13' = 'MMC'; '14' = 'Virtual'; '15' = 'File Backed Virtual'; '16' = 'Storage Spaces'; '17' = 'NVMe'; '18' = 'SCM'; '19' = 'UFS' }
             $rows = @(); $sum = @()
+            # lista z innego źródła (Win32_DiskDrive po błędzie Get-PhysicalDisk) albo z dyskami wszystkich węzłów S2D – sekcja niezebrana (bez porównania:
+            # każdy dysk byłby „Usunięty” i „Nowy” teraz i w następnym skanie); błąd zgłasza Zdrowie dysków, a gdy ta sekcja jest pominięta – ta grupa
+            if ($pdErr -or $pdPartial) { $failedKeys.Add('Hardware'); if ($pdErr -and -not (Want 'DiskHealth')) { $errs.Add("Sprzęt i konfiguracja (Dyski): Get-PhysicalDisk – $($pdErr.Exception.Message); dyski odczytane z Win32_DiskDrive") } }
             if ($pdAll.Count) {
                 # dyski USB (np. rotowane dyski kopii) i zamontowane pliki VHD (kopie zapasowe hosta) to nie konfiguracja serwera – bez nich porównanie nie zgłasza każdej rotacji
                 foreach ($x in @($pdAll | Sort-Object { [double]("0" + ("$($_.D.DeviceId)" -replace '\D', '')) })) {
@@ -1800,14 +1811,15 @@ $Collector = {
                     $bt = "$($pd.BusType)"; $bus = if ($btMap.ContainsKey($bt)) { $btMap[$bt] } else { $bt }
                     if ($bus -in 'USB', 'File Backed Virtual') { continue }
                     $hs = "$($pd.HealthStatus)"; $dsn = HwSn $pd.SerialNumber
-                    $rows += HwRow 'Dyski' "Dysk $($pd.DeviceId)" (HwJ @($pd.FriendlyName, $med, $bus, (HwSz $pd.Size), $(if ($dsn) { "nr ser. $dsn" }), $(if ("$($pd.FirmwareVersion)".Trim()) { "firmware $($pd.FirmwareVersion)" }), "stan $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs })")) (HwJ @($(if ($rc -and $null -ne $rc.Wear -and $med -ne 'HDD') { "zużycie $($rc.Wear)%" }), $(if ($rc -and $rc.Temperature) { "$($rc.Temperature) °C" }), $(if ($rc -and $rc.PowerOnHours) { "$($rc.PowerOnHours) h pracy" })) ', ')
+                    $rows += HwRow 'Dyski' "Dysk $($pd.DeviceId)" (HwJ @($pd.FriendlyName, $med, $bus, (HwSz $pd.Size), $(if ($dsn) { "nr ser. $dsn" }), $(if ("$($pd.FirmwareVersion)".Trim()) { "firmware $($pd.FirmwareVersion)" }))) (HwJ @($(if ($hs) { "stan $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs })" }), $(if ($rc -and $null -ne $rc.Wear -and $med -ne 'HDD') { "zużycie $($rc.Wear)%" }), $(if ($rc -and $rc.Temperature) { "$($rc.Temperature) °C" }), $(if ($rc -and $rc.PowerOnHours) { "$($rc.PowerOnHours) h pracy" })) ', ')
                     $sum += HwJ @($med, (HwSz $pd.Size), $bus) ' '
                 }
             } else {
-                # bez modułu Storage albo po błędzie Get-PhysicalDisk: dyski z WMI (typ nośnika nieznany)
-                foreach ($dd in @(Get-CimInstance Win32_DiskDrive | Where-Object { "$($_.InterfaceType)" -ne 'USB' } | Sort-Object Index)) {
+                # bez modułu Storage albo po błędzie Get-PhysicalDisk: dyski z WMI (typ nośnika nieznany); bez dysków USB i nośników wymiennych
+                # (dysk USB z UAS ma InterfaceType SCSI, a MediaType „External hard disk media”)
+                foreach ($dd in @(Get-CimInstance Win32_DiskDrive | Where-Object { "$($_.InterfaceType)" -ne 'USB' -and "$($_.MediaType)" -notmatch 'External|Removable' } | Sort-Object Index)) {
                     $dsn = HwSn $dd.SerialNumber
-                    $rows += HwRow 'Dyski' "Dysk $($dd.Index)" (HwJ @($dd.Model, $dd.InterfaceType, (HwSz $dd.Size), $(if ($dsn) { "nr ser. $dsn" }), $(if ("$($dd.FirmwareRevision)".Trim()) { "firmware $($dd.FirmwareRevision)" }), "stan $($dd.Status)"))
+                    $rows += HwRow 'Dyski' "Dysk $($dd.Index)" (HwJ @($dd.Model, $dd.InterfaceType, (HwSz $dd.Size), $(if ($dsn) { "nr ser. $dsn" }), $(if ("$($dd.FirmwareRevision)".Trim()) { "firmware $($dd.FirmwareRevision)" }))) $(if ("$($dd.Status)".Trim()) { "stan $($dd.Status)" })
                     $sum += HwJ @((HwSz $dd.Size), $dd.InterfaceType) ' '
                 }
             }
@@ -3513,7 +3525,7 @@ $script:Sections = @(
     @{ Key = 'Changes';        Header = 'Zmiany od poprzedniego skanu' }
     @{ Key = 'System';         Header = 'System' }
     @{ Key = 'Hardware';       Header = 'Sprzęt i konfiguracja' }
-    @{ Key = 'Hardening';     Header = 'Konfiguracja bezpieczeństwa' }
+    @{ Key = 'Hardening';      Header = 'Konfiguracja bezpieczeństwa' }
     @{ Key = 'EventLogs';      Header = 'Dzienniki zdarzeń' }
     @{ Key = 'AuditPolicy';    Header = 'Polityka audytu' }
     @{ Key = 'Disks';          Header = 'Dyski' }
@@ -3573,9 +3585,10 @@ $script:DiffDefs = [ordered]@{
     Software   = @{ Label = 'oprogramowanie';  KeyFn = { param($r) "$($r.Name) $($r.Version)" };   Filter = $null; Sev = 'Info' }
     Persistence = @{ Label = 'trwałość (WMI, AV)'; KeyFn = { param($r) "$($r.Type): $($r.Name)" };   Filter = $null; Sev = 'Ostrzeżenie' }
     Exposure   = @{ Label = 'reguły zapory';   KeyFn = { param($r) "$($r.Rule) [$($r.Ports)]" };    Filter = $null; Sev = 'Ostrzeżenie' }
-    # wymiana dysku, modułów RAM, procesora, karty sieciowej, aktualizacja BIOS – tylko wartości stałe (Live: zużycie, temperatura, stan łącza – bez porównania);
-    # podsumowania dysków i modułów wynikają z wierszy pojedynczych dysków i modułów – bez nich jedna wymiana to jedna zmiana, nie trzy
-    Hardware   = @{ Label = 'sprzęt';          KeyFn = { param($r) "$($r.Group) – $($r.Item): $($r.Value)" }; Filter = { -not (("$($_.Group)" -eq 'Dyski' -and "$($_.Item)" -eq 'Razem') -or ("$($_.Group)" -eq 'Pamięć' -and "$($_.Item)" -eq 'Moduły')) }; Sev = 'Info' }
+    # wymiana dysku, modułów RAM, procesora, karty sieciowej, aktualizacja BIOS – tylko wartości stałe (Live: stan i zużycie dysku, temperatura, stan łącza – bez porównania);
+    # podsumowania dysków i modułów wynikają z wierszy pojedynczych dysków i modułów – bez nich jedna wymiana to jedna zmiana, nie trzy;
+    # dysk z numerem seryjnym bez numeru dysku w kluczu (numer zmienia się po restarcie: kolejność wykrycia kontrolerów i LUN-ów)
+    Hardware   = @{ Label = 'sprzęt';          KeyFn = { param($r) if ("$($r.Group)" -eq 'Dyski' -and "$($r.Value)" -match '(^| · )nr ser\. ') { "Dyski: $($r.Value)" } else { "$($r.Group) – $($r.Item): $($r.Value)" } }; Filter = { -not (("$($_.Group)" -eq 'Dyski' -and "$($_.Item)" -eq 'Razem') -or ("$($_.Group)" -eq 'Pamięć' -and "$($_.Item)" -eq 'Moduły')) }; Sev = 'Info' }
 }
 
 $script:Headers = @{
@@ -3599,7 +3612,7 @@ $script:Headers = @{
     HotFixID = 'KB'; InstalledOn = 'Zainstalowano'; InstalledBy = 'Zainstalował'
     HotFixIds = 'Zainstalowane poprawki (KB)'; Cve = 'CVE'; Impact = 'Skutek'; Cvss = 'CVSS'; Exploited = 'Wykorzystywana'; Month = 'Biuletyn'
     Kb = 'Poprawka (KB)'; FixedBuild = 'Naprawiono w kompilacji'; CveMissing = 'Brakujące poprawki (CVE)'; CveExpl = 'Wykorzystywane CVE'
-    Check = 'Sprawdzenie'; Value = 'Wartość'; Severity = 'Poziom'; Category = 'Kategoria'; Section = 'Obszar'; Change = 'Zmiana'; Item = 'Element'; Property = 'Właściwość'; Live = 'Bieżące'
+    Check = 'Sprawdzenie'; Value = 'Wartość'; Severity = 'Poziom'; Category = 'Kategoria'; Section = 'Obszar'; Change = 'Zmiana'; Item = 'Pozycja'; Property = 'Właściwość'; Live = 'Bieżące'
     Server = 'Serwer'; OS = 'System'; RAM = 'RAM [%]'; MinDiskPct = 'Min. wolne na dysku [%]'; Crit = 'Krytyczne'; Warn = 'Ostrzeżenia'; PatchDays = 'Dni od aktualizacji'
     ScanSec = 'Skan [s]'; Scanned = 'Skanowano'
     ComputerName = 'Nazwa komputera'; FQDN = 'FQDN'; Build = 'Kompilacja'; OSInstallDate = 'Instalacja systemu'; LastBoot = 'Ostatni start'
@@ -8268,15 +8281,18 @@ function Get-HardwareRows($D, [string]$Name) {
         # dyski z sekcji Hyper-V: dyski VM hosta (bez dysków pass-through i na udziałach SMB, których host nie odczytuje); po samym wierszu maszyny – łączny rozmiar
         $hd = $script:Data[$vm.Host]
         $vd = @(if ($hd -and $hd.PSObject.Properties['VMStorage']) { foreach ($x in @($hd.VMStorage)) { if ($x -and "$($x.VM)" -eq "$($r.Name)") { $x } } })
-        $max = 0.0; foreach ($x in $vd) { $max += [double]$x.MaxGB }
+        # rozmiar maksymalny bywa nieznany (dysk na udziale SMB, plik VHD nieczytelny dla hosta) – suma tylko znanych, bez „maks.”, gdy żaden nie jest znany
+        $max = 0.0; $nk = 0; foreach ($x in $vd) { if ("$($x.MaxGB)" -ne '') { $max += [double]$x.MaxGB } else { $nk++ } }
         $used = if ("$($r.DisksGB)" -ne '') { "zajęte na hoście $($r.DisksGB) GB (z checkpointami)" } else { '' }
-        & $row 'Dyski wirtualne (razem)' $(if ($vd.Count) { "liczba: $($vd.Count), maks. $([math]::Round($max, 1)) GB" } else { 'szczegóły dysków niedostępne w danych hosta' }) $used
+        & $row 'Dyski wirtualne (razem)' $(if ($vd.Count) { "liczba: $($vd.Count)$(if ($nk -lt $vd.Count) { ", maks. $([math]::Round($max, 1)) GB" })$(if ($nk) { " (rozmiar nieznany: $nk)" })" } else { 'szczegóły dysków niedostępne w danych hosta' }) $used
         $tp = @{ Dynamic = 'dynamiczny'; Fixed = 'stały'; Differencing = 'różnicowy' }
         $i = 0
         foreach ($x in $vd) { $i++; & $row "Dysk wirtualny $i" ((@("$($x.Disk)", $(if ($tp.ContainsKey("$($x.Type)")) { $tp["$($x.Type)"] } else { "$($x.Type)" }), $(if ("$($x.MaxGB)" -ne '') { "maks. $($x.MaxGB) GB" })) | Where-Object { $_ }) -join ' · ') ((@($(if ("$($x.CurrentGB)" -ne '') { "obecnie $($x.CurrentGB) GB" }), $(if ("$($x.VolumeFreeGB)" -ne '') { "wolne na wolumenie $($x.VolumeFreeGB) GB" })) | Where-Object { $_ }) -join ', ') }
     } elseif ("$($s.PSObject.Properties['Hypervisor'].Value)" -eq 'Hyper-V') {
         $hn = "$($s.PSObject.Properties['HvHost'].Value)"; $hk = Find-ServerKey $hn
-        $why = if (-not $hn) { 'host nieznany – brak danych usług integracji w systemie gościa' } elseif (-not $hk) { 'hosta nie ma na liście serwerów – dodaj go, żeby widzieć przydział zasobów' } elseif (-not $script:Data[$hk] -or $script:Data[$hk].Offline) { 'brak aktualnych danych hosta (nie skanowano albo brak połączenia)' } else { 'maszyny nie ma w danych hosta (przeniesiona albo usunięta?)' }
+        $hd = if ($hk) { $script:Data[$hk] } else { $null }
+        # indeks maszyn odświeża się po wczytaniu wyników i po skanie (Complete-Load, Complete-Scan) – wcześniej brak maszyny nie jest rozstrzygający
+        $why = if (-not $hn) { 'host nieznany – brak danych usług integracji w systemie gościa' } elseif (-not $hk) { 'hosta nie ma na liście serwerów – dodaj go, żeby widzieć przydział zasobów' } elseif (-not $hd -or $hd.Offline) { 'brak aktualnych danych hosta (nie skanowano albo brak połączenia)' } elseif (@($hd.PSObject.Properties['Skipped'].Value) -contains 'HyperV' -or @($hd.PSObject.Properties['Failed'].Value) -contains 'HyperV') { 'w skanie hosta sekcja „Hyper-V: maszyny” była pominięta albo nie udało się jej zebrać' } elseif (-not $script:VmIndex -or (Get-Operation 'Load') -or (Get-Operation 'Scan')) { 'dane hostów są jeszcze uzupełniane (wczytywanie wyników albo skan w toku) – przydział pojawi się po zakończeniu' } else { 'maszyny nie ma w danych hosta (przeniesiona albo usunięta?)' }
         & $row 'Host' $(if ($hn) { Get-DisplayName $hn } else { 'nieznany' }) $why
     } else {
         $g = 'Przydział zasobów'
