@@ -77,6 +77,7 @@ $Config = [ordered]@{
     IncludeWarnings        = $false   # $true = także ostrzeżenia z System/Application (dużo szumu)
     DiskWarnPct            = 20
     DiskCritPct            = 10
+    DiskMinFreeGB          = 0        # dysk poniżej progu krytycznego, ale z co najmniej tyloma GB wolnego = tylko ostrzeżenie (duże wolumeny; 0 = bez warunku)
     UptimeWarnDays         = 45
     PatchWarnDays          = 45
     CertWarnDays           = 30
@@ -154,7 +155,7 @@ $Config = [ordered]@{
     CveRefreshHours        = 24      # dane starsze niż tyle godzin są pobierane ponownie
     CveProxy               = ''      # serwer proxy dla pobierania, np. http://proxy:8080 (puste = ustawienia systemowe)
     # Koniec rozszerzonego wsparcia Microsoft wg numeru kompilacji (bez płatnego ESU)
-    OsSupportEnd           = @{ '9200' = '2023-10-10'; '9600' = '2023-10-10'; '14393' = '2027-01-12'; '17763' = '2029-01-09'; '20348' = '2031-10-14'; '26100' = '2034-10-10' }
+    OsSupportEnd           = @{ '6001' = '2020-01-14'; '6002' = '2020-01-14'; '6003' = '2020-01-14'; '7600' = '2020-01-14'; '7601' = '2020-01-14'; '9200' = '2023-10-10'; '9600' = '2023-10-10'; '14393' = '2027-01-12'; '17763' = '2029-01-09'; '20348' = '2031-10-14'; '26100' = '2034-10-10' }
     # Powiadomienia po skanie bez okna (-Scan): e-mail (SMTP) i/lub webhook (Slack, Mattermost, Microsoft Teams – Workflows)
     NotifyOnlyNew          = $true   # tylko gdy pojawiły się nowe problemy krytyczne (względem poprzedniego powiadomienia)
     NotifyWarnings         = $false  # także nowe ostrzeżenia
@@ -271,13 +272,48 @@ $Collector = {
     # Hasła podane w linii poleceń (usługi, zadania, autostart, WMI) nie trafiają do migawek, raportów ani CSV
     function Hide-Secret([string]$s) {
         if (-not $s) { return $s }
-        $s = [regex]::Replace($s, '(?i)((?:^|\s)[-/](?:p|pw|pwd|pass|passwd|password|secret|token|apikey)(?::|=|\s+))(?!\d)("[^"]*"|\S+)', '$1***')
-        [regex]::Replace($s, '(?i)((?:password|passwd|pwd|secret|token|apikey)\s*=\s*)("[^"]*"|[^;\s"]+)', '$1***')
+        # hasło doklejone do -p (mysql, mysqldump, 7-Zip, RAR: -pHASLO; samo -p to pytanie o hasło). Szukanie -p kończy się na następnej
+        # nazwie programu (od niej szuka kolejne dopasowanie), więc długi tekst z wieloma nazwami nie jest przeglądany w kółko do końca
+        $kw = '\b(?:mysql\w*|7z[ar]?|(?:un|win)?rar)(?:\.exe)?"?\s'
+        $s = [regex]::Replace($s, '(?i)(' + $kw + '(?:(?:(?!' + $kw + ')[^|])*?\s)?(?-i:-p))(?!\s)("[^"]*"|\S+)', '$1***')
+        # przełącznik z hasłem (-P x, --password x, /rp x, -SqlPassword x, --client-secret x); -p z numerem portu, kolejnym przełącznikiem, ścieżką albo /p:Nazwa=wartość zostaje
+        $s = [regex]::Replace($s, '(?i)((?:^|\s)(?:--?|/)(?:(?:[\w-]{2,}?)?(?:password|passwd|passphrase|secret|token|api[-_]?key)|p(?![:=\s]+(?:\d{1,5}(?:\s|$)|[-/]\w|"?[a-z]:\\|"?\\\\)|:\w+=)|pw|pwd|pass|rp)(?::|=|\s+))(''[^'']*''|"[^"]*"|\S+)', '$1***')
+        # hasło pozycyjne net use (\\serwer\udział HASLO, także po /user:)
+        $s = [regex]::Replace($s, '(?i)(\bnet(?:\.exe)?\s+use\s+(?:[a-z]:\s+|\*\s+)?(?:"\\\\[^"]+"|\\\\\S+)\s+(?:/u(?:ser)?:(?:"[^"]*"|\S+)\s+)?)(?![/-])(''[^'']*''|"[^"]*"|\S+)', '$1***')
+        # adres z poświadczeniami (https://login:HASLO@host); dopasowanie od ostatniego znaku schematu, bo wzorzec od początku schematu
+        # sprawdzany przy każdej granicy słowa przeglądał długi ciąg a.b.c… od nowa
+        $s = [regex]::Replace($s, '(?i)([a-z0-9+.-]://[^/\s:@]+:)[^\s/]+(@)', '$1***$2')
+        # skrypty WMI (VBS/JS): czwarty argument ConnectServer(serwer, przestrzeń nazw, login, HASLO)
+        $s = [regex]::Replace($s, '(?i)(\bConnectServer\s*\((?:[^,()]*,){3}\s*)("[^"]*"|[^,()\s]+)', '$1***')
+        # ConvertTo-SecureString 'HASLO' -AsPlainText (przełączniki w dowolnej kolejności, także -String) i 'HASLO' | ConvertTo-SecureString
+        $s = [regex]::Replace($s, '(?i)(\bConvertTo-SecureString(?:\s+-(?:AsPlainText|Force)\b)*\s+(?:-String\s+)?)(?![-$(])(''[^'']*''|"[^"]*"|[^\s;|)]+)', '$1***')
+        $s = [regex]::Replace($s, '(?i)(''[^'']*''|"[^"]*")(\s*\|\s*ConvertTo-SecureString\b)', '''***''$2')
+        # login:hasło po -u / --user (curl, wget)
+        $s = [regex]::Replace($s, '(?i)((?:^|\s)(?:-u|--user)[\s=]+"?[^\s:"@/=]+:)(?![\\/])([^\s"]+)', '$1***')
+        # przypisanie: Password=x, w ciągu połączenia także ze spacją (Password=a b;), -Dpassword=x -jar – tylko wartość
+        [regex]::Replace($s, '(?i)((?:password|passwd|passphrase|pwd|secret|token|api[-_]?key)\s*=\s*)("[^"]*"|''[^'']*''|[^;"=\s&|]+(?:\s+[^;"=\s&|/-][^;"=\s&|]*)*(?=;)|[^;\s"]+)', '$1***')
     }
     # Wartość z rejestru albo $null (brak klucza lub wartości)
     function RegV([string]$Path, [string]$Name) { try { $k = Get-Item -LiteralPath $Path -ErrorAction Stop; return $k.GetValue($Name) } catch { return $null } }
     # Pola EventData zdarzenia jako tabela nazwa → wartość (niezależne od języka systemu)
     function EvMap($e) { $h = @{}; try { $x = [xml]$e.ToXml(); foreach ($n in @($x.Event.EventData.Data)) { if ($n.Name) { $h["$($n.Name)"] = "$($n.'#text')" } } } catch { }; $h }
+    # Zdarzenia wprost przez EventLogReader, od najnowszych (z -Oldest: od najstarszego). Get-WinEvent formatuje treść każdego rekordu,
+    # a sekcje czytające dane z ToXml() jej nie używają (Zdarzenia formatują tylko pokazywaną: FormatDescription()). Brak dostępu do dziennika
+    # zgłasza wyjątek – Get-WinEvent -FilterHashtable zwraca wtedy pusty wynik, nie do odróżnienia od braku zdarzeń
+    function EvRead([string]$Log, [int[]]$Id, [int[]]$Level, $Since, [int]$Max = 1, [switch]$Oldest) {
+        $c = @()
+        if ($Since) { $c += "TimeCreated[@SystemTime>='" + ([datetime]$Since).ToUniversalTime().ToString('yyyy-MM-dd''T''HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + "Z']" }
+        if ($Id) { $c += '(' + (@($Id | ForEach-Object { "EventID=$_" }) -join ' or ') + ')' }
+        if ($Level) { $c += '(' + (@($Level | ForEach-Object { "Level=$_" }) -join ' or ') + ')' }
+        $xp = if ($c.Count) { '*[System[' + ($c -join ' and ') + ']]' } else { '*' }
+        $q = New-Object System.Diagnostics.Eventing.Reader.EventLogQuery -ArgumentList $Log, ([System.Diagnostics.Eventing.Reader.PathType]::LogName), $xp
+        $q.ReverseDirection = -not $Oldest
+        $rd = New-Object System.Diagnostics.Eventing.Reader.EventLogReader -ArgumentList $q
+        $n = 0
+        try { while ($n -lt $Max) { $e = $rd.ReadEvent(); if (-not $e) { break }; $e; $n++ } }
+        catch { if (-not $n) { throw $_ }; $errs.Add("Dziennik $Log`: odczyt przerwany po $n zdarzeniach – $($_.Exception.Message)") }
+        finally { $rd.Dispose() }
+    }
 
     # ── System ──
     $sys = [ordered]@{}
@@ -345,6 +381,17 @@ $Collector = {
         $hvts = ($vts -and "$($vts.Status)" -eq 'Running' -and (-not $vtp -or $vtp.Enabled -ne 0))
     } catch {}
     $sys.HvTimeSync = [bool]$hvts
+    # Ostrzeżenia usługi czasu: 36 (brak synchronizacji od doby), 47 (brak odpowiedzi ręcznie podanego serwera NTP), 129 i 134 (nie można
+    # ustalić źródła domenowego / ręcznego). PDC bez działającego NTP chodzi na własnym zegarze, a z nim cała domena (i stacja) – porównanie
+    # zegarów ze stacją tego nie pokaże. Bez nawiasów klamrowych: Get-SnapshotSummary wycina System prostym wyrażeniem.
+    $sys.TimeSyncWarn = 0; $sys.TimeSyncNoSync = 0; $sys.TimeSyncLast = ''
+    try {
+        $tsw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Time-Service'; Id = 36, 47, 129, 134; StartTime = $since } -MaxEvents 200 -ErrorAction SilentlyContinue)
+        $sys.TimeSyncWarn = $tsw.Count; $sys.TimeSyncNoSync = @($tsw | Where-Object { $_.Id -eq 36 }).Count
+        if ($tsw.Count) { $sys.TimeSyncLast = "$(D $tsw[0].TimeCreated), zdarzenie $($tsw[0].Id): $(Short $tsw[0].Message 200)" -replace '[{}]', '' }
+    } catch {}
+    # Kontroler domeny głównej lasu: tylko PDC tej domeny potrzebuje zewnętrznego źródła NTP (PDC domen podrzędnych biorą czas z hierarchii domen)
+    if ($sys.IsDC) { try { $rdse = New-Object System.DirectoryServices.DirectoryEntry -ArgumentList 'LDAP://RootDSE'; $sys.ForestRoot = ("$($rdse.InvokeGet('rootDomainNamingContext'))" -eq "$($rdse.InvokeGet('defaultNamingContext'))"); $rdse.Dispose() } catch {} }
 
     $pr = @()
     try {
@@ -407,6 +454,9 @@ $Collector = {
         }
     } catch { $errs.Add("Aktywacja Windows: $($_.Exception.Message)") }
     $timings['Aktywacja Windows'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
+    # Win32_Service raz na skan: konfiguracja bezpieczeństwa, usługi według PID i sekcja Usługi (wyliczenie usług trwa w starszych systemach do 1,5 s)
+    $svcCim = @(); $svcCimErr = $null
+    try { $svcCim = @(Get-CimInstance Win32_Service) } catch { $svcCimErr = $_ }
 
     # ── Konfiguracja bezpieczeństwa ──
     $hard = New-Object System.Collections.Generic.List[object]
@@ -424,7 +474,7 @@ $Collector = {
             Add-Check 'Defender – ochrona w czasie rzeczywistym' $(if ($mp.RealTimeProtectionEnabled) { 'włączona' } else { 'WYŁĄCZONA' }) $(if ($mp.RealTimeProtectionEnabled) { 'OK' } else { 'Krytyczne' })
             $age = [int64]$mp.AntivirusSignatureAge   # UInt32; 4294967295 = brak daty aktualizacji (rzutowanie na [int] rzuciłoby wyjątek)
             Add-Check 'Defender – wiek sygnatur [dni]' $(if ($age -ge 65535) { 'brak daty aktualizacji' } else { $age }) $(if ($age -le 3) { 'OK' } elseif ($age -le 7) { 'Uwaga' } else { 'Krytyczne' })
-            Add-Check 'Defender – dni od szybkiego skanu' $mp.QuickScanAge $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })
+            Add-Check 'Defender – dni od szybkiego skanu' $(if ([int64]$mp.QuickScanAge -ge 65535) { 'nigdy' } else { $mp.QuickScanAge }) $(if ($mp.QuickScanAge -le 14) { 'OK' } else { 'Info' })   # 4294967295 = skanu nie było
             if ($null -ne $mp.IsTamperProtected) { Add-Check 'Defender – ochrona przed naruszeniami' $(if ($mp.IsTamperProtected) { 'włączona' } else { 'wyłączona' }) $(if ($mp.IsTamperProtected) { 'OK' } else { 'Info' }) }
         }
     } catch { $sys.AV = 'brak danych z Defendera'; Add-Check 'Antywirus' 'Defender niedostępny (inny AV lub starszy system)' 'Info' }
@@ -469,7 +519,10 @@ $Collector = {
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $wd = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' -ErrorAction SilentlyContinue
-        Add-Check 'WDigest – hasła w pamięci' $(if ($wd.UseLogonCredential -eq 1) { 'WŁĄCZONE' } else { 'wyłączone' }) $(if ($wd.UseLogonCredential -eq 1) { 'Krytyczne' } else { 'OK' })
+        # bez wartości UseLogonCredential WDigest przechowuje hasła w systemach starszych niż Windows Server 2012 R2 (kompilacja 9600), także z KB2871997
+        $wdv  = $wd.UseLogonCredential
+        $wdOn = if ($null -ne $wdv) { "$wdv" -eq '1' } else { $sys.BuildNumber -and [int]$sys.BuildNumber -lt 9600 }
+        Add-Check 'WDigest – hasła w pamięci' $(if ($wdOn -and $null -eq $wdv) { 'WŁĄCZONE (domyślnie przed Windows Server 2012 R2 – ustaw UseLogonCredential = 0)' } elseif ($wdOn) { 'WŁĄCZONE' } else { 'wyłączone' }) $(if ($wdOn) { 'Krytyczne' } else { 'OK' })
     } catch { $errs.Add("Konfiguracja bezpieczeństwa: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]") }
     try {
         $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
@@ -507,7 +560,7 @@ $Collector = {
     # ── Dalsze utwardzenie: tylko odczyt rejestru, usług i WMI. Status 'Zalecenie' = warto poprawić (w analizie jedna zbiorcza informacja
     #    na serwer), 'Uwaga'/'Krytyczne' = realne ryzyko. Brak wpisu w rejestrze oceniamy według domyślnego zachowania danej wersji systemu.
     $osB = [int]$sys.BuildNumber   # 9600 = 2012 R2, 14393 = 2016, 17763 = 2019, 20348 = 2022, 26100 = 2025
-    $svcAll = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Select-Object Name, DisplayName, State, StartMode, PathName)
+    $svcAll = $svcCim
     function Svc([string]$Name) { $svcAll | Where-Object { $_.Name -eq $Name } | Select-Object -First 1 }
     function HErr([string]$What, $E) { $errs.Add("Konfiguracja bezpieczeństwa ($What): $($E.Exception.Message) [linia $($E.InvocationInfo.ScriptLineNumber)]") }
     function Is1($v) { "$v" -eq '1' }
@@ -602,7 +655,8 @@ $Collector = {
         foreach ($s in $svcAll) {
             $p = "$($s.PathName)".Trim()
             if (-not $p -or $p.StartsWith('"')) { continue }
-            if ($p -match '^(?i)([a-z]:\\.+?\.exe)' -and $Matches[1] -match '\s') { $uq.Add("$($s.Name)") }
+            # tylko Windows i C:\Program Files (domyślnie bez prawa zapisu dla użytkowników) – pozostałe ścieżki są ostrzeżeniem w analizie usług
+            if ($p -match '^(?i)([a-z]:\\.+?\.exe)' -and $Matches[1] -match '\s' -and $p -match '^([a-z]:\\Windows|c:\\Program Files( \(x86\))?)\\') { $uq.Add("$($s.Name)") }
         }
         if ($uq.Count) { Add-Check 'Niecytowane ścieżki usług ze spacją' "$(Short ($uq -join ', ') 300) – przy prawie zapisu do folderu nadrzędnego możliwe uruchomienie cudzego pliku jako usługa" 'Zalecenie' }
     } catch { HErr 'podniesienie uprawnień' $_ }
@@ -737,10 +791,14 @@ $Collector = {
     $network = @(S 'Network' 'Sieć' {
         $np = @{}
         try { foreach ($c in @(Get-NetConnectionProfile -ErrorAction Stop)) { $np[[int]$c.InterfaceIndex] = "$($c.NetworkCategory)" } } catch {}
+        # adresy, bramy i serwery DNS – po jednym zapytaniu dla wszystkich kart (zamiast trzech na każdą kartę)
+        $ipAll  = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+        $gwAll  = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue)
+        $dnsAll = @(Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
         foreach ($a in (Get-NetAdapter)) {
-            $ips = @(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
-            $gw  = @(Get-NetRoute -InterfaceIndex $a.ifIndex -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop)
-            $dns = @((Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses)
+            $ips = @($ipAll | Where-Object { $_.InterfaceIndex -eq $a.ifIndex })
+            $gw  = @($gwAll | Where-Object { $_.InterfaceIndex -eq $a.ifIndex } | Select-Object -ExpandProperty NextHop)
+            $dns = @($dnsAll | Where-Object { $_.InterfaceIndex -eq $a.ifIndex } | ForEach-Object { $_.ServerAddresses })
             [pscustomobject]@{
                 Adapter = $a.Name; Description = $a.InterfaceDescription; Status = "$($a.Status)"; Profile = "$($np[[int]$a.ifIndex])"
                 MAC = $a.MacAddress; Speed = "$($a.LinkSpeed)"
@@ -754,16 +812,19 @@ $Collector = {
     # ── Procesy / usługi wg PID ──
     $procNames = @{}; try { Get-Process | ForEach-Object { $procNames[[int]$_.Id] = $_.ProcessName } } catch {}
     $svcByPid  = @{}
-    try { Get-CimInstance Win32_Service -Filter 'ProcessId > 0' | Group-Object ProcessId | ForEach-Object { $svcByPid[[int]$_.Name] = ($_.Group.Name -join ',') } } catch {}
+    foreach ($s in $svcCim) { $spid = [int]$s.ProcessId; if ($spid -gt 0) { if ($svcByPid.ContainsKey($spid)) { $svcByPid[$spid] += ",$($s.Name)" } else { $svcByPid[$spid] = "$($s.Name)" } } }
     function PName($id) { $n = $procNames[[int]$id]; if ($n) { $n } else { "PID $id" } }
     function PSvc($id)  { Short $svcByPid[[int]$id] 80 }
 
     # ── Porty nasłuchujące ──
     $listenPorts = @{}
     # potrzebne do ustalenia kierunku połączeń także wtedy, gdy sekcja Listening jest pominięta
-    try { foreach ($lc in @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)) { $listenPorts[[int]$lc.LocalPort] = $true } } catch {}
+    $listenTcp = @(); $listenErr = $null   # jedno zapytanie także dla sekcji Porty; jej błąd zgłasza sama sekcja
+    try { $listenTcp = @(Get-NetTCPConnection -State Listen) } catch { $listenErr = $_ }
+    foreach ($lc in $listenTcp) { $listenPorts[[int]$lc.LocalPort] = $true }
     $listening = @(S 'Listening' 'Porty' {
-        Get-NetTCPConnection -State Listen | Group-Object LocalPort, OwningProcess | ForEach-Object {
+        if ($listenErr) { throw $listenErr }
+        $listenTcp | Group-Object LocalPort, OwningProcess | ForEach-Object {
             $f = $_.Group[0]
             $listenPorts[[int]$f.LocalPort] = $true
             $addrs = @($_.Group.LocalAddress | Sort-Object -Unique)
@@ -807,7 +868,8 @@ $Collector = {
     # ── Usługi ──
     $vendorCache = @{}
     $services = @(S 'Services' 'Usługi' {
-        foreach ($s in (Get-CimInstance Win32_Service)) {
+        if ($svcCimErr) { throw $svcCimErr }
+        foreach ($s in $svcCim) {
             $raw = "$($s.PathName)"
             $exe = $raw
             if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
@@ -827,6 +889,9 @@ $Collector = {
             if ((-not $isMs) -or $autoStop -or (-not $builtin) -or $unquoted) {
                 [pscustomobject]@{
                     Name = $s.Name; DisplayName = $s.DisplayName; State = "$($s.State)"; StartMode = $mode; Account = $acct
+                    # zatrzymana usługa automatyczna: kod wyjścia (1067 = awaria procesu, 1066/N = błąd zgłoszony przez usługę) i start wyzwalany zdarzeniem (klucz TriggerInfo)
+                    ExitCode = $(if (-not $autoStop) { '' } elseif ([int64]$s.ExitCode -eq 1066 -and $s.ServiceSpecificExitCode) { "1066/$($s.ServiceSpecificExitCode)" } else { "$($s.ExitCode)" })
+                    Trigger = $(if ($autoStop -and (Test-Path -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($s.Name)\TriggerInfo")) { 'Tak' } else { '' })
                     Vendor = $vendor; Microsoft = $(if ($isMs) { 'Tak' } else { 'Nie' }); Unquoted = $(if ($unquoted) { 'Tak' } else { '' }); Path = (Hide-Secret $raw)
                 }
             }
@@ -843,8 +908,24 @@ $Collector = {
         '0x800710E0' = 'Odmowa (warunki lub uprawnienia)'; '0x80070002' = 'Nie znaleziono pliku'; '0x80070005' = 'Odmowa dostępu'
         '0x8007052E' = 'Błędny login lub hasło'; '0xC000013A' = 'Przerwane (zamknięcie aplikacji)'; '0xFFFD0000' = 'Błąd skryptu PowerShell'
     }
+    # Zadania z \Microsoft\ (setki wbudowanych) pomijamy – poza tymi, które nie wyglądają na wbudowane: host skryptów
+    # (np. zadania Register-ScheduledJob) albo program spoza katalogu Windows bez metadanych Microsoftu. Tam też bywa ukryte obce zadanie
+    function MsTaskOdd($t) {
+        foreach ($a in @($t.Actions)) {
+            if (-not $a.Execute) { continue }   # obsługa COM
+            $x = "$($a.Execute) $($a.Arguments)"
+            if ($x -match '\\system32\\(silcollector\.cmd|calluxxprovider\.vbs)\b' -and $x -notmatch '[&|]') { continue }   # wbudowane: Software Inventory Logging, Menedżer serwera
+            if ($x -match '(^|[\\"\s])(powershell|pwsh|wscript|cscript|mshta|cmd)(\.exe)?("|\s|$)') { return $true }
+            $exe = [Environment]::ExpandEnvironmentVariables("$($a.Execute)".Trim().Trim('"'))
+            if ($exe -notmatch '\\') { $exe = "$env:SystemRoot\System32\$exe" }
+            if ($exe -like "$env:SystemRoot\*") { continue }
+            if (-not $vendorCache.ContainsKey($exe)) { $v = ''; try { $v = (Get-Item -LiteralPath $exe -ErrorAction Stop).VersionInfo.CompanyName } catch {}; $vendorCache[$exe] = "$v" }
+            if ($vendorCache[$exe] -notmatch 'Microsoft') { return $true }
+        }
+        $false
+    }
     $tasks = @(S 'Tasks' 'Zadania' {
-        Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' } | ForEach-Object {
+        Get-ScheduledTask | Where-Object { $_.TaskPath -notlike '\Microsoft\*' -or (MsTaskOdd $_) } | ForEach-Object {
             $t = $_
             $info = $null; try { $info = $t | Get-ScheduledTaskInfo -ErrorAction Stop } catch {}
             $hex = ''
@@ -871,7 +952,8 @@ $Collector = {
         if ($sys.IsHyperV) { foreach ($l in 'Microsoft-Windows-Hyper-V-VMMS-Admin', 'Microsoft-Windows-Hyper-V-Worker-Admin') { try { if (Get-WinEvent -ListLog $l -ErrorAction Stop) { $evLogs += $l } } catch {} } }
         # osobny limit dla każdego dziennika – zalew błędów w System (np. DCOM 10016) nie ukryje błędów Application i Hyper-V
         $ev = @(foreach ($l in $evLogs) {
-            $part = @(Get-WinEvent -FilterHashtable @{ LogName = $l; Level = $levels; StartTime = $since } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
+            # dziennik, którego nie da się odczytać (brak uprawnień, uszkodzenie), trafia do błędów i nie zatrzymuje pozostałych
+            $part = @(try { EvRead -Log $l -Level $levels -Since $since -Max $MaxEvents } catch { $errs.Add("Zdarzenia – dziennik $l`: $($_.Exception.Message)") })
             if ($part.Count -ge $MaxEvents) { $truncated.Add("$l (od $(D $part[-1].TimeCreated))") }
             $part
         })
@@ -882,7 +964,7 @@ $Collector = {
                 Log = $f.LogName
                 Level = $(switch ($f.Level) { 1 { 'Krytyczny' } 2 { 'Błąd' } 3 { 'Ostrzeżenie' } default { "$($f.Level)" } })
                 Source = $f.ProviderName; Id = $f.Id; Count = $g.Count
-                First = $(D $g[-1].TimeCreated); Last = $(D $f.TimeCreated); Message = $(Short $f.Message 400)
+                First = $(D $g[-1].TimeCreated); Last = $(D $f.TimeCreated); Message = $(Short $(try { $f.FormatDescription() } catch { '' }) 400)
             }
         } | Sort-Object @{ e = { if ($_.Level -eq 'Krytyczny') { 0 } else { 1 } } }, @{ e = 'Count'; Descending = $true }
     })
@@ -919,7 +1001,7 @@ $Collector = {
         }
         # czas w EventData ma do 9 cyfr ułamka sekundy – .NET przyjmuje najwyżej 7
         $parseTime = { param($t) if ("$t") { try { ([datetime]::Parse(("$t" -replace '(\.\d{7})\d+', '$1'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime() } catch { $null } } else { $null } }
-        $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 12, 13, 41, 1074, 6005, 6006, 6008; StartTime = $since.AddDays(-2) } -MaxEvents 3000 -ErrorAction SilentlyContinue | Sort-Object TimeCreated)
+        $ev = @(EvRead -Log 'System' -Id 12, 13, 41, 1074, 6005, 6006, 6008 -Since ($since.AddDays(-2)) -Max 3000 | Sort-Object TimeCreated)
         $boots = New-Object System.Collections.Generic.List[object]
         $stops = New-Object System.Collections.Generic.List[object]
         $crash = New-Object System.Collections.Generic.List[object]
@@ -1008,12 +1090,17 @@ $Collector = {
     $secEvents = @(S 'SecurityEvents' 'Bezpieczeństwo' {
         $list = @()
         # rzadkie, ważne zdarzenia osobno – atak na hasła (tysiące 4625/4771) nie może wypchnąć z limitu np. wyczyszczenia dziennika (1102)
-        $list += @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4740, 4720, 4726, 4722, 4724, 4728, 4732, 4756, 1102, 4698, 4697; StartTime = $since } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
-        $noisy = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625, 4771; StartTime = $since } -MaxEvents $MaxEvents -ErrorAction SilentlyContinue)
+        $rare = @(EvRead -Log 'Security' -Id 4740, 4720, 4726, 4722, 4724, 4728, 4732, 4756, 1102, 4698, 4697 -Since $since -Max $MaxEvents)
+        if ($rare.Count -ge $MaxEvents) { $truncated.Add("Security – zmiany kont i grup, usługi, zadania (od $(D $rare[-1].TimeCreated))") }
+        # po wyczyszczeniu dziennika 1102 jest jego najstarszym rekordem (pierwszym odciętym przez limit) – odczyt jednego rekordu od początku nie zależy od limitu
+        if (-not @($rare | Where-Object { $_.Id -eq 1102 }).Count) { $rare += @(EvRead -Log 'Security' -Oldest | Where-Object { $_.Id -eq 1102 -and $_.TimeCreated -ge $since }) }
+        $list += $rare
+        $noisy = @(EvRead -Log 'Security' -Id 4625, 4771 -Since $since -Max $MaxEvents)
         if ($noisy.Count -ge $MaxEvents) { $truncated.Add("Security 4625/4771 (od $(D $noisy[-1].TimeCreated))") }
         $list += $noisy
-        $list += @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7045, 104; StartTime = $since } -MaxEvents 300 -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Id -eq 7045 -or $_.ProviderName -eq 'Microsoft-Windows-Eventlog' })
+        # wyczyszczenie dziennika (104) osobno – seria instalacji usług (7045) nie wypchnie go z limitu
+        $list += @(EvRead -Log 'System' -Id 104 -Since $since -Max 300 | Where-Object { $_.ProviderName -eq 'Microsoft-Windows-Eventlog' })
+        $list += @(EvRead -Log 'System' -Id 7045 -Since $since -Max 300)
         $fails = New-Object System.Collections.Generic.List[object]; $rows = New-Object System.Collections.Generic.List[object]
         foreach ($e in $list) {
             $d = EvData $e
@@ -1025,22 +1112,26 @@ $Collector = {
                 $fails.Add([pscustomobject]@{ Id = 4771; Account = "$($d.TargetUserName)"; Source = ("$($d.IpAddress)" -replace '^::ffff:', ''); T = $e.TimeCreated; Detail = "status $($d.Status)" })
                 continue
             }
-            $acc = ''; $by = "$($d.SubjectUserName)"; $src = ''; $det = ''
+            $acc = ''; $by = "$($d.SubjectUserName)"; $src = ''; $det = ''; $gsid = ''
             switch ($e.Id) {
                 { $_ -in 4720, 4726, 4722, 4724 } { $acc = "$($d.TargetDomainName)\$($d.TargetUserName)" }
                 4740 { $acc = "$($d.TargetUserName)"; $src = "$($d.TargetDomainName)" }
-                { $_ -in 4728, 4732, 4756 } { $acc = $(if ($d.MemberName -and $d.MemberName -ne '-') { $d.MemberName } else { $d.MemberSid }); $det = "grupa: $($d.TargetUserName)" }
+                { $_ -in 4728, 4732, 4756 } { $acc = $(if ($d.MemberName -and $d.MemberName -ne '-') { $d.MemberName } else { $d.MemberSid }); $det = "grupa: $($d.TargetUserName)"; $gsid = "$($d.TargetSid)" }
                 104  { $det = "dziennik: $($d.Channel)" }
                 4698 { $det = "$($d.TaskName)" }
-                4697 { $det = "$($d.ServiceName) -> $($d.ServiceFileName)" }
-                7045 { $det = "$($d.ServiceName) -> $($d.ImagePath)"; $acc = "$($d.AccountName)"; $by = '' }
+                4697 { $det = "$($d.ServiceName) -> " + (Hide-Secret "$($d.ServiceFileName)") }
+                7045 { $det = "$($d.ServiceName) -> " + (Hide-Secret "$($d.ImagePath)"); $acc = "$($d.AccountName)"; $by = '' }
             }
-            $rows.Add([pscustomobject]@{ Time = $(D $e.TimeCreated); Id = $e.Id; Event = $secNames[$e.Id]; Account = $acc; By = $by; Source = $src; Count = 1; Detail = $det })
+            # _GroupSid (pole wewnętrzne, niewidoczne w tabelach): analiza odróżnia po nim grupy uprzywilejowane od zwykłych niezależnie od języka nazw
+            $rows.Add([pscustomobject]@{ Time = $(D $e.TimeCreated); Id = $e.Id; Event = $secNames[$e.Id]; Account = $acc; By = $by; Source = $src; Count = 1; Detail = $det; _GroupSid = $gsid })
         }
-        $grp = @($fails | Group-Object Id, Account, Source | ForEach-Object {
-            $g = @($_.Group | Sort-Object T -Descending)
-            [pscustomobject]@{ Time = $(D $g[0].T); Id = $g[0].Id; Event = $secNames[$g[0].Id]; Account = $g[0].Account; By = ''; Source = $g[0].Source; Count = $g.Count; Detail = "$($g[0].Detail); pierwsze: $(D $g[-1].T)" }
-        })
+        # Agregacja przez hashtabelę (O(n)) – Group-Object w PowerShell 4/5.1 bardzo zwalnia przy tysiącach różnych par konto/źródło (rozpylanie haseł)
+        $agg = @{}
+        foreach ($f in $fails) {
+            $k = "$($f.Id)|$($f.Account)|$($f.Source)"; $g = $agg[$k]
+            if ($g) { $g.N++; if ($f.T -gt $g.Last.T) { $g.Last = $f }; if ($f.T -lt $g.First) { $g.First = $f.T } } else { $agg[$k] = @{ Last = $f; First = $f.T; N = 1 } }
+        }
+        $grp = @(foreach ($g in $agg.Values) { [pscustomobject]@{ Time = $(D $g.Last.T); Id = $g.Last.Id; Event = $secNames[$g.Last.Id]; Account = $g.Last.Account; By = ''; Source = $g.Last.Source; Count = $g.N; Detail = "$($g.Last.Detail); pierwsze: $(D $g.First)" } })
         foreach ($x in $grp) { $rows.Add($x) }
         $rows | Sort-Object @{ e = { if ($_.Id -in 4625, 4771) { 1 } else { 0 } } }, @{ e = 'Count'; Descending = $true }
     })
@@ -1116,12 +1207,19 @@ $Collector = {
     }
 
     # ── Udziały ──
-    $everyone = 'Everyone'
-    try { $everyone = (New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')).Translate([System.Security.Principal.NTAccount]).Value } catch {}
     $shares = @(S 'Shares' 'Udziały' {
         # CIM zamiast Get-SmbShare/Get-SmbShareAccess (moduł SmbShare zgłasza błąd, gdy brak jego pliku lokalizacji w języku sesji)
         # GetAccessControlEntries – ta sama metoda, której używa Get-SmbShareAccess (tylko odczyt); błędy zbiorczo, jeden wpis na serwer
         $acTxt = @{ 0 = 'Allow'; 1 = 'Deny' }; $arTxt = @{ 0 = 'Full'; 1 = 'Change'; 2 = 'Read'; 3 = 'Custom' }
+        # Grupy obejmujące (prawie) wszystkich – po SID, niezależnie od języka nazw: Wszyscy, Anonim, Sieć, Użytkownicy uwierzytelnieni,
+        # Użytkownicy, Użytkownicy/Goście/Komputery domeny. Nazwa konta → SID z pamięcią podręczną (tłumaczenie bywa zapytaniem do domeny)
+        $sidOf = @{}
+        function BroadSid([string]$Acct) {
+            if (-not $sidOf.ContainsKey($Acct)) { $v = ''; if ($Acct -match '^S-1-\d') { $v = $Acct } else { try { $v = (New-Object System.Security.Principal.NTAccount($Acct)).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { } }; $sidOf[$Acct] = $v }
+            $v = $sidOf[$Acct]
+            ($v -in 'S-1-1-0', 'S-1-5-7', 'S-1-5-2', 'S-1-5-11', 'S-1-5-32-545') -or ($v -match '^S-1-5-21-[\d-]+-51[345]$')
+        }
+        function SidName([string]$Sid) { try { (New-Object System.Security.Principal.SecurityIdentifier($Sid)).Translate([System.Security.Principal.NTAccount]).Value } catch { $Sid } }
         $accFail = New-Object System.Collections.Generic.List[string]; $accWhy = New-Object System.Collections.Generic.List[string]
         Get-CimInstance -Namespace root\Microsoft\Windows\SMB -ClassName MSFT_SmbShare | Where-Object { $_.Name -notmatch '^(ADMIN\$|IPC\$|print\$|[A-Z]\$)$' } | ForEach-Object {
             $sh = $_; $acc = @()
@@ -1133,11 +1231,23 @@ $Collector = {
                 $acc = @(@($cimr | ForEach-Object { if ($null -ne $_.ItemValue) { $_.ItemValue } else { $_.Output } }) | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ AccountName = "$($_.AccountName)"; AccessControlType = $acTxt[[int]$_.AccessControlType]; AccessRight = $arTxt[[int]$_.AccessRight] } })
             }
             catch { $accFail.Add("$($sh.Name)"); $accWhy.Add("$($_.Exception.Message) ($($_.CategoryInfo.Reason))") }
-            $ew  = $acc | Where-Object { $_.AccountName -eq $everyone -and "$($_.AccessControlType)" -eq 'Allow' -and "$($_.AccessRight)" -in 'Full', 'Change' }
+            $bw  = @($acc | Where-Object { "$($_.AccessControlType)" -eq 'Allow' -and "$($_.AccessRight)" -in 'Full', 'Change' -and (BroadSid $_.AccountName) } | ForEach-Object { $_.AccountName } | Select-Object -Unique)
+            $ewTxt = ''
+            if ($bw.Count -and "$($sh.ShareType)" -notmatch '^(1|2|3|PrintQueue|CommDevice|IPC)$') {
+                # NTFS folderu głównego (odczyt samej listy DACL). Zmiana cudzych plików: zapis danych dziedziczony na pliki, pełne prawa ogólne
+                # albo zmiana uprawnień/właściciela. Sam zapis danych w folderze (domyślne dziedziczenie z katalogu głównego dysku) = tylko nowe pliki
+                $nf = $null; $nc = $null
+                try {
+                    $rules = @([IO.Directory]::GetAccessControl($sh.Path, [System.Security.AccessControl.AccessControlSections]::Access).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | Where-Object { "$($_.AccessControlType)" -eq 'Allow' -and ([int]$_.FileSystemRights -band 0x500C0002) -and (BroadSid "$($_.IdentityReference.Value)") })
+                    $nf = @($rules | Where-Object { ([int]$_.FileSystemRights -band 0x500C0000) -or ([int]$_.InheritanceFlags -band 2) } | ForEach-Object { SidName "$($_.IdentityReference.Value)" } | Select-Object -Unique)
+                    $nc = @($rules | ForEach-Object { SidName "$($_.IdentityReference.Value)" } | Select-Object -Unique)
+                } catch { }
+                $ewTxt = if ($null -eq $nc) { "udział, NTFS nieodczytany: $($bw -join ', ')" } elseif ($nf.Count) { "udział i NTFS: $($nf -join ', ')" } elseif ($nc.Count) { "udział i NTFS (tworzenie plików): $($nc -join ', ')" } else { "tylko udział: $($bw -join ', ')" }
+            }
             [pscustomobject]@{
                 Name = $sh.Name; Path = $sh.Path; Description = $sh.Description
                 Access = (@($acc | ForEach-Object { "$($_.AccountName): $($_.AccessControlType) $($_.AccessRight)" }) -join '; ')
-                EveryoneWrite = $(if ($ew) { 'Tak' } else { '' })
+                EveryoneWrite = $ewTxt
             }
         }
         if ($accFail.Count) { $errs.Add("Udziały – uprawnienia: $($accWhy[0]); nie odczytano dla $($accFail.Count) udziałów: $((@($accFail) | Select-Object -First 5) -join ', ')$(if ($accFail.Count -gt 5) { ', …' })") }
@@ -1146,7 +1256,8 @@ $Collector = {
     # ── Autostart ──
     $autostart = @(S 'Autostart' 'Autostart' {
         foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
-                       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce') {
+                       'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+                       'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run') {
             if (-not (Test-Path $k)) { continue }
             $rk = Get-Item -LiteralPath $k
             foreach ($vn in @($rk.GetValueNames())) {
@@ -1155,19 +1266,53 @@ $Collector = {
         }
         $sf = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
         if (Test-Path $sf) {
-            Get-ChildItem $sf -File -Force | Where-Object Name -ne 'desktop.ini' | ForEach-Object { [pscustomobject]@{ Location = 'Folder Autostart (wszyscy)'; Name = $_.Name; Command = $_.FullName } }
+            # skrót .lnk: cel i argumenty – podmiana celu zmienia klucz porównania (CreateShortcut tylko czyta plik, bez Save nic nie zapisuje)
+            $wsh = $null; try { $wsh = New-Object -ComObject WScript.Shell } catch { }
+            Get-ChildItem $sf -File -Force | Where-Object Name -ne 'desktop.ini' | ForEach-Object {
+                $cmd = $_.FullName
+                if ($wsh -and $_.Extension -eq '.lnk') { try { $lnk = $wsh.CreateShortcut($_.FullName); if ($lnk.TargetPath) { $cmd = "$($lnk.TargetPath) $($lnk.Arguments)".Trim() } } catch { } }
+                [pscustomobject]@{ Location = 'Folder Autostart (wszyscy)'; Name = $_.Name; Command = (Hide-Secret $cmd) }
+            }
         }
         $wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
         if ($wl.Userinit -and $wl.Userinit -notmatch '^[A-Za-z]:\\Windows\\system32\\userinit\.exe,?$') { [pscustomobject]@{ Location = 'Winlogon'; Name = 'Userinit'; Command = "$($wl.Userinit)" } }
         if ($wl.Shell -and $wl.Shell -ne 'explorer.exe') { [pscustomobject]@{ Location = 'Winlogon'; Name = 'Shell'; Command = "$($wl.Shell)" } }
+        # Rzadziej używane miejsca autostartu całej maszyny (tylko odczyt rejestru): Debugger w Image File Execution Options (uruchamiany
+        # zamiast programu, np. sethc.exe na ekranie logowania), MonitorProcess w SilentProcessExit, AppInit_DLLs (gdy włączone),
+        # polecenia Session Manager przy starcie systemu (poza sprawdzaniem dysków autochk) i pakiety LSA spoza listy domyślnej
+        foreach ($ik in @(@{ K = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'; L = 'IFEO (Debugger)'; V = 'Debugger' }, @{ K = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'; L = 'IFEO 32-bit (Debugger)'; V = 'Debugger' }, @{ K = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit'; L = 'SilentProcessExit (MonitorProcess)'; V = 'MonitorProcess' })) {
+            foreach ($sk in @(Get-ChildItem -LiteralPath $ik.K -ErrorAction SilentlyContinue)) {
+                $dbg = ''; try { $dbg = "$($sk.GetValue($ik.V))".Trim() } catch { }
+                if ($dbg) { [pscustomobject]@{ Location = $ik.L; Name = $sk.PSChildName; Command = (Hide-Secret $dbg) } }
+            }
+        }
+        foreach ($wk in 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows') {
+            $ai = "$(RegV $wk 'AppInit_DLLs')".Trim()
+            if ($ai -and "$(RegV $wk 'LoadAppInit_DLLs')" -eq '1') { [pscustomobject]@{ Location = $(if ($wk -like '*WOW6432Node*') { 'AppInit_DLLs 32-bit' } else { 'AppInit_DLLs' }); Name = 'AppInit_DLLs'; Command = $ai } }
+        }
+        foreach ($vn in 'BootExecute', 'SetupExecute', 'Execute') {
+            foreach ($be in @(RegV 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' $vn)) { if ("$be".Trim() -and "$be" -notmatch '^\s*autocheck\s+autochk\b') { [pscustomobject]@{ Location = 'Session Manager'; Name = $vn; Command = "$be".Trim() } } }
+        }
+        $lsaDef = 'msv1_0', 'scecli', 'rassfm', 'kerberos', 'schannel', 'wdigest', 'tspkg', 'pku2u', 'cloudap', 'negoexts', 'livessp'
+        foreach ($lp in @(@{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; V = 'Authentication Packages' }, @{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; V = 'Notification Packages' }, @{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; V = 'Security Packages' }, @{ K = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\OSConfig'; V = 'Security Packages' })) {
+            foreach ($pk in @(@(RegV $lp.K $lp.V) | ForEach-Object { "$_" -split '[\s,]+' } | ForEach-Object { $_.Trim('"') } | Where-Object { $_ -and $lsaDef -notcontains $_ } | Select-Object -Unique)) {
+                [pscustomobject]@{ Location = $(if ($lp.K -like '*\OSConfig') { 'LSA (OSConfig)' } else { 'LSA' }); Name = $lp.V; Command = $pk }
+            }
+        }
     })
 
     # ── Certyfikaty ──
     $certs = @(S 'Certificates' 'Certyfikaty' {
-        Get-ChildItem Cert:\LocalMachine\My | ForEach-Object {
-            [pscustomobject]@{
-                Subject = $_.Subject; Issuer = $_.Issuer; NotAfter = $(D $_.NotAfter); DaysLeft = [int]($_.NotAfter - $now).TotalDays
-                PrivateKey = $(if ($_.HasPrivateKey) { 'Tak' } else { 'Nie' }); Thumbprint = $_.Thumbprint
+        # WebHosting: certyfikaty powiązań IIS (SNI, centralny magazyn certyfikatów) – magazyn istnieje tylko z IIS 8+
+        $stores = @('My'); if (Test-Path 'Cert:\LocalMachine\WebHosting') { $stores += 'WebHosting' }
+        foreach ($st in $stores) {
+            Get-ChildItem "Cert:\LocalMachine\$st" | ForEach-Object {
+                # certyfikat z samym SAN (np. ACME) ma pusty podmiot – pokazujemy nazwy DNS
+                $sub = "$($_.Subject)"; if (-not $sub) { $dn = @(foreach ($x in @($_.DnsNameList)) { if ("$x") { "$x" } }); if ($dn.Count) { $sub = "SAN: $(@($dn | Select-Object -First 3) -join ', ')$(if ($dn.Count -gt 3) { ', …' })" } }
+                [pscustomobject]@{
+                    Subject = $sub; Issuer = $_.Issuer; NotAfter = $(D $_.NotAfter); DaysLeft = [int]($_.NotAfter - $now).TotalDays
+                    PrivateKey = $(if ($_.HasPrivateKey) { 'Tak' } else { 'Nie' }); Thumbprint = $_.Thumbprint; Store = $st
+                }
             }
         }
     })
@@ -1183,23 +1328,28 @@ $Collector = {
             if (-not (Test-Path -LiteralPath $p)) { continue }
             # Wszerz, do 3 poziomów, najwyżej 20 000 plików: zaniedbany C:\Windows\Temp potrafi mieć setki tysięcy plików
             # (pełne wyliczenie przekraczało limit pamięci sesji WinRM i cały serwer wyglądał na niedostępny)
-            $cap = 20000; $count = 0; $total = [int64]0; $execCount = 0; $capped = $false
+            $cap = 20000; $count = 0; $total = [int64]0; $execCount = 0; $capped = $false; $deep = $false
             $top = New-Object System.Collections.Generic.List[object]
             $queue = New-Object System.Collections.Generic.Queue[object]
             $queue.Enqueue(@((New-Object IO.DirectoryInfo $p), 0))
             while ($queue.Count -and -not $capped) {
                 $di, $lvl = $queue.Dequeue()
-                $fi = @(); try { $fi = @($di.GetFiles()) } catch { }
-                foreach ($x in $fi) {
-                    $count++; $total += $x.Length
-                    if ($execExt -contains $x.Extension.ToLower()) { $execCount++ }
-                    $top.Add($x)
-                    if ($top.Count -ge 400) { $keep = @($top | Sort-Object LastWriteTime -Descending | Select-Object -First 50); $top.Clear(); foreach ($k in $keep) { $top.Add($k) } }
-                    if ($count -ge $cap) { $capped = $true; break }
-                }
-                if ($lvl -lt 3) { $sub = @(); try { $sub = @($di.GetDirectories()) } catch { }; foreach ($sd in $sub) { $queue.Enqueue(@($sd, ($lvl + 1))) } }
+                # EnumerateFiles/EnumerateDirectories (.NET 4) wyliczają strumieniowo – GetFiles() budował najpierw tablicę WSZYSTKICH plików katalogu,
+                # więc limit nie chronił przed płaskim katalogiem z milionem plików
+                try {
+                    foreach ($x in $di.EnumerateFiles()) {
+                        $count++; $total += $x.Length
+                        if ($execExt -contains $x.Extension.ToLower()) { $execCount++ }
+                        $top.Add($x)
+                        if ($top.Count -ge 400) { $keep = @($top | Sort-Object LastWriteTime -Descending | Select-Object -First 50); $top.Clear(); foreach ($k in $keep) { $top.Add($k) } }
+                        if ($count -ge $cap) { $capped = $true; break }
+                    }
+                } catch { }
+                if ($capped) { break }
+                if ($lvl -lt 3) { try { foreach ($sd in $di.EnumerateDirectories()) { $queue.Enqueue(@($sd, ($lvl + 1))) } } catch { } }
+                elseif (-not $deep) { try { foreach ($sd in $di.EnumerateDirectories()) { $deep = $true; break } } catch { } }
             }
-            [pscustomobject]@{ Folder = $p; File = "[podsumowanie] plików: $count$(if ($capped) { '+ (przerwano liczenie)' }), wykonywalnych/skryptów: $execCount"; SizeKB = [math]::Round($total / 1KB); Modified = ''; Executable = $(if ($execCount) { "$execCount" } else { '' }) }
+            [pscustomobject]@{ Folder = $p; File = "[podsumowanie] plików: $count$(if ($capped) { '+ (przerwano liczenie)' } elseif ($deep) { ' (bez podfolderów głębszych niż 3 poziomy)' }), wykonywalnych/skryptów: $execCount"; SizeKB = [math]::Round($total / 1KB); Modified = ''; Executable = $(if ($execCount) { "$execCount" } else { '' }) }
             $root = $p.TrimEnd('\').Length
             $top | Sort-Object LastWriteTime -Descending | Select-Object -First 50 | ForEach-Object {
                 [pscustomobject]@{
@@ -1212,17 +1362,21 @@ $Collector = {
 
     # ── Hyper-V ──
     # Get-VM, dyski i informacje VHD zbierane RAZ (Get-VHD otwiera plik dysku – przy kilkudziesięciu maszynach to najwolniejsza część skanu hosta)
-    $hyperv = @(); $checkpoints = @(); $vmStorage = @(); $clusterRows = @()
-    if ($sys.IsHyperV -and ((Want 'HyperV') -or (Want 'Checkpoints') -or (Want 'VMStorage'))) {
+    # Sekcja Klaster jest w tym bloku (pojemność hosta potrzebna do testu N+1) – zbierana także przy odznaczonych sekcjach maszyn
+    $hyperv = @(); $checkpoints = @(); $vmStorage = @(); $clusterRows = @(); $csvList = $null
+    if ($sys.IsHyperV -and ((Want 'HyperV') -or (Want 'Checkpoints') -or (Want 'VMStorage') -or (Want 'Cluster'))) {
         $t0 = $sw.Elapsed.TotalSeconds
         $vms = @(); $hdAll = @(); $snaps = @(); $vhdCache = @{}; $kvp = @{}; $nics = @{}; $since2 = @{}
         $sys.HvVmms = "$((Get-Service vmms -ErrorAction SilentlyContinue).Status)"
         if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { $errs.Add('Hyper-V: brak modułu PowerShell Hyper-V na hoście (Install-WindowsFeature Hyper-V-PowerShell)') }
         else { try { $vms = @(Get-VM -ErrorAction Stop) } catch { $errs.Add("Hyper-V: $($_.Exception.Message)") } }
         if ($vms.Count) {
-            try { $hdAll = @(Get-VMHardDiskDrive -VM $vms -ErrorAction Stop) } catch { $errs.Add("Hyper-V (dyski): $($_.Exception.Message)") }
-            try { $snaps = @(Get-VMSnapshot -VM $vms -ErrorAction Stop) } catch {}
-            try { foreach ($n in @(Get-VMNetworkAdapter -VM $vms -ErrorAction Stop)) { $k = "$($n.VMId)".ToUpper(); if (-not $nics.ContainsKey($k)) { $nics[$k] = @() }; $nics[$k] += $n } } catch {}
+            # Błąd jednej maszyny (np. przeniesionej na inny węzeł albo usuniętej w trakcie skanu) nie kasuje danych pozostałych;
+            # gdy nie ma żadnych danych, sekcja jest niezebrana (stacja nie porównuje jej i nie traktuje pustej listy jako stanu)
+            function HvPart([string]$What, $E, [string]$Key, [int]$Got) { $E = @($E | Where-Object { $_ }); if ($E.Count) { $errs.Add("Hyper-V ($What): $(@($E)[0].Exception.Message)$(if (@($E).Count -gt 1) { " (+$(@($E).Count - 1))" })"); if ($Key -and -not $Got -and (Want $Key)) { $failedKeys.Add($Key) } } }
+            $hvE = $null; try { $hdAll = @(Get-VMHardDiskDrive -VM $vms -ErrorAction SilentlyContinue -ErrorVariable hvE) } catch { $hvE = @($_) }; HvPart 'dyski' $hvE 'VMStorage' $hdAll.Count
+            $hvE = $null; try { $snaps = @(Get-VMSnapshot -VM $vms -ErrorAction SilentlyContinue -ErrorVariable hvE) } catch { $hvE = @($_) }; HvPart 'checkpointy' $hvE 'Checkpoints' $snaps.Count
+            $hvE = $null; try { foreach ($n in @(Get-VMNetworkAdapter -VM $vms -ErrorAction SilentlyContinue -ErrorVariable hvE)) { $k = "$($n.VMId)".ToUpper(); if (-not $nics.ContainsKey($k)) { $nics[$k] = @() }; $nics[$k] += $n } } catch { $hvE = @($_) }; HvPart 'karty sieciowe' $hvE '' 1
             # Od kiedy maszyna jest w obecnym stanie (np. wyłączona od 40 dni = prawdopodobnie wycofana)
             try { foreach ($cs2 in @(Get-CimInstance -Namespace 'root\virtualization\v2' -ClassName Msvm_ComputerSystem -ErrorAction Stop)) { if ($cs2.TimeOfLastStateChange) { $since2["$($cs2.Name)".ToUpper()] = $cs2.TimeOfLastStateChange } } } catch {}
             # Wymiana KVP (usługi integracji): system gościa, FQDN i adresy IP – jedna kwerenda dla wszystkich maszyn
@@ -1281,13 +1435,14 @@ $Collector = {
         # RAM startowy maszyn, które działają albo same startują z hostem – czy wszystkie wstaną po restarcie hosta
         $sys.HvRamStartupGB  = [math]::Round([double](@($prim | Where-Object { "$($_.State)" -like 'Running*' -or "$($_.AutomaticStartAction)" -ne 'Nothing' } | ForEach-Object { [double]$_.MemoryStartup }) | Measure-Object -Sum).Sum / 1GB, 1)
 
-        # Klaster pracy awaryjnej: nazwa, węzły; wolumeny CSV raportuje tylko węzeł-właściciel (bez powtórzeń z każdego węzła)
-        $sys.HvCluster = ''; $sys.HvClusterNodes = ''; $sys.HvClusterNodeCount = 0
+        # Klaster pracy awaryjnej: nazwa, węzły (wolumeny CSV w sekcji Dyski – osobny blok za sekcjami Hyper-V)
+        $sys.HvCluster = ''; $sys.HvClusterNodes = ''; $sys.HvClusterNodeCount = 0; $clOk = $false
         try { $sys.HvCluster = "$((Get-ItemProperty 'HKLM:\Cluster' -ErrorAction Stop).ClusterName)" } catch {}
-        if ((Get-Command Get-ClusterNode -ErrorAction SilentlyContinue) -and "$((Get-Service ClusSvc -ErrorAction SilentlyContinue).Status)" -eq 'Running') {
+        $clSvc = "$((Get-Service ClusSvc -ErrorAction SilentlyContinue).Status)"
+        if ((Get-Command Get-ClusterNode -ErrorAction SilentlyContinue) -and $clSvc -eq 'Running') {
             try {
                 $sys.HvCluster = "$((Get-Cluster -ErrorAction Stop).Name)"
-                $cnodes = @(Get-ClusterNode -ErrorAction Stop)
+                $cnodes = @(Get-ClusterNode -ErrorAction Stop); $clOk = $true
                 $sys.HvClusterNodes = (@($cnodes | ForEach-Object { "$($_.Name) ($($_.State))" }) -join ', ')
                 $sys.HvClusterNodeCount = $cnodes.Count
                 # Sekcja Klaster: ten sam obraz z każdego węzła – stacja ocenia ją raz na klaster (węzeł reprezentujący)
@@ -1295,7 +1450,8 @@ $Collector = {
                     $t0c = $sw.Elapsed.TotalSeconds
                     try {
                         foreach ($n in $cnodes) { $clusterRows += [pscustomobject]@{ Type = 'Węzeł'; Name = "$($n.Name)"; State = "$($n.State)"; Owner = ''; Detail = $(if ("$($n.DrainStatus)") { "opróżnianie: $($n.DrainStatus)" } else { '' }) } }
-                        foreach ($csv in @(Get-ClusterSharedVolume -ErrorAction Stop)) {
+                        $csvList = @(Get-ClusterSharedVolume -ErrorAction Stop)
+                        foreach ($csv in $csvList) {
                             $vi = @($csv.SharedVolumeInfo)[0]; $pt = if ($vi) { $vi.Partition } else { $null }
                             $clusterRows += [pscustomobject]@{ Type = 'CSV'; Name = "$($csv.Name) $(if ($vi) { $vi.FriendlyVolumeName })".Trim(); State = "$($csv.State)"; Owner = "$($csv.OwnerNode.Name)"
                                 Detail = $(if ($pt -and $pt.Size) { "wolne $([math]::Round($pt.FreeSpace / 1GB, 1)) z $([math]::Round($pt.Size / 1GB, 1)) GB ($([math]::Round($pt.FreeSpace / $pt.Size * 100, 1))%)$(if ($vi.MaintenanceMode) { ', tryb konserwacji' })" } else { '' }) }
@@ -1307,21 +1463,13 @@ $Collector = {
                     } catch { $failedKeys.Add('Cluster'); $errs.Add("Klaster (sekcja): $($_.Exception.Message)") }
                     $timings['Klaster'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0c, 1)
                 }
-                if (Want 'Disks') {
-                    foreach ($csv in @(Get-ClusterSharedVolume -ErrorAction Stop)) {
-                        if ("$($csv.OwnerNode.Name)" -ne $env:COMPUTERNAME) { continue }
-                        foreach ($vi in @($csv.SharedVolumeInfo)) {
-                            $pt = $vi.Partition
-                            if (-not $pt -or -not $pt.Size) { continue }
-                            $disks += [pscustomobject]@{
-                                Drive = "$($vi.FriendlyVolumeName)"; Label = "CSV: $($csv.Name) ($($csv.State))"
-                                SizeGB = [math]::Round($pt.Size / 1GB, 1); FreeGB = [math]::Round($pt.FreeSpace / 1GB, 1)
-                                FreePct = [math]::Round($pt.FreeSpace / $pt.Size * 100, 1)
-                            }
-                        }
-                    }
-                }
             } catch { $errs.Add("Klaster: $($_.Exception.Message)") }
+        }
+        # Węzeł bez odczytanego stanu klastra (brak modułu, zatrzymana usługa, błąd odczytu) nie może reprezentować klastra na stacji
+        if ($sys.HvCluster -and -not $clOk -and (Want 'Cluster')) {
+            $failedKeys.Add('Cluster')
+            if (-not (Get-Command Get-ClusterNode -ErrorAction SilentlyContinue)) { $errs.Add("Klaster $($sys.HvCluster): brak modułu PowerShell FailoverClusters na węźle – stan klastra nieodczytany (Install-WindowsFeature RSAT-Clustering-PowerShell)") }
+            elseif ($clSvc -ne 'Running') { $errs.Add("Klaster $($sys.HvCluster): usługa klastra (ClusSvc) nie działa$(if ($clSvc) { " ($clSvc)" }) – stan klastra nieodczytany") }
         }
 
         $hyperv = @(S 'HyperV' 'Hyper-V' {
@@ -1378,6 +1526,26 @@ $Collector = {
             }
         })
         $timings['Hyper-V (razem)'] = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1)
+    }
+
+    # Wolumeny CSV klastra w sekcji Dyski (sekcja Dyski pomija CSVFS) – na każdym węźle klastra, także bez Hyper-V (Scale-Out File Server, SQL)
+    # i przy odznaczonych sekcjach Hyper-V; wolumen raportuje tylko węzeł-właściciel (bez powtórzeń z każdego węzła)
+    if ((Want 'Disks') -and (Get-Command Get-ClusterSharedVolume -ErrorAction SilentlyContinue) -and "$((Get-Service ClusSvc -ErrorAction SilentlyContinue).Status)" -eq 'Running') {
+        try {
+            if ($null -eq $csvList) { $csvList = @(Get-ClusterSharedVolume -ErrorAction Stop) }
+            foreach ($csv in $csvList) {
+                if ("$($csv.OwnerNode.Name)" -ne $env:COMPUTERNAME) { continue }
+                foreach ($vi in @($csv.SharedVolumeInfo)) {
+                    $pt = $vi.Partition
+                    if (-not $pt -or -not $pt.Size) { continue }
+                    $disks += [pscustomobject]@{
+                        Drive = "$($vi.FriendlyVolumeName)"; Label = "CSV: $($csv.Name) ($($csv.State))"
+                        SizeGB = [math]::Round($pt.Size / 1GB, 1); FreeGB = [math]::Round($pt.FreeSpace / 1GB, 1)
+                        FreePct = [math]::Round($pt.FreeSpace / $pt.Size * 100, 1)
+                    }
+                }
+            }
+        } catch { $errs.Add("Dyski (wolumeny CSV klastra): $($_.Exception.Message)") }   # bez Failed 'Disks': dyski lokalne zebrane, historia zapełniania je zapisuje
     }
 
     # ── Dzienniki zdarzeń: rozmiar, tryb i ile dni faktycznie obejmują ──
@@ -1477,10 +1645,25 @@ $Collector = {
                 '6' = 'błąd'; 'Error' = 'błąd'; '7' = 'błąd nienaprawialny'; 'Non-Recoverable Error' = 'błąd nienaprawialny'; '10' = 'zatrzymany'; 'Stopped' = 'zatrzymany'
                 '11' = 'w serwisie'; 'In Service' = 'w serwisie'; '13' = 'utrata komunikacji'; 'Lost Communication' = 'utrata komunikacji' }
     $diskHealth = @(S 'DiskHealth' 'Zdrowie dysków' {
+        function OpText($v) { (@(@($v) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } }) -join ', ') }
+        $pools = @()
+        if (Get-Command Get-StoragePool -ErrorAction SilentlyContinue) { try { $pools = @(Get-StoragePool -IsPrimordial $false -ErrorAction SilentlyContinue) } catch { } }   # brak pul: błąd „nie znaleziono” modułu Storage
+        $clPool = @($pools | Where-Object { $_.IsClustered }).Count
         if (Get-Command Get-PhysicalDisk -ErrorAction SilentlyContinue) {
-            foreach ($pd in @(Get-PhysicalDisk)) {
+            # Storage Spaces Direct: Get-PhysicalDisk na węźle z pulą klastrową widzi dyski WSZYSTKICH węzłów – bierzemy tylko podłączone do tego węzła
+            # (jeden uszkodzony dysk nie daje problemu na każdym węźle); bez węzła magazynu albo przy błędzie – wszystkie dyski jak dotąd
+            $pds = $null
+            if ($clPool -and (Get-Command Get-StorageNode -ErrorAction SilentlyContinue)) {
+                try {
+                    $stn = @(Get-StorageNode -ErrorAction Stop | Where-Object { "$($_.Name)" -eq $env:COMPUTERNAME -or "$($_.Name)" -like "$env:COMPUTERNAME.*" })
+                    $seen = @{}   # węzeł bywa widoczny w kilku podsystemach magazynu – bez powtórzeń dysków
+                    if ($stn.Count) { $pds = @($stn | Get-PhysicalDisk -PhysicallyConnected -ErrorAction Stop | Where-Object { $k = "$($_.UniqueId)|$($_.SerialNumber)"; if ($k -eq '|') { $k = "$($_.ObjectId)" }; if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true } }) }
+                } catch { $pds = $null }
+            }
+            if (-not $pds) { $pds = @(Get-PhysicalDisk) }
+            foreach ($pd in $pds) {
                 $hs  = "$($pd.HealthStatus)"
-                $ops = @(@($pd.OperationalStatus) | Where-Object { "$_" } | ForEach-Object { if ($opMap.ContainsKey("$_")) { $opMap["$_"] } else { "$_" } })
+                $ops = OpText $pd.OperationalStatus
                 $rc  = $null; try { $rc = $pd | Get-StorageReliabilityCounter -ErrorAction Stop } catch {}
                 $unc = if ($rc -and ($null -ne $rc.ReadErrorsUncorrected -or $null -ne $rc.WriteErrorsUncorrected)) { [int64]$rc.ReadErrorsUncorrected + [int64]$rc.WriteErrorsUncorrected } else { $null }
                 [pscustomobject]@{
@@ -1488,13 +1671,44 @@ $Collector = {
                     Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs })
                     WearPct = $(if ($rc -and $rc.Wear) { [int]$rc.Wear } else { $null }); TempC = $(if ($rc -and $rc.Temperature) { [int]$rc.Temperature } else { $null })
                     UncorrectedErrors = $unc; PowerOnHours = $(if ($rc -and $rc.PowerOnHours) { [int64]$rc.PowerOnHours } else { $null })
-                    Count = $null; Last = ''; Detail = "stan: $($ops -join ', ')"
+                    Count = $null; Last = ''; Detail = "stan: $ops"
+                }
+            }
+        }
+        # Pule i dyski wirtualne Storage Spaces / S2D: po awarii dysku dysk wirtualny traci odporność (Degraded, naprawa), choć dyski fizyczne są już OK.
+        # Pulę klastrową (S2D, wspólna półka JBOD) raportuje tylko właściciel zasobu puli w klastrze (bez powtórzeń z każdego węzła)
+        if ($pools.Count) {
+            $own = $true
+            if ($clPool -and (Get-Command Get-ClusterResource -ErrorAction SilentlyContinue)) { try { $own = [bool]@(Get-ClusterResource -ErrorAction Stop | Where-Object { ("$($_.ResourceType)" -eq 'Storage Pool' -or "$($_.ResourceType.Name)" -eq 'Storage Pool') -and "$($_.OwnerNode.Name)" -eq $env:COMPUTERNAME }).Count } catch { $own = $true } }
+            foreach ($sp in $pools) {
+                if ($sp.IsClustered -and -not $own) { continue }
+                $hs = "$($sp.HealthStatus)"
+                [pscustomobject]@{
+                    Source = 'Pula Storage Spaces'; Id = $null; Name = "$($sp.FriendlyName) ($([math]::Round($sp.Size / 1GB)) GB, przydzielone $([math]::Round($sp.AllocatedSize / 1GB)) GB)"
+                    Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs }); WearPct = $null; TempC = $null; UncorrectedErrors = $null; PowerOnHours = $null
+                    Count = $null; Last = ''; Detail = "stan: $(OpText $sp.OperationalStatus)$(if ($sp.IsReadOnly) { ', tylko do odczytu' })"
+                }
+                $vds = @(); try { $vds = @($sp | Get-VirtualDisk -ErrorAction SilentlyContinue) } catch { }
+                foreach ($vd in $vds) {
+                    $hs = "$($vd.HealthStatus)"
+                    [pscustomobject]@{
+                        Source = 'Dysk wirtualny (Storage Spaces)'; Id = $null; Name = "$($vd.FriendlyName) ($($vd.ResiliencySettingName), $([math]::Round($vd.Size / 1GB)) GB, pula $($sp.FriendlyName))"
+                        Health = $(if ($hsMap.ContainsKey($hs)) { $hsMap[$hs] } else { $hs }); WearPct = $null; TempC = $null; UncorrectedErrors = $null; PowerOnHours = $null
+                        Count = $null; Last = ''; Detail = "stan: $(OpText $vd.OperationalStatus)"
+                    }
                 }
             }
         }
         # disk 7 (uszkodzony blok), 51 (błąd stronicowania), 153/157 (ponowienie/usunięcie I/O), Ntfs 55/98 (uszkodzenie systemu plików), 129 (reset urządzenia przez sterownik)
-        $dEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7, 51, 55, 98, 129, 153, 157; StartTime = $since } -MaxEvents 1000 -ErrorAction SilentlyContinue |
-                 Where-Object { ($_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs)$' -or ($_.Id -eq 129 -and $_.ProviderName -ne 'Microsoft-Windows-Time-Service')) -and -not ($_.Id -eq 98 -and $_.Level -ge 4) })
+        # Tylko błędy i ostrzeżenia już w zapytaniu: Ntfs 98 „wolumin jest w dobrym stanie” (każde zamontowanie kopii VSS) i inni dostawcy nie wypierają
+        # prawdziwych błędów z limitu. 129 osobno, bez usługi czasu (W32Time ma częste ostrzeżenie o tym samym identyfikatorze).
+        $dCap = [Math]::Max(1000, $MaxEvents)
+        $dRaw = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7, 51, 55, 98, 153, 157; Level = 1, 2, 3; StartTime = $since } -MaxEvents $dCap -ErrorAction SilentlyContinue)
+        $q129 = "<QueryList><Query Id='0' Path='System'><Select Path='System'>*[System[(EventID=129) and (Level=1 or Level=2 or Level=3) and TimeCreated[timediff(@SystemTime) &lt;= $([int64]$Days * 86400000)]]]</Select><Suppress Path='System'>*[System[Provider[@Name='Microsoft-Windows-Time-Service']]]</Suppress></Query></QueryList>"
+        $d129 = @(Get-WinEvent -FilterXml ([xml]$q129) -MaxEvents $dCap -ErrorAction SilentlyContinue)
+        if ($dRaw.Count -ge $dCap) { $truncated.Add("System – zdarzenia dyskowe (od $(D $dRaw[-1].TimeCreated))") }
+        if ($d129.Count -ge $dCap) { $truncated.Add("System – resety urządzeń, ID 129 (od $(D $d129[-1].TimeCreated))") }
+        $dEv = @(@($dRaw | Where-Object { $_.ProviderName -match '^(disk|Ntfs|Microsoft-Windows-Ntfs)$' }) + $d129)
         $dEv | Group-Object ProviderName, Id | ForEach-Object {
             $g = @($_.Group | Sort-Object TimeCreated -Descending)
             [pscustomobject]@{
@@ -1509,26 +1723,38 @@ $Collector = {
     if ($sys.IsDC) {
         $dcRows = @(S 'DomainController' 'Kontroler domeny' {
             $ck = { param($c, $v, $st) [pscustomobject]@{ Check = $c; Value = "$v"; Status = $st } }
-            $dfsr = @()
-            try { $dfsr = @(Get-CimInstance -Namespace root/microsoftdfs -ClassName DfsrReplicatedFolderInfo -ErrorAction Stop | Where-Object { $_.ReplicationGroupName -eq 'Domain System Volume' }) } catch {}
+            $dfsr = @(); $dfsrErr = ''
+            try { $dfsr = @(Get-CimInstance -Namespace root/microsoftdfs -ClassName DfsrReplicatedFolderInfo -Filter "ReplicationGroupName='Domain System Volume'" -ErrorAction Stop) } catch { $dfsrErr = $_.Exception.Message }
             if ($dfsr.Count) {
                 $stMap = @{ 0 = 'niezainicjowany'; 1 = 'zainicjowany'; 2 = 'synchronizacja początkowa'; 3 = 'automatyczne odzyskiwanie'; 4 = 'normalny'; 5 = 'BŁĄD' }
                 foreach ($f in $dfsr) {
                     $st = [int]$f.State
                     & $ck "SYSVOL (DFSR) – $($f.ReplicatedFolderName)" "$($stMap[$st]) ($st)" $(if ($st -eq 4) { 'OK' } elseif ($st -eq 5) { 'Krytyczne' } else { 'Uwaga' })
                 }
-            } else { & $ck 'SYSVOL' 'brak replikacji DFSR – prawdopodobnie przestarzała FRS (migracja: dfsrmig)' 'Uwaga' }
+            } else {
+                # brak stanu DFSR to FRS tylko wtedy, gdy działa usługa NtFrs (na 2019+ FRS nie istnieje); inaczej zatrzymana DFSR albo uszkodzony dostawca WMI
+                $frs = "$((Get-Service NtFrs -ErrorAction SilentlyContinue).Status)"; $dsv = "$((Get-Service DFSR -ErrorAction SilentlyContinue).Status)"
+                if ($frs -eq 'Running') { & $ck 'SYSVOL' 'replikacja przez przestarzałą usługę FRS (migracja: dfsrmig)' 'Uwaga' }
+                else { & $ck 'SYSVOL (DFSR)' "brak stanu replikacji SYSVOL – usługa DFSR: $(if ($dsv) { $dsv } else { 'brak' })$(if ($dfsrErr) { "; WMI: $(Short $dfsrErr 150)" })" $(if ($dsv -ne 'Running') { 'Krytyczne' } else { 'Uwaga' }) }
+            }
+            # SysvolReady = 0: kontroler nie udostępnia SYSVOL i NETLOGON (np. nieukończona synchronizacja początkowa DFSR, nieudane odtwarzanie)
+            if ("$(RegV 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters' 'SysvolReady')" -eq '0') { & $ck 'SYSVOL – udostępnianie (SysvolReady)' '0 – kontroler nie udostępnia SYSVOL ani NETLOGON; klienci uwierzytelnieni przez ten DC nie pobiorą zasad grupy ani skryptów logowania' 'Krytyczne' }
 
             Import-Module ActiveDirectory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
             if (Get-Command Get-ADReplicationPartnerMetadata -ErrorAction SilentlyContinue) {
                 try {
-                    $pm = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -ErrorAction Stop)
+                    # wszystkie partycje (bez -Partition tylko domyślna: błędy Configuration, Schema i stref DNS AD byłyby niewidoczne); starszy moduł – tylko domyślna
+                    $pm = @(); try { $pm = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -Partition * -ErrorAction Stop) } catch { $pm = @(Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -ErrorAction Stop) }
                     if (-not $pm.Count) { & $ck 'Replikacja AD' 'brak partnerów replikacji (jedyny kontroler domeny?)' 'Info' }
-                    foreach ($p in $pm) {
-                        $partner = "$($p.Partner)" -replace '^CN=NTDS Settings,CN=([^,]+),.*$', '$1'
+                    foreach ($grp in @($pm | Group-Object { "$($_.Partner)" })) {
+                        $partner = "$($grp.Name)" -replace '^CN=NTDS Settings,CN=([^,]+),.*$', '$1'
+                        # wiersz na partnera: stan najgorszej partycji (z błędem i najdawniejszym sukcesem)
+                        $bad = @($grp.Group | Where-Object { [int]$_.ConsecutiveReplicationFailures -gt 0 -or [int64]$_.LastReplicationResult -ne 0 })
+                        $p = @(@(if ($bad.Count) { $bad } else { $grp.Group }) | Sort-Object { if ($_.LastReplicationSuccess) { [datetime]$_.LastReplicationSuccess } else { [datetime]::MinValue } })[0]
                         $fails = [int]$p.ConsecutiveReplicationFailures
                         $age = if ($p.LastReplicationSuccess) { ($now - $p.LastReplicationSuccess).TotalHours } else { 1e6 }
-                        & $ck "Replikacja AD z $partner" "ostatni sukces: $(D $p.LastReplicationSuccess), błędy z rzędu: $fails, wynik: $($p.LastReplicationResult)" $(if ($fails -eq 0 -and [int64]$p.LastReplicationResult -eq 0) { 'OK' } elseif ($age -gt 24) { 'Krytyczne' } else { 'Uwaga' })
+                        $parts = (@($bad | ForEach-Object { "$($_.Partition)" -replace '^(?:DC|CN)=([^,]+).*$', '$1' } | Sort-Object -Unique) -join ', ')
+                        & $ck "Replikacja AD z $partner" "ostatni sukces: $(D $p.LastReplicationSuccess), błędy z rzędu: $fails, wynik: $($p.LastReplicationResult)$(if ($parts) { "; partycje z błędami: $parts" })" $(if (-not $bad.Count) { 'OK' } elseif ($age -gt 24) { 'Krytyczne' } else { 'Uwaga' })
                     }
                 } catch { & $ck 'Replikacja AD' "nie udało się odczytać: $($_.Exception.Message)" 'Info' }
             } else { & $ck 'Replikacja AD' 'brak modułu ActiveDirectory – pominięto' 'Info' }
@@ -1747,14 +1973,24 @@ $Collector = {
                     $m    = AdFind "(&$usr$(InChain $gdn)$en)"
                     $off  = AdFind "(&$usr$(InChain $gdn)$(Uac 2))"
                     $idle = AdFind "(&$usr$(InChain $gdn)$en(!(objectSid=$domSid-500))(|(lastLogonTimestamp<=$cut90)(&(!(lastLogonTimestamp=*))(whenCreated<=$created90))))"
+                    # konta komputerów, gMSA/MSA i obce podmioty (konta z domen zaufanych, SID jako nazwa) – zapytania o osoby ich nie obejmują
+                    $npm  = @((AdFind "(&(|(objectClass=user)(objectClass=foreignSecurityPrincipal))(!(objectCategory=person))$(InChain $gdn))") | ForEach-Object { if ("$($_.Name)" -match '^S-1-\d') { [pscustomobject]@{ Name = (AccOf $_.Name); DN = $_.DN } } else { $_ } })
                     $txt = "$($m.Count) aktywnych kont$(if ($m.Count) { ": $(Names $m 10)" })$(if ($off.Count) { "; wyłączone: $($off.Count)" })$(if ($idle.Count) { "; nieużywane od 90 dni: $(Names $idle 5)" })"
-                    $st = if (($g.Big -and $m.Count -gt $g.Big) -or $idle.Count) { 'Uwaga' } elseif ($g.Empty -and $m.Count) { 'Zalecenie' } else { 'Info' }
-                    if ($g.Empty -and $m.Count) { $txt += ' – grupa powinna być pusta (uprawnienia bliskie administratorowi domeny)' }
+                    if ($npm.Count) { $txt += "; konta komputerów, usług (gMSA/MSA) i z innych domen: $(Names $npm 5)" }
+                    $st = if (($g.Big -and $m.Count -gt $g.Big) -or $idle.Count -or $npm.Count) { 'Uwaga' } elseif ($g.Empty -and $m.Count) { 'Zalecenie' } else { 'Info' }
+                    if ($g.Empty -and ($m.Count -or $npm.Count)) { $txt += ' – grupa powinna być pusta (uprawnienia bliskie administratorowi domeny)' }
                     if ($idle.Count) { $txt += ' – nieużywane konta uprzywilejowane wyłącz albo usuń z grupy' }
+                    if ($npm.Count) { $txt += ' – konto komputera lub usługi w grupie uprzywilejowanej to znana technika utrwalenia dostępu; sprawdź, czy to zamierzone' }
                     AdRow "Grupa uprzywilejowana: $($g.N)" $txt $st
                 }
             }
             $privOr = if ($privDn.Count) { '(|' + (@($privDn | ForEach-Object { InChain $_ }) -join '') + ')' } else { '(objectSid=S-1-0-0)' }
+            # Lista kont uprzywilejowanych (DOMENA\sAMAccountName, do 500) – stacja szuka ich wśród kont usług i zadań wszystkich serwerów
+            Try-Ad 'Konta uprzywilejowane – lista' {
+                if (-not ($domSid -and "$(AccOf "$domSid-512")" -match '^([^\\]+)\\')) { return }   # nazwa NetBIOS domeny z nazwy grupy Administratorzy domeny
+                $nb = $Matches[1]
+                $sys.PrivAccounts = (@((AdFind "(&(objectClass=user)$en$privOr)") | Select-Object -First 500 | ForEach-Object { "$(AdGet $_.DN 'sAMAccountName')" } | Where-Object { $_ -and $_ -notmatch '[{}]' } | ForEach-Object { "$nb\$_" }) -join ',')
+            }
 
             Try-Ad 'Hasło konta krbtgt' {
                 $age = 'krócej niż 180 dni'; $st = 'OK'
@@ -1874,6 +2110,13 @@ $Collector = {
                 $pu = AdList (GroupDn "(objectSid=$domSid-525)") 'member'
                 if ([int]$dfl -ge 6) { AdRow 'Grupa Użytkownicy chronieni' $(if ($pu.Count) { "$($pu.Count) członków" } else { 'pusta – konta administratorów nie korzystają z dodatkowej ochrony (bez NTLM, delegowania i zapamiętywania poświadczeń)' }) $(if ($pu.Count) { 'OK' } else { 'Zalecenie' }) }
             }
+            # Kopia zapasowa AD: NTDS zapisuje zdarzenie 2089 raz dziennie dla każdej partycji bez kopii w progu „Backup Latency Threshold”
+            # (domyślnie połowa czasu życia tombstone). Stan kopii jest replikowany – wystarczy dziennik jednego kontrolera (ocena raz na domenę).
+            Try-Ad 'Kopia zapasowa Active Directory' {
+                $bk = @(Get-WinEvent -FilterHashtable @{ LogName = 'Directory Service'; Id = 2089; StartTime = $since } -MaxEvents 100 -ErrorAction SilentlyContinue)
+                $bkp = @($bk | ForEach-Object { if ("$($_.Message)" -match '\b(?:CN|DC)=[^\s,]+(?:,(?:CN|DC)=[^\s,]+)*') { $Matches[0] } } | Select-Object -Unique)
+                AdRow 'Kopia zapasowa Active Directory (zdarzenie 2089)' $(if ($bk.Count) { "brak kopii zapasowej w progu opóźnienia$(if ($bkp.Count) { ", partycje: $(@($bkp | Select-Object -First 5) -join '; ')" }) (ostatnio $(D $bk[0].TimeCreated)) – bez aktualnej kopii stanu systemu kontrolera nie da się odtworzyć domeny po awarii lub ataku" } else { "brak ostrzeżeń z $Days dni" }) $(if ($bk.Count) { 'Uwaga' } else { 'OK' })
+            }
             Try-Ad 'Zaufania' {
                 foreach ($t in (AdFind '(objectClass=trustedDomain)' "CN=System,$defNC")) {
                     $ta = [int](AdGet $t.DN 'trustAttributes'); $td = [int](AdGet $t.DN 'trustDirection'); $tp = "$(AdGet $t.DN 'trustPartner')"
@@ -1916,15 +2159,19 @@ $Collector = {
                 if (-not $svRoot) { $svRoot = Join-Path $env:SystemRoot 'SYSVOL\sysvol' }
                 $base = Join-Path $svRoot $dnsDom
                 if (-not (Test-Path -LiteralPath $base)) { AdRow 'SYSVOL – hasła w plikach' "nie znaleziono folderu $base" 'Info'; return }
-                $files = @(Get-ChildItem -LiteralPath $base -Recurse -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and $_.Length -lt 2MB -and $_.Extension -match '^\.(xml|bat|cmd|vbs|ps1|kix|ini|inf)$' } | Select-Object -First 5000)
-                $gpp = New-Object System.Collections.Generic.List[string]; $scr = New-Object System.Collections.Generic.List[string]
+                # najpierw scripts (NETLOGON – najczęstsze miejsce haseł), potem Policies; z plików .ini tylko scripts.ini / psscripts.ini (parametry skryptów)
+                $files = @(@(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue | Sort-Object { $_.Name -ne 'scripts' }) | ForEach-Object { if ($_.PSIsContainer) { Get-ChildItem -LiteralPath $_.FullName -Recurse -ErrorAction SilentlyContinue } else { $_ } } | Where-Object { -not $_.PSIsContainer -and $_.Length -lt 2MB -and ($_.Extension -match '^\.(xml|bat|cmd|vbs|ps1|kix)$' -or $_.Name -match '^(ps)?scripts\.ini$') } | Select-Object -First 5000)
+                $gpp = New-Object System.Collections.Generic.List[string]; $scr = New-Object System.Collections.Generic.List[string]; $alp = New-Object System.Collections.Generic.List[string]
                 foreach ($f in $files) {
                     $t = ''; try { $t = [IO.File]::ReadAllText($f.FullName) } catch { continue }
                     $rel = $f.FullName.Substring($base.Length).TrimStart('\')
-                    if ($f.Extension -eq '.xml') { if ($t -match 'cpassword="[^"]+"') { $gpp.Add($rel) } }
-                    elseif ($f.Extension -match '^\.(bat|cmd|vbs|ps1|kix)$' -and $t -match '(?im)(\bnet\s+use\b[^\r\n]*\s/user:\S+|\bpassword\s*[=:]\s*(?!(Read-Host|Get-|Import-|ConvertTo-|ConvertFrom-|New-Object|InputBox)\b)["'']?[^\s"''%$(]{4,}|-AsPlainText\b)') { $scr.Add($rel) }
+                    # Registry.xml: wartość DefaultPassword (autologowanie Winlogon) zapisana jawnym tekstem w atrybucie value
+                    if ($f.Extension -eq '.xml') { if ($t -match 'cpassword="[^"]+"') { $gpp.Add($rel) }; if ($t -match '(?i)<(?=[^>]*\sname="DefaultPassword")(?=[^>]*\svalue="[^"]+")') { $alp.Add($rel) } }
+                    elseif ($f.Extension -match '^\.(bat|cmd|vbs|ps1|kix|ini)$' -and $t -match '(?im)(\bnet\s+use\b[^\r\n]*\s/user:\S+|^\s*\d+Parameters\s*=[^\r\n]*/user:\S+|\bpassword\s*[=:]\s*(?!(Read-Host|Get-|Import-|ConvertTo-|ConvertFrom-|New-Object|InputBox)\b)["'']?[^\s"''%$(]{4,}|-AsPlainText\b)') { $scr.Add($rel) }
                 }
-                AdRow 'SYSVOL – hasła w preferencjach zasad grupy (cpassword)' $(if ($gpp.Count) { "$($gpp.Count) plików: $(@($gpp | Select-Object -First 5) -join ', ') – hasło odszyfruje każdy użytkownik domeny; usuń preferencję i zmień hasło" } else { "brak (sprawdzono $($files.Count) plików)" }) $(if ($gpp.Count) { 'Krytyczne' } else { 'OK' })
+                # limit 5000 plików: brak znalezisk nie oznacza „OK”, gdy części plików nie przejrzano
+                AdRow 'SYSVOL – hasła w preferencjach zasad grupy (cpassword)' $(if ($gpp.Count) { "$($gpp.Count) plików: $(@($gpp | Select-Object -First 5) -join ', ') – hasło odszyfruje każdy użytkownik domeny; usuń preferencję i zmień hasło" } elseif ($files.Count -ge 5000) { "brak w sprawdzonych plikach – sprawdzono tylko pierwsze $($files.Count) plików (limit), pozostałych nie przejrzano" } else { "brak (sprawdzono $($files.Count) plików)" }) $(if ($gpp.Count) { 'Krytyczne' } elseif ($files.Count -ge 5000) { 'Info' } else { 'OK' })
+                if ($alp.Count) { AdRow 'SYSVOL – hasło autologowania w preferencjach rejestru (DefaultPassword)' "$($alp.Count) plików: $(@($alp | Select-Object -First 5) -join ', ') – hasło zapisane jawnym tekstem czyta każdy użytkownik domeny; usuń preferencję i zmień hasło" 'Krytyczne' }
                 if ($scr.Count) { AdRow 'SYSVOL – możliwe hasła w skryptach' "$(@($scr | Select-Object -First 6) -join ', ')$(if ($scr.Count -gt 6) { " (+$($scr.Count - 6))" }) – skrypty czyta każdy użytkownik domeny" 'Uwaga' }
                 # Zasady haseł (szyfrowanie odwracalne, złożoność): obowiązujące na kontrolerze = zasady domeny z wygrywającego GPO
                 # (secedit /export do pliku tymczasowego, usuwanego od razu); gdy się nie uda – Default Domain Policy z SYSVOL
@@ -1945,10 +2192,14 @@ $Collector = {
     # ── Ekspozycja: reguły zapory wpuszczające porty wrażliwe (lista portów przychodzi ze stacji: $Config.ExposedPorts) ──
     $exposure = @(S 'Exposure' 'Ekspozycja' {
         $ports = @($ExposedPorts | ForEach-Object { "$_" })
+        $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow)
+        # Rozrost reguł zapory (np. RDS: reguły aplikacji dopisywane przy każdym logowaniu użytkownika) – filtry wszystkich reguł to minuty
+        # i setki MB pamięci sesji (serwer przekraczał limit czasu); sekcja niezebrana, żeby porównanie nie pokazało usuniętych reguł
+        if ($rules.Count -gt 20000) { $failedKeys.Add('Exposure'); $errs.Add("Ekspozycja: $($rules.Count) włączonych reguł przychodzących zapory – pominięto analizę (rozrost reguł spowalnia też logowanie; na hostach RDS: DeleteUserAppContainersOnLogoff)"); return }
         $pf = @{};  foreach ($x in @(Get-NetFirewallPortFilter -PolicyStore ActiveStore -All)) { $pf[$x.InstanceID] = $x }
         $af = @{};  foreach ($x in @(Get-NetFirewallAddressFilter -PolicyStore ActiveStore -All)) { $af[$x.InstanceID] = $x }
         $apf = @{}; foreach ($x in @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -All)) { $apf[$x.InstanceID] = $x }
-        foreach ($r in @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Inbound -Action Allow)) {
+        foreach ($r in $rules) {
             $p = $pf[$r.InstanceID]; if (-not $p) { continue }
             $lp   = @($p.LocalPort | ForEach-Object { "$_" })
             $prog = "$($apf[$r.InstanceID].Program)"
@@ -1978,7 +2229,7 @@ $Collector = {
             $cls = $c.CimClass.CimClassName
             $det = switch ($cls) {
                 'CommandLineEventConsumer'  { Hide-Secret ("$($c.CommandLineTemplate) $($c.ExecutablePath)".Trim()) }
-                'ActiveScriptEventConsumer' { if ($c.ScriptFileName) { "$($c.ScriptFileName)" } else { Short $c.ScriptText 300 } }
+                'ActiveScriptEventConsumer' { if ($c.ScriptFileName) { "$($c.ScriptFileName)" } else { Short (Hide-Secret "$($c.ScriptText)") 300 } }
                 default                     { '' }
             }
             [pscustomobject]@{ Type = "WMI – konsument ($cls)"; Name = "$($c.Name)"; Detail = "$det" }
@@ -2054,7 +2305,7 @@ $Collector = {
         Errors         = $errList
         Days           = $Days
         DurationSec    = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-        CollectorVersion = 2   # zmiana formatu wierszy porównywanych sekcji = nowy numer (stacja nie porównuje migawek różnych wersji)
+        CollectorVersion = 3   # zmiana formatu wierszy porównywanych sekcji = nowy numer (stacja nie porównuje migawek różnych wersji)
     } | ConvertTo-Json -Depth 4 -Compress
     # Czas serwera PO serializacji – stacja liczy różnicę zegarów bez czasu budowania JSON (przy dużych serwerach to sekundy)
     '@@SRTIME@@' + [DateTime]::UtcNow.ToString('o')
@@ -2083,19 +2334,26 @@ function Read-SnapshotText([string]$Path) {
 }
 
 function Write-SnapshotText([string]$Path, [string]$Text) {
-    # Zapis przez plik tymczasowy: wczytywanie migawek nigdy nie trafi na plik zapisany do połowy
+    # Zapis przez plik tymczasowy: wczytywanie migawek nigdy nie trafi na plik zapisany do połowy. Po błędzie (pełny dysk) albo
+    # przerwaniu wątku plik .tmp jest usuwany – indeks migawek go nie widzi, więc porządki by go nie usunęły (a folder skanu by został).
     $bytes = (New-Object Text.UTF8Encoding $false).GetBytes($Text)
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))   # folder skanu mógł zniknąć (porządki innej instancji)
     $tmp = "$Path.tmp"
-    $fs = [IO.File]::Create($tmp)
+    $done = $false
     try {
-        if ($Path.EndsWith('.gz', [StringComparison]::OrdinalIgnoreCase)) {
-            $gz = New-Object IO.Compression.GZipStream($fs, [IO.Compression.CompressionLevel]::Optimal)
-            try { $gz.Write($bytes, 0, $bytes.Length) } finally { $gz.Dispose() }
-        } else { $fs.Write($bytes, 0, $bytes.Length) }
-    } finally { $fs.Dispose() }
-    if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
-    [IO.File]::Move($tmp, $Path)
+        $fs = [IO.File]::Create($tmp)
+        try {
+            if ($Path.EndsWith('.gz', [StringComparison]::OrdinalIgnoreCase)) {
+                $gz = New-Object IO.Compression.GZipStream($fs, [IO.Compression.CompressionLevel]::Optimal)
+                try { $gz.Write($bytes, 0, $bytes.Length) } finally { $gz.Dispose() }
+            } else { $fs.Write($bytes, 0, $bytes.Length) }
+        } finally { $fs.Dispose() }
+        # istniejący plik (pamięć podręczna CVE) podmieniany jednym wywołaniem – awaria w trakcie nie zostawia braku pliku;
+        # system plików bez ReplaceFile (część udziałów sieciowych) – jak dotąd: usunięcie i przeniesienie
+        if (-not [IO.File]::Exists($Path)) { [IO.File]::Move($tmp, $Path) }
+        else { try { [IO.File]::Replace($tmp, $Path, $null) } catch { [IO.File]::Delete($Path); [IO.File]::Move($tmp, $Path) } }
+        $done = $true
+    } finally { if (-not $done) { try { [IO.File]::Delete($tmp) } catch {} } }
 }
 
 function ConvertFrom-ServerJson([string]$Json, [string[]]$ArrayKeys) {
@@ -2130,10 +2388,23 @@ function Merge-PrevSections {
     $verC = "$($Cur.PSObject.Properties['CollectorVersion'].Value)"
     if ("$($Prev.PSObject.Properties['CollectorVersion'].Value)" -ne $verC) { return $Prev }   # i tak nie porównujemy
     $from = @{}
+    # lista nazw sekcji z tablicy najwyższego poziomu („Skipped”/„Failed” są za wszystkimi sekcjami, więc ostatnie wystąpienie)
+    $names = { param($n) $m = [regex]::Match($t, '"' + $n + '":\[([^\]]*)\]', [Text.RegularExpressions.RegexOptions]::RightToLeft); if ($m.Success) { @([regex]::Matches($m.Groups[1].Value, '"([^"]*)"') | ForEach-Object { $_.Groups[1].Value }) } else { @() } }
     foreach ($f in @($Older)) {
         if (-not $need.Count) { break }
+        $t = $null
+        try { $t = Read-SnapshotText $f } catch { continue }
+        # Wstępnie z tekstu, bez parsowania całej migawki (sekcja nowa albo długo pominięta nie występuje w żadnej starszej):
+        # inna wersja kolektora = koniec; brak klucza potrzebnej sekcji albo sekcja pominięta/niezebrana = następna migawka.
+        # Bez numeru wersji (uszkodzony plik, bardzo stara migawka, znacznik niedostępności) – jak dotąd, pełne parsowanie.
+        $mv = [regex]::Match($t, '"CollectorVersion":\s*(\d+)', [Text.RegularExpressions.RegexOptions]::RightToLeft)
+        if ($mv.Success) {
+            if ($mv.Groups[1].Value -ne $verC) { break }
+            $skp = & $names 'Skipped'; $fld = & $names 'Failed'
+            if (-not @($need.ToArray() | Where-Object { $t.Contains('"' + $_ + '":') -and $skp -notcontains $_ -and $fld -notcontains $_ }).Count) { continue }
+        }
         $o = $null
-        try { $o = ConvertFrom-ServerJson (Read-SnapshotText $f) $ArrayKeys } catch { continue }
+        try { $o = ConvertFrom-ServerJson $t $ArrayKeys } catch { continue }
         if ($o.PSObject.Properties['Offline'] -and $o.Offline) { continue }
         if ("$($o.PSObject.Properties['CollectorVersion'].Value)" -ne $verC) { break }   # starsze migawki mają inny format wierszy
         $date = ([IO.File]::GetLastWriteTime($f)).ToString('yyyy-MM-dd HH:mm')
@@ -2282,20 +2553,46 @@ function Get-WinRmErrorInfo {
 }
 
 function Get-AdComputerInfo([string]$Name) {
-    # Konto komputera w AD (bieżąca domena stacji): istnieje? włączone? kiedy ostatnio logowało się do domeny?
-    $r = [ordered]@{ Found = $false; Enabled = $null; LastLogonDays = $null; PwdAgeDays = $null; OS = ''; DN = ''; Error = '' }
+    # Konto komputera w AD: istnieje? włączone? kiedy ostatnio logowało się do domeny? Szukamy w domenie stacji, a nazwy FQDN
+    # z innej domeny lasu – najpierw w tamtej domenie. Konto o tej samej nazwie NetBIOS, ale z inną nazwą DNS, to nie ten serwer.
+    $r = [ordered]@{ Found = $false; Enabled = $null; LastLogonDays = $null; PwdAgeDays = $null; OS = ''; DN = ''; Domain = ''; Error = '' }
     if ($Name -match '^\d{1,3}(\.\d{1,3}){3}$' -or $Name.Contains(':')) { $r.Error = 'adres IP'; return [pscustomobject]$r }
     try {
         $esc = { param($v) ($v -replace '\\', '\5c' -replace '\*', '\2a' -replace '\(', '\28' -replace '\)', '\29') }
         $short = $Name.Split('.')[0]
-        $ds = New-Object System.DirectoryServices.DirectorySearcher
-        $ds.Filter = "(&(objectCategory=computer)(|(sAMAccountName=$(& $esc $short)`$)(dNSHostName=$(& $esc $Name))))"
-        $ds.ClientTimeout = [TimeSpan]::FromSeconds(8)
-        $ds.ServerTimeLimit = [TimeSpan]::FromSeconds(8)
-        [void]$ds.PropertiesToLoad.AddRange([string[]]@('useraccountcontrol', 'lastlogontimestamp', 'pwdlastset', 'operatingsystem', 'distinguishedname'))
-        $hit = $ds.FindOne()
-        if ($hit) {
-            $p = $hit.Properties
+        $nb = $short.Substring(0, [Math]::Min(15, $short.Length))   # sAMAccountName komputera: nazwa NetBIOS (najwyżej 15 znaków) + $
+        $fq = $Name.Contains('.')
+        $roots = @('')
+        if ($fq -and $Name.Substring($Name.IndexOf('.') + 1) -ne "$env:USERDNSDOMAIN") {
+            # tylko domena lasu, której nazwa jest sufiksem nazwy serwera (dowolny sufiks DNS = próby połączenia LDAP z hostem spoza AD)
+            $sfx = $Name.Substring($Name.IndexOf('.') + 1)
+            try { $r.Domain = "$(@([System.DirectoryServices.ActiveDirectory.Forest]::GetCurrentForest().Domains | ForEach-Object { "$($_.Name)" } | Where-Object { $_ -ne "$env:USERDNSDOMAIN" -and ($sfx -eq $_ -or $sfx.EndsWith(".$_", [StringComparison]::OrdinalIgnoreCase)) } | Sort-Object Length -Descending)[0])" } catch {}
+            if ($r.Domain) { $roots = @("LDAP://$($r.Domain)", '') }
+        }
+        $flt = if ($fq) { "(dNSHostName=$(& $esc $Name))" } else { "(dNSHostName=$(& $esc $short).*)" }
+        $p = $null; $bestSc = 0; $other = ''
+        foreach ($root in $roots) {
+            try {
+                $ds = if ($root) { New-Object System.DirectoryServices.DirectorySearcher (New-Object System.DirectoryServices.DirectoryEntry $root) } else { New-Object System.DirectoryServices.DirectorySearcher }
+                $ds.Filter = "(&(objectCategory=computer)(|(sAMAccountName=$(& $esc $nb)`$)$flt))"
+                $ds.ClientTimeout = [TimeSpan]::FromSeconds(8)
+                $ds.ServerTimeLimit = [TimeSpan]::FromSeconds(8)
+                [void]$ds.PropertiesToLoad.AddRange([string[]]@('useraccountcontrol', 'lastlogontimestamp', 'pwdlastset', 'operatingsystem', 'distinguishedname', 'dnshostname'))
+                $all = $ds.FindAll()
+                try {
+                    foreach ($h in $all) {
+                        $dns = if ($h.Properties['dnshostname'].Count) { "$($h.Properties['dnshostname'][0])" } else { '' }
+                        # 3 = nazwa DNS konta zgodna z nazwą serwera, 1 = konto bez nazwy DNS (nie da się sprawdzić), 0 = inny komputer
+                        $sc = if (-not $dns) { 1 } elseif (($fq -and $dns -eq $Name) -or (-not $fq -and $dns.Split('.')[0] -eq $short)) { 3 } else { 0 }
+                        if (-not $sc) { $other = $dns }
+                        if ($sc -gt $bestSc) { $p = $h.Properties; $bestSc = $sc }
+                    }
+                } finally { $all.Dispose() }
+            } catch { if ($root) { continue }; throw }   # domena z nazwy serwera nieosiągalna – zostaje domena stacji
+            if ($null -ne $p -or $other) { break }
+        }
+        if ($null -eq $p -and $other) { $r.Error = "konto $nb`$ należy do komputera $other (inny komputer o tej samej nazwie NetBIOS albo serwer ma inną nazwę DNS)" }
+        if ($null -ne $p) {
             $r.Found = $true
             $r.Enabled = -not ([int64]$p['useraccountcontrol'][0] -band 2)
             if ($p['lastlogontimestamp'].Count) { $r.LastLogonDays = [int]((Get-Date) - [datetime]::FromFileTime([int64]$p['lastlogontimestamp'][0])).TotalDays }
@@ -2326,7 +2623,7 @@ function Get-HttpSpnOwners([string]$Name) {
     try {
         foreach ($h in $res) {
             $sam = "$($h.Properties['samaccountname'][0])"
-            if ($sam -eq "$short`$") { continue }   # konto samego komputera – tak ma być
+            if ($sam -eq "$($short.Substring(0, [Math]::Min(15, $short.Length)))`$") { continue }   # konto samego komputera (nazwa NetBIOS: najwyżej 15 znaków) – tak ma być
             $own = @($h.Properties['serviceprincipalname'] | Where-Object { $spns -contains "$_" })
             $out.Add([pscustomobject]@{ Account = $sam; Spn = ($own -join ', ') })
         }
@@ -2382,8 +2679,8 @@ function Test-WinRmPort([string]$Target, [int]$TimeoutMs, [int]$Port = 5985) {
 
 function Invoke-ConnectionDiagnostics {
     <#
-        Diagnostyka niedostępnego serwera ze stacji: DNS (A i PTR), ping, porty TCP (równolegle, z limitem czasu),
-        TrustedHosts dla adresów IP, konto komputera w AD i klasyfikacja błędu WinRM. Trwa zwykle 2–4 s.
+        Diagnostyka niedostępnego serwera ze stacji: DNS (A i PTR), ping, porty TCP (równolegle, z limitem czasu; port 5985 także
+        pod kolejnymi adresami z DNS), TrustedHosts (adres IP albo błąd TrustedHosts), konto komputera w AD i klasyfikacja błędu WinRM. Trwa zwykle 2–4 s.
         Wynik: przyczyna i zalecenie (po polsku) + lista sprawdzeń do sekcji „Diagnoza połączenia”.
     #>
     param(
@@ -2432,9 +2729,12 @@ function Invoke-ConnectionDiagnostics {
 
     # ── Ping i porty TCP (równolegle) ──
     $ip = if ($ips.Count) { $ips[0] } else { $null }
-    $pingOk = $false; $state = @{}
+    $pingOk = $false; $state = @{}; $w = $null; $moved = $false
+    # stan próby TCP: open | refused | unreach | timeout | error; nazwa stanu do opisu
+    $tcpState = { param($x) if (-not $x.Task) { 'error' } elseif ("$($x.Task.Status)" -eq 'RanToCompletion' -and $x.Client.Connected) { 'open' } elseif ($x.Task.IsFaulted) { $se = $x.Task.Exception.InnerException; if ($se -is [Net.Sockets.SocketException] -and "$($se.SocketErrorCode)" -eq 'ConnectionRefused') { 'refused' } else { 'unreach' } } else { 'timeout' } }
+    $stName = { param($s) switch ("$s") { 'open' { 'otwarty' } 'refused' { 'zamknięty' } 'unreach' { 'nieosiągalny' } 'error' { '?' } default { 'brak odp.' } } }
     if ($ip) {
-        $pinger = $null; $pingTask = $null; $tcp = @()
+        $pinger = $null; $pingTask = $null; $tcp = @(); $alt = @()
         try { $pinger = New-Object Net.NetworkInformation.Ping; $pingTask = $pinger.SendPingAsync($ip, $TimeoutMs) } catch {}
         # gniazdo w rodzinie adresu: domyślny TcpClient w .NET Framework obsługuje tylko IPv4 (adres IPv6 = żadna próba portu)
         $fam = [Net.Sockets.AddressFamily]::InterNetwork; $pa = $null
@@ -2444,8 +2744,17 @@ function Invoke-ConnectionDiagnostics {
             $task = $null; try { $task = $cl.ConnectAsync($ip, [int]$port) } catch {}
             $tcp += , @{ Port = [int]$port; Client = $cl; Task = $task }
         }
+        # kilka adresów w DNS (karta zaplecza zarejestrowana w DNS, nieaktualny rekord A): port 5985 także pod kolejnymi (najwyżej 3),
+        # jak we wstępnym teście portu – pierwszy adres bywa martwy, choć serwer działa
+        foreach ($altIp in @($ips | Select-Object -Skip 1 -First 3)) {
+            $afam = [Net.Sockets.AddressFamily]::InterNetwork; $aa = $null
+            if ([Net.IPAddress]::TryParse("$altIp", [ref]$aa)) { $afam = $aa.AddressFamily }
+            $cl = New-Object Net.Sockets.TcpClient($afam)
+            $task = $null; try { $task = $cl.ConnectAsync("$altIp", 5985) } catch {}
+            $alt += , @{ Ip = "$altIp"; Client = $cl; Task = $task }
+        }
         $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs + 250)
-        foreach ($tk in @(@($pingTask) + @($tcp | ForEach-Object { $_.Task }) | Where-Object { $_ })) {
+        foreach ($tk in @(@($pingTask) + @($tcp | ForEach-Object { $_.Task }) + @($alt | ForEach-Object { $_.Task }) | Where-Object { $_ })) {
             $left = [int][Math]::Max(0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
             try { [void]$tk.Wait($left) } catch {}
         }
@@ -2453,13 +2762,7 @@ function Invoke-ConnectionDiagnostics {
             $pingOk = $true; & $add 'Ping (ICMP)' "odpowiada ($($pingTask.Result.RoundtripTime) ms)" 'OK'
         } else { & $add 'Ping (ICMP)' 'brak odpowiedzi (ICMP bywa blokowany przez zaporę – samo w sobie nie przesądza)' 'Uwaga' }
         foreach ($x in $tcp) {
-            $st = 'timeout'
-            if (-not $x.Task) { $st = 'error' }
-            elseif ("$($x.Task.Status)" -eq 'RanToCompletion' -and $x.Client.Connected) { $st = 'open' }
-            elseif ($x.Task.IsFaulted) {
-                $se = $x.Task.Exception.InnerException
-                $st = if ($se -is [Net.Sockets.SocketException] -and "$($se.SocketErrorCode)" -eq 'ConnectionRefused') { 'refused' } else { 'unreach' }
-            }
+            $st = & $tcpState $x
             $state[$x.Port] = $st
             try { $x.Client.Close() } catch {}
             $label = "TCP $($x.Port)$(if ($portNames.ContainsKey($x.Port)) { " ($($portNames[$x.Port]))" })"
@@ -2471,15 +2774,29 @@ function Invoke-ConnectionDiagnostics {
                 default   { & $add $label 'brak odpowiedzi w limicie czasu (filtrowany przez zaporę albo host wyłączony)' $(if ($x.Port -eq 5985) { 'Błąd' } else { 'Uwaga' }) }
             }
         }
+        $w = $state[5985]
+        if ($alt.Count) {
+            # wniosek z adresu, pod którym WinRM odpowiada najlepiej (otwarty > zamknięty > brak odpowiedzi)
+            $rank = @{ open = 2; refused = 1 }
+            $lst = @("$ip $(& $stName $w) (ping i porty powyżej)")
+            foreach ($x in $alt) {
+                $st = & $tcpState $x
+                try { $x.Client.Close() } catch {}
+                $lst += "$($x.Ip) $(& $stName $st)"
+                if ([int]$rank[$st] -gt [int]$rank["$w"]) { $ip = $x.Ip; $w = $st }
+            }
+            $moved = $ip -ne $ips[0]
+            & $add 'DNS: kilka adresów (TCP 5985)' "$($lst -join '; ')$(if ($moved) { " – WinRM odpowiada pod $ip, a nie pod pierwszym adresem z DNS: nieaktualny rekord A albo zarejestrowana w DNS karta zaplecza (kopie, iSCSI, migracja)" })" $(if ($moved) { 'Uwaga' } else { 'Info' })
+        }
         if ($pinger) { try { $pinger.Dispose() } catch {} }
     }
 
-    # ── TrustedHosts (połączenia po adresie IP) ──
-    if ($isIp) {
+    # ── TrustedHosts (połączenia po adresie IP albo błąd TrustedHosts: serwer po nazwie spoza domeny, uwierzytelnianie NTLM) ──
+    $inTh = $false
+    if ($isIp -or $cls.Class -eq 'TrustedHosts') {
         $th = ''
         try { $th = "$((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WSMAN\Client' -ErrorAction Stop).trusted_hosts)" } catch {}
         try { $pol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client' -ErrorAction Stop; if ($pol.TrustedHosts -eq 1 -and $pol.TrustedHostsList) { $th = "$th,$($pol.TrustedHostsList)" } } catch {}
-        $inTh = $false
         foreach ($e in ($th -split ',')) { $e = $e.Trim(); if ($e -and ($e -eq '*' -or $Target -like $e)) { $inTh = $true } }
         & $add 'TrustedHosts (stacja)' $(if ($inTh) { "zawiera $Target" } elseif ($th.Trim(',')) { "brak $Target (lista: $($th.Trim(',')))" } else { 'lista pusta' }) $(if ($inTh) { 'OK' } else { 'Uwaga' })
     }
@@ -2489,7 +2806,7 @@ function Invoke-ConnectionDiagnostics {
     if ($CheckAd -and -not $isIp) {
         $ad = Get-AdComputerInfo $Target
         if ($ad.Error) { & $add 'Konto komputera w AD' "nie sprawdzono: $($ad.Error)" 'Info' }
-        elseif (-not $ad.Found) { & $add 'Konto komputera w AD' 'nie znaleziono w domenie stacji (serwer spoza domeny albo usunięty)' 'Uwaga' }
+        elseif (-not $ad.Found) { & $add 'Konto komputera w AD' "nie znaleziono w $(if ($ad.Domain) { "domenie $($ad.Domain) ani w domenie stacji" } else { 'domenie stacji' }) (serwer spoza domeny albo usunięty)" 'Uwaga' }
         else {
             $txt = "$(if ($ad.Enabled) { 'włączone' } else { 'WYŁĄCZONE' })$(if ($null -ne $ad.LastLogonDays) { ", ostatnie logowanie do domeny ≈ $($ad.LastLogonDays) dni temu" })$(if ($null -ne $ad.PwdAgeDays) { ", hasło konta zmienione $($ad.PwdAgeDays) dni temu" }), $($ad.OS)"
             & $add 'Konto komputera w AD' $txt $(if (-not $ad.Enabled -or $ad.LastLogonDays -gt 30 -or $ad.PwdAgeDays -gt 60) { 'Uwaga' } else { 'OK' })
@@ -2507,9 +2824,14 @@ function Invoke-ConnectionDiagnostics {
     }
 
     # ── Wniosek: najpierw sieć (czy serwer w ogóle żyje), potem WinRM, potem uwierzytelnianie ──
-    $w = $state[5985]
-    $alive = $pingOk -or @($state.Values | Where-Object { $_ -in 'open', 'refused' }).Count -gt 0
+    $alive = $pingOk -or @($state.Values | Where-Object { $_ -in 'open', 'refused' }).Count -gt 0 -or $w -in 'open', 'refused'
     $cause = $cls.Cause; $remedy = $cls.Remedy; $class = $cls.Class
+    if ($class -eq 'TrustedHosts' -and -not $isIp) {
+        # ten sam błąd WinRM dla serwera dodanego po nazwie: spoza domeny stacji (albo stacja poza domeną) – uwierzytelnianie inne niż Kerberos
+        $cause = 'Serwer spoza domeny stacji (albo bez relacji zaufania) – logowanie inne niż Kerberos (NTLM, konto lokalne serwera) wymaga wpisu nazwy serwera w TrustedHosts stacji i jawnego konta'
+        $remedy = "Na stacji (jako administrator): Set-Item WSMan:\localhost\Client\TrustedHosts -Value $Target -Concatenate i wybierz konto przyciskiem " + '„Konto”.'
+    }
+    if ($class -eq 'TrustedHosts' -and $inTh) { $remedy = "$Target jest już na liście TrustedHosts stacji – wybierz jawne konto przyciskiem " + '„Konto” (konto lokalne serwera albo konto jego domeny).' }
     if ($class -in 'Timeout', 'Remote' -and $ErrorId -match '^(SrTimeout|CollectorFatal)' -and $alive) { }
     elseif (-not $isIp -and -not $dnsOk) {
         $class = 'Dns'; $cause = 'Nazwa serwera nie jest rozwiązywana w DNS'
@@ -2529,7 +2851,11 @@ function Invoke-ConnectionDiagnostics {
     }
     elseif ($w -eq 'open' -and -not $ErrorText) {
         # diagnoza na żądanie działającego serwera – bez błędu połączenia do wyjaśnienia
-        $class = 'OK'; $cause = 'WinRM jest osiągalny ze stacji (port 5985 otwarty)'; $remedy = ''
+        $class = 'OK'; $cause = "WinRM jest osiągalny ze stacji (port 5985 otwarty$(if ($moved) { " pod adresem $ip; pod pierwszym adresem z DNS ($($ips[0])) WinRM nie odpowiada" }))"; $remedy = ''
+    }
+    elseif ($w -eq 'open' -and $moved -and $class -in 'Network', 'Unknown', 'Dns' -and $ErrorId -notmatch '^(CollectorFatal|ParseError|NoData)') {
+        $class = 'Dns'; $cause = "WinRM odpowiada pod adresem $ip, ale nie pod pierwszym adresem z DNS ($($ips[0])) – nieaktualny rekord A albo zarejestrowana w DNS karta zaplecza (kopie, iSCSI, migracja)"
+        $remedy = 'Usuń nieaktualny rekord A albo wyłącz rejestrację w DNS na karcie zaplecza (właściwości karty: „Zarejestruj adresy tego połączenia w systemie DNS”), potem ipconfig /flushdns na stacji.'
     }
     elseif ($w -eq 'open' -and $class -in 'Network', 'Unknown', 'Dns' -and $ErrorId -notmatch '^(CollectorFatal|ParseError|NoData)') {
         $class = 'WinRM'; $cause = 'WinRM nasłuchuje (port 5985 otwarty), ale sesja nie powstała'
@@ -2546,10 +2872,10 @@ function Invoke-ConnectionDiagnostics {
     elseif ($ad -and $ad.Found -and $ad.PwdAgeDays -gt 60) { $notes.Add("hasło konta komputera nie zmieniło się od $($ad.PwdAgeDays) dni – możliwy zerwany kanał zabezpieczeń (Test-ComputerSecureChannel)") }
     elseif ($ad -and -not $ad.Found -and -not $ad.Error) { $notes.Add('brak konta komputera w AD') }
     if ($ad -and $ad.OS -and $ad.OS -notmatch 'Windows') { $notes.Add("system wg AD: $($ad.OS) – nie jest skanowany") }
-    $portTxt = (@($state.Keys | Sort-Object | ForEach-Object { "$_ $(switch ($state[$_]) { 'open' { 'otwarty' } 'refused' { 'zamknięty' } 'unreach' { 'nieosiągalny' } 'error' { '?' } default { 'brak odp.' } })" }) -join ', ')
+    $portTxt = (@($state.Keys | Sort-Object | ForEach-Object { "$_ $(& $stName $state[$_])" }) -join ', ')
     [pscustomobject]@{
         Class = $class; Cause = $cause; Remedy = $remedy; Code = $cls.Code; Notes = ($notes -join '; ')
-        Ip = "$ip"; Ptr = $ptr; Ping = $pingOk; Ports = $portTxt; Port5985 = "$($state[5985])"
+        Ip = "$ip"; Ptr = $ptr; Ping = $pingOk; Ports = $portTxt; Port5985 = "$w"
         AdFound = $(if ($ad) { $ad.Found } else { $null }); AdEnabled = $(if ($ad) { $ad.Enabled } else { $null })
         AdLastLogonDays = $(if ($ad) { $ad.LastLogonDays } else { $null }); AdOS = $(if ($ad) { $ad.OS } else { '' })
         Checks = [object[]]$checks.ToArray(); DurationSec = [math]::Round($sw.Elapsed.TotalSeconds, 1)
@@ -2826,18 +3152,32 @@ try {
             # błąd kolektora z wersją PowerShell, a nie „brak połączenia”
             $boot = {
                 param([string]$Text, [object[]]$CArgs)
+                # PowerShell 2.0 (2008 R2 bez WMF): kolektor się nie skompiluje, a ConvertTo-Json poniżej nie istnieje – komunikat bez poleceń
+                if ($PSVersionTable.PSVersion.Major -lt 3) { return ('{"Fatal":"PowerShell ' + $PSVersionTable.PSVersion + ' na serwerze jest za stary – kolektor wymaga PowerShell 4.0 lub nowszego (WMF 5.1)"}') }
                 $sb = $null
                 try { $sb = [scriptblock]::Create($Text) }
                 catch { return ('{"Fatal":' + (ConvertTo-Json ("kolektor nie kompiluje się w PowerShell $($PSVersionTable.PSVersion): $($_.Exception.Message)") -Compress) + '}') }
-                # błąd nieterminujący wypisany poza sekcjami kolektora (np. przez moduł) wraca jako tekst – w strumieniu błędów sesji stacja wzięłaby go za błąd połączenia
-                & $sb @CArgs 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { '@@SRERR@@' + "$($_.CategoryInfo.Reason): $($_.Exception.Message)" } else { $_ } }
+                if (-not $sb) { return }
+                # błąd nieterminujący wypisany poza sekcjami kolektora (np. przez moduł) wraca jako tekst – w strumieniu błędów sesji stacja wzięłaby go za błąd połączenia;
+                # JSON czeka na znacznik czasu serwera: znacznik dociera do stacji przed wielomegabajtowym JSON-em (różnica zegarów bez czasu przesyłu danych)
+                $held = New-Object System.Collections.ArrayList
+                & $sb @CArgs 2>&1 | ForEach-Object {
+                    if ($_ -is [System.Management.Automation.ErrorRecord]) { '@@SRERR@@' + "$($_.CategoryInfo.Reason): $($_.Exception.Message)" }
+                    elseif ($_ -is [string] -and $_.StartsWith('{')) { [void]$held.Add($_) }
+                    elseif ($_ -is [string] -and $_.StartsWith('@@SRTIME@@')) { $_; $held.ToArray(); $held.Clear() }
+                    else { $_ }
+                }
+                $held.ToArray()
             }
             # bez ErrorAction Stop: błąd wypisany na serwerze nie przerywa odbioru danych; błędy połączenia rozpoznajemy po typie (Test-RemotingTransportError)
             $icErr = $null
             $ic = @{ ComputerName = $Target; ScriptBlock = $boot; ArgumentList = @($Opt.CollectorText, [object[]]$Opt.CollectorArgs); SessionOption = $so; ErrorAction = 'SilentlyContinue'; ErrorVariable = 'icErr' }
             if ($Opt.Credential) { $ic.Credential = $Opt.Credential }
-            $out = @(Invoke-Command @ic)
-            $res.ReceivedUtc = [DateTime]::UtcNow
+            # moment odbioru = przyjście znacznika czasu serwera (wyprzedza JSON, patrz $boot), nie koniec przesyłu danych i zamykania sesji
+            $out = @(Invoke-Command @ic | ForEach-Object { if (-not $res.ReceivedUtc -and $_ -is [string] -and $_.StartsWith('@@SRTIME@@')) { $res.ReceivedUtc = [DateTime]::UtcNow }; $_ })
+            if (-not $res.ReceivedUtc) { $res.ReceivedUtc = [DateTime]::UtcNow }
+            # dane odebrane (albo błąd połączenia): przetwarzanie na stacji (parsowanie, zapis, porównanie) i diagnostyka mają własny limit czasu
+            try { $Sync.Started[$Target] = [DateTime]::UtcNow } catch {}
             $strs = @($out | Where-Object { $_ -is [string] })
             $json = $strs | Where-Object { $_.StartsWith('{') } | Select-Object -Last 1
             $mark = $strs | Where-Object { $_.StartsWith('@@SRTIME@@') } | Select-Object -Last 1
@@ -3044,14 +3384,14 @@ $script:Headers = @{
     Proto = 'Protokół'; Port = 'Port'; Address = 'Adres'; Scope = 'Nasłuch na'; Process = 'Proces'; Service = 'Usługa'; PID = 'PID'
     Direction = 'Kierunek'; Remote = 'Adres zdalny'; RemotePort = 'Port zdalny'; LocalPort = 'Port lokalny'; Network = 'Sieć'; Count = 'Liczba'
     Name = 'Nazwa'; DisplayName = 'Nazwa wyświetlana'; State = 'Stan'; StartMode = 'Uruchamianie'; Account = 'Konto'; Vendor = 'Producent'
-    Microsoft = 'Microsoft'; Unquoted = 'Niecytowana ścieżka'; Path = 'Ścieżka'
+    Microsoft = 'Microsoft'; Unquoted = 'Niecytowana ścieżka'; Path = 'Ścieżka'; ExitCode = 'Kod wyjścia'; Trigger = 'Start wyzwalany zdarzeniem'
     RunAs = 'Uruchom jako'; LastRun = 'Ostatnio'; Result = 'Kod'; ResultText = 'Wynik'; Failed = 'Błąd'; NextRun = 'Następne'; Author = 'Autor'; Action = 'Akcja'
     Log = 'Dziennik'; Level = 'Poziom'; Source = 'Źródło'; Id = 'ID'; First = 'Pierwsze'; Last = 'Ostatnie'; Message = 'Komunikat'
     Time = 'Czas'; Type = 'Typ'; Detail = 'Szczegóły'; Event = 'Zdarzenie'; By = 'Wykonał'
     Version = 'Wersja'; Publisher = 'Wydawca'; InstallDate = 'Instalacja'; InstallDays = 'Dni temu'; Arch = 'Arch.'; Location = 'Lokalizacja'
     Group = 'Grupa'; Member = 'Członek'; Enabled = 'Włączone'; LastLogon = 'Ostatnie logowanie'; PasswordLastSet = 'Zmiana hasła'
-    PasswordNeverExpires = 'Hasło nie wygasa'; SID = 'SID'; Access = 'Uprawnienia udziału'; EveryoneWrite = 'Wszyscy: zapis'; Command = 'Polecenie'
-    Subject = 'Podmiot'; Issuer = 'Wystawca'; NotAfter = 'Ważny do'; DaysLeft = 'Dni do wygaśnięcia'; PrivateKey = 'Klucz prywatny'; Thumbprint = 'Odcisk'
+    PasswordNeverExpires = 'Hasło nie wygasa'; SID = 'SID'; Access = 'Uprawnienia udziału'; EveryoneWrite = 'Zapis dla wszystkich'; Command = 'Polecenie'
+    Subject = 'Podmiot'; Issuer = 'Wystawca'; NotAfter = 'Ważny do'; DaysLeft = 'Dni do wygaśnięcia'; PrivateKey = 'Klucz prywatny'; Thumbprint = 'Odcisk'; Store = 'Magazyn'
     Folder = 'Folder'; File = 'Plik'; SizeKB = 'Rozmiar [KB]'; Modified = 'Zmodyfikowano'; Executable = 'Wykonywalny'
     UptimeDays = 'Uptime [dni]'; CPU = 'CPU'; MemGB = 'RAM [GB]'; DynamicMem = 'Pamięć dynamiczna'; Gen = 'Generacja'; Replication = 'Replikacja'
     IntegrationServices = 'Usługi integracji'; DisksGB = 'Dyski [GB]'; VM = 'Maszyna'; Created = 'Utworzono'; AgeDays = 'Wiek [dni]'
@@ -3063,9 +3403,9 @@ $script:Headers = @{
     Server = 'Serwer'; OS = 'System'; RAM = 'RAM [%]'; MinDiskPct = 'Min. wolne na dysku [%]'; Crit = 'Krytyczne'; Warn = 'Ostrzeżenia'; PatchDays = 'Dni od aktualizacji'
     ScanSec = 'Skan [s]'; Scanned = 'Skanowano'
     ComputerName = 'Nazwa komputera'; FQDN = 'FQDN'; Build = 'Kompilacja'; OSInstallDate = 'Instalacja systemu'; LastBoot = 'Ostatni start'
-    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
+    Model = 'Model'; CPUName = 'Procesor'; Cores = 'Procesory logiczne'; CpuLoad = 'Obciążenie CPU (chwilowe) [%]'; RamGB = 'RAM [GB]'; RamUsedPct = 'Użycie RAM [%]'; RamFreeGB = 'Wolny RAM [GB]'
     Domain = 'Domena'; DomainRole = 'Rola w domenie'; IsDC = 'Kontroler domeny'; PendingReboot = 'Oczekujący restart'; LastHotfix = 'Ostatnia aktualizacja'
-    LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Host Hyper-V'; TimeZone = 'Strefa czasowa'
+    LastHotfixDays = 'Dni od aktualizacji'; WSUS = 'Serwer WSUS'; Roles = 'Zainstalowane role'; IsHyperV = 'Rola Hyper-V (serwer jest hostem)'; TimeZone = 'Strefa czasowa'
     PSVersion = 'Wersja PowerShell'; AV = 'Antywirus'
     LicenseStatus = 'Aktywacja Windows'; LicenseStatusId = 'Aktywacja (kod)'; LicenseChannel = 'Kanał licencji'; LicenseGraceDays = 'Aktywacja: pozostało dni'; KmsHost = 'Serwer KMS'
     Subcategory = 'Podkategoria'; Guid = 'GUID'; Setting = 'Ustawienie'; Required = 'Wymagane'
@@ -3076,6 +3416,7 @@ $script:Headers = @{
     Profile = 'Profil sieci'; DomainRoleId = 'Rola w domenie (kod)'; BuildNumber = 'Numer kompilacji'; CommitLimitGB = 'Limit pamięci wirtualnej [GB]'; CommitUsedPct = 'Użycie pamięci wirtualnej [%]'
     PageFileAuto = 'Plik stronicowania zarządzany automatycznie'; PageFiles = 'Pliki stronicowania'; ResourceExhaustion = 'Wyczerpanie pamięci (zdarzenia 2004)'
     TimeSource = 'Źródło czasu (W32Time)'; NtpServer = 'Serwer NTP'; HvTimeSync = 'Czas z hosta Hyper-V'; CollectedUtc = 'Czas zebrania danych (UTC)'; TimeOffsetSec = 'Różnica czasu vs stacja [s]'
+    TimeSyncWarn = 'Ostrzeżenia usługi czasu (zdarzenia)'; TimeSyncNoSync = 'Brak synchronizacji czasu od doby (zdarzenia 36)'; TimeSyncLast = 'Ostatnie ostrzeżenie usługi czasu'; ForestRoot = 'Domena główna lasu'; PrivAccounts = 'Konta uprzywilejowane domeny'
     Down = 'Wyłączenie'; Up = 'Start'; DowntimeMin = 'Przestój [min]'; Initiator = 'Zainicjował'; Reason = 'Przyczyna'; Sec = 'Czas [s]'
     CpuUsage = 'CPU [%]'; MemStartupGB = 'RAM startowy [GB]'; ReplicationMode = 'Tryb replikacji'; Checkpoints = 'Checkpointy'; CheckpointType = 'Typ checkpointów'
     AutoStop = 'Przy wyłączeniu hosta'; IntegrationVersion = 'Wersja usług integracji'; GuestOS = 'System gościa'; GuestFQDN = 'Nazwa gościa (FQDN)'
@@ -3134,7 +3475,8 @@ function Export-RowsToCsv($Rows, [string]$Path) {
     $skip = 'Flag', 'Key', 'Rows', 'SevColor', 'SevBg', 'Rank', 'ServerKey', 'Section', 'IssueKey', '_Search', 'Ignored'
     $out = foreach ($r in $Rows) {
         $h = [ordered]@{}
-        foreach ($p in $r.PSObject.Properties) { if ($skip -notcontains $p.Name -and $p.Name -notlike '_*') { $h[(Get-Header $p.Name)] = Protect-CsvCell $p.Value } }   # '_*' – pola wewnętrzne, niewidoczne w tabelach
+        # nagłówek też przez Protect-CsvCell – nazwy kolumn spoza listy nagłówków pochodzą z danych serwera (JSON migawki)
+        foreach ($p in $r.PSObject.Properties) { if ($skip -notcontains $p.Name -and $p.Name -notlike '_*') { $h[(Protect-CsvCell (Get-Header $p.Name))] = Protect-CsvCell $p.Value } }   # '_*' – pola wewnętrzne, niewidoczne w tabelach
         [pscustomobject]$h
     }
     @($out) | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding UTF8
@@ -3150,13 +3492,19 @@ function New-Issue($ServerKey, $Severity, $Category, $Message, $Section) {
         _Search = ("$srv $Category $Message").ToLowerInvariant()
     }
 }
+$script:LegacyIssueKeys = @{}   # klucz problemu → ten sam problem w dawnym formacie klucza (reguły wyciszeń zapisane przed zmianą)
 function Get-IssueKey([string]$Category, [string]$Section, [string]$Message) {
-    # Stały klucz problemu do wyciszania: wartości (wolne %, dni, liczniki, daty, adresy) zastąpione '#', żeby reguła działała
-    # przy kolejnych skanach. Cyfry będące częścią nazwy (SRV01, APP-02, KB5034441, 0x80090322) i numery po „ID”, „port”, „kod”
-    # zostają – wyciszenie jednej maszyny, zdarzenia albo portu nie może wyciszać innych.
-    $m = ("$Message" -replace '(?<![\p{L}\d_])(?<!\p{L}-)(?<!(?:ID|Id|port|portu|kod|KB) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '\s+', ' ').Trim()
-    "$Category|$Section|$m"
+    # Stały klucz problemu do wyciszania: wartości (wolne %, dni, liczniki, daty, adresy, także ze znakiem minus) zastąpione '#', żeby reguła
+    # działała przy kolejnych skanach. Cyfry będące częścią nazwy (SRV01, APP-02, KB5034441, 0x80090322), numery po „ID”, „port”, „kod”
+    # i wersje (SSL 3.0, TLS 1.0, Windows Server 2016, .NET 4) zostają – wyciszenie jednej maszyny, zdarzenia, portu albo wersji nie może wyciszać innych.
+    $m = ("$Message" -replace '(?<![\p{L}\d_])(?<!\d[.,:])(?<!\p{L}-)(?<!(?:ID|port|portu|kod|KB|SSL|TLS|Server|Windows|NET) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '(?<![\p{L}\d#-])-#', '#' -replace '\s+', ' ').Trim()
+    $key = "$Category|$Section|$m"
+    # dawny format (wersje zamieniane na '#', minus poza '#') – tylko do dopasowania starszych reguł wyciszeń (Test-IssueIgnored)
+    $old = "$Category|$Section|" + ("$Message" -replace '(?<![\p{L}\d_])(?<!\p{L}-)(?<!(?:ID|Id|port|portu|kod|KB) )\d+(?:[.,:]\d+)*(?![\p{L}\d_])', '#' -replace '\s+', ' ').Trim()
+    if ($old -cne $key) { $l = $script:LegacyIssueKeys[$key]; if (-not $l) { $script:LegacyIssueKeys[$key] = $old } elseif (@($l) -notcontains $old) { $script:LegacyIssueKeys[$key] = @($l) + $old } }
+    $key
 }
+function Get-IssueKeyVariants([string]$IssueKey) { @($IssueKey) + @($script:LegacyIssueKeys[$IssueKey] | Where-Object { $_ }) }
 #endregion
 
 #region ── Dziennik operacji i dziennik dostępności ────────────────────────────
@@ -3179,7 +3527,7 @@ function Write-Log {
             if ($items.Count -ge 3000) { for ($i = 0; $i -lt 500; $i++) { $items.RemoveAt(0) } }
             $entry = [pscustomobject]@{ Time = $now.ToString('HH:mm:ss'); Level = $Level; Module = $Module; Message = $Message; _Search = ("$Module $Message").ToLowerInvariant() }
             $items.Add($entry)
-            if ($ui -and $ui['logList'] -and $ui.logPanel.Visibility -eq 'Visible') { $ui.logList.ScrollIntoView($entry) }
+            if ($ui -and $ui['logList'] -and $ui.logPanel.Visibility -eq 'Visible') { if (Test-LogAtEnd) { $ui.logList.ScrollIntoView($entry) } }
             elseif ($Level -in 'WARN', 'ERROR') { $script:LogUnread++; Update-LogBadge }
         } catch { }
     } else {
@@ -3192,6 +3540,18 @@ function Write-Log {
         $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] [{2}] {3}' -f $now, $Level, $Module, ($Message -replace '\r?\n', ' | ')
         [IO.File]::AppendAllText($file, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
     } catch { $script:LogFailed = $true }
+}
+$script:LogScroll = $null
+function Test-LogAtEnd {
+    # Nowy wpis przewija listę tylko wtedy, gdy widać jej koniec – użytkownik przewinięty wyżej czyta (albo zaznacza do skopiowania) starsze wpisy
+    $sv = $script:LogScroll
+    if (-not $sv) {
+        $b = if ([System.Windows.Media.VisualTreeHelper]::GetChildrenCount($ui.logList)) { [System.Windows.Media.VisualTreeHelper]::GetChild($ui.logList, 0) }
+        $sv = if ($b -and [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($b)) { [System.Windows.Media.VisualTreeHelper]::GetChild($b, 0) }
+        if ($sv -isnot [System.Windows.Controls.ScrollViewer]) { return $true }   # szablon listy jeszcze niezbudowany
+        $script:LogScroll = $sv
+    }
+    $sv.VerticalOffset -ge $sv.ScrollableHeight - 1
 }
 function Update-LogBadge {
     if (-not $ui -or -not $ui['logBadge']) { return }
@@ -3206,14 +3566,12 @@ function Add-AvailabilityRecord {
     param([string]$Name, [string]$Status, $DurationSec, [int]$Crit = 0, [int]$Warn = 0, [string]$Class = '', [string]$Detail = '')
     $now = Get-Date
     try {
-        if (-not (Test-Path -LiteralPath $Config.LogDir)) { New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null }
-        $file = Join-Path $Config.LogDir ('Availability_{0:yyyyMM}.csv' -f $now)
         $dur = if ("$DurationSec" -ne '') { ([double]$DurationSec).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) } else { '' }
         $line = (@(('{0:yyyy-MM-dd HH:mm:ss}' -f $now), $Name, $Status, $dur, $Crit, $Warn, $Class, (ConvertTo-CsvSafe $Detail)) | ForEach-Object { ConvertTo-CsvSafe "$_" }) -join ';'
-        if (-not (Test-Path -LiteralPath $file)) {
-            [IO.File]::WriteAllText($file, 'Czas;Serwer;Status;CzasSkanu;Krytyczne;Ostrzezenia;Rodzaj;Szczegoly' + [Environment]::NewLine, (New-Object Text.UTF8Encoding $true))
-        }
-        [IO.File]::AppendAllText($file, $line + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
+        $script:AvailPending.Add($line)
+        Write-AvailabilityPending
+        $k = $Name.ToLowerInvariant()
+        if ($script:AvailLines) { if (-not $script:AvailLines.ContainsKey($k)) { $script:AvailLines[$k] = New-Object System.Collections.Generic.List[string] }; $script:AvailLines[$k].Add($line) }
     } catch { Write-Log "Nie zapisano dziennika dostępności: $($_.Exception.Message)" 'WARN' 'Dziennik' }
     # Statystyka 30 dni (kolumna „Dostępność” w tabeli stanu serwerów)
     if ($script:AvailStats) {
@@ -3227,8 +3585,34 @@ function Add-AvailabilityRecord {
     }
     $script:HistoryCache.Remove($Name.ToLowerInvariant())
 }
+# Wiersze jeszcze niezapisane: plik otwarty w Excelu (albo dopisywany w tej chwili przez skan bez okna) blokuje zapis – dopisujemy je przy następnej okazji
+$script:AvailPending = New-Object System.Collections.Generic.List[string]
+$script:AvailWarned  = $false
+function Write-AvailabilityPending {
+    if (-not $script:AvailPending.Count) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $Config.LogDir)) { New-Item -ItemType Directory -Path $Config.LogDir -Force | Out-Null }
+        while ($script:AvailPending.Count) {
+            $mon = $script:AvailPending[0].Substring(0, 7)   # każdy wiersz do pliku swojego miesiąca (RRRR-MM)
+            $part = [string[]]@($script:AvailPending | Where-Object { $_.StartsWith($mon, [StringComparison]::Ordinal) })
+            $file = Join-Path $Config.LogDir ('Availability_{0}.csv' -f $mon.Replace('-', ''))
+            $fi = New-Object IO.FileInfo $file
+            if (-not $fi.Exists) { [IO.File]::WriteAllText($file, 'Czas;Serwer;Status;CzasSkanu;Krytyczne;Ostrzezenia;Rodzaj;Szczegoly' + [Environment]::NewLine, (New-Object Text.UTF8Encoding $true)) }
+            $len0 = if ($fi.Exists) { $fi.Length } else { -1 }
+            [IO.File]::AppendAllText($file, ($part -join [Environment]::NewLine) + [Environment]::NewLine, (New-Object Text.UTF8Encoding $false))
+            # plik zmieniony tylko przez ten program – bez ponownego wczytywania w Sync-AvailabilityStats
+            if ($file -eq $script:AvailSync.File -and $len0 -eq $script:AvailSync.Len) { $fi.Refresh(); $script:AvailSync.Len = $fi.Length }
+            for ($i = $script:AvailPending.Count - 1; $i -ge 0; $i--) { if ($script:AvailPending[$i].StartsWith($mon, [StringComparison]::Ordinal)) { $script:AvailPending.RemoveAt($i) } }
+        }
+        if ($script:AvailWarned) { $script:AvailWarned = $false; Write-Log 'Dopisano zaległe wpisy dziennika dostępności.' 'INFO' 'Dziennik' }
+    } catch {
+        if ($script:AvailPending.Count -gt 20000) { $script:AvailPending.RemoveRange(0, $script:AvailPending.Count - 20000) }
+        # jedno ostrzeżenie na okres blokady, nie po jednym na każdy serwer skanu
+        if (-not $script:AvailWarned) { $script:AvailWarned = $true; Write-Log "Nie zapisano dziennika dostępności (plik otwarty w innym programie, np. w Excelu?) – wpisy zostaną dopisane później: $($_.Exception.Message)" 'WARN' 'Dziennik' }
+    }
+}
 function Read-AvailabilityLines([int]$Months) {
-    # Wiersze z ostatnich N plików miesięcznych (od najstarszego)
+    # Wiersze z ostatnich N plików miesięcznych (od najstarszego) i wiersze czekające na zapis
     $files = @()
     for ($i = $Months - 1; $i -ge 0; $i--) {
         $f = Join-Path $Config.LogDir ('Availability_{0:yyyyMM}.csv' -f (Get-Date).AddMonths(-$i))
@@ -3237,6 +3621,7 @@ function Read-AvailabilityLines([int]$Months) {
     foreach ($f in $files) {
         try { foreach ($l in [IO.File]::ReadLines($f, [Text.Encoding]::UTF8)) { if ($l -and -not $l.StartsWith('Czas;')) { $l } } } catch { }
     }
+    foreach ($l in $script:AvailPending) { $l }
 }
 $script:HistoryCache = @{}
 function Get-AvailabilityHistory([string]$Name) {
@@ -3244,28 +3629,40 @@ function Get-AvailabilityHistory([string]$Name) {
     $k = $Name.ToLowerInvariant()
     if ($script:HistoryCache.ContainsKey($k)) { return $script:HistoryCache[$k] }
     $rows = New-Object System.Collections.Generic.List[object]
-    foreach ($l in (Read-AvailabilityLines 3)) {
+    # wiersze tego serwera z pamięci (Initialize-AvailabilityStats) – bez czytania plików z 3 miesięcy przy każdym kliknięciu serwera
+    $src = if ($script:AvailLines) { $script:AvailLines[$k] } else { Read-AvailabilityLines 3 }
+    foreach ($l in $src) {
         $c = $l.Split(';')
         if ($c.Count -lt 8 -or -not [string]::Equals($c[1], $Name, [StringComparison]::OrdinalIgnoreCase)) { continue }
         $flag = switch ($c[2]) { 'OK' { '' } 'Brak połączenia' { 'crit' } 'Limit czasu' { 'warn' } default { 'info' } }
         $rows.Add([pscustomobject]@{ Time = $c[0]; Status = $c[2]; DurationSec = $c[3]; Crit = $c[4]; Warn = $c[5]; Class = $c[6]; Detail = $c[7]; Flag = $flag })
     }
     $rows.Reverse()
+    # na czerwono/żółto tylko bieżąca seria niepowodzeń – wcześniejsze, po których był udany skan, zostają jako informacja
+    $okSeen = $false
+    foreach ($r in $rows) { if ($r.Status -eq 'OK') { $okSeen = $true } elseif ($okSeen -and $r.Flag -in 'crit', 'warn') { $r.Flag = 'info' } }
     $res = [object[]]$rows.ToArray()
     $script:HistoryCache[$k] = $res
     $res
 }
 $script:AvailStats = $null
+$script:AvailLines = $null   # wiersze dziennika dostępności z 3 miesięcy według serwera (sekcja Historia)
+$script:AvailSync  = @{ Date = $null; File = ''; Len = -1 }
 function Initialize-AvailabilityStats {
     # Jedno przejście po dzienniku z 3 miesięcy; potem aktualizowane przy każdym wyniku (Add-AvailabilityRecord)
     $stats = @{}
+    $lines = @{}
     $cut = (Get-Date).AddDays(-30).ToString('yyyy-MM-dd HH:mm:ss')
+    $cur = Join-Path $Config.LogDir ('Availability_{0:yyyyMM}.csv' -f (Get-Date))
+    $len = try { $fi = New-Object IO.FileInfo $cur; if ($fi.Exists) { $fi.Length } else { -1 } } catch { -1 }
     foreach ($l in (Read-AvailabilityLines 3)) {
         $c = $l.Split(';')
         if ($c.Count -lt 8) { continue }
         $k = $c[1].ToLowerInvariant()
         $st = $stats[$k]
         if (-not $st) { $st = @{ Seen = 0; Ok = 0; LastOk = ''; LastFail = ''; FailSince = '' }; $stats[$k] = $st }
+        if (-not $lines.ContainsKey($k)) { $lines[$k] = New-Object System.Collections.Generic.List[string] }
+        $lines[$k].Add($l)
         # procent dostępności z 30 dni; „bez połączenia od” i „ostatni udany” z całego okresu dziennika (dłuższe awarie)
         if ([string]::CompareOrdinal($c[0], $cut) -ge 0) { $st.Seen++; if ($c[2] -eq 'OK') { $st.Ok++ } }
         $t = $c[0].Substring(0, [Math]::Min(16, $c[0].Length))
@@ -3273,6 +3670,17 @@ function Initialize-AvailabilityStats {
         elseif ($c[2] -eq 'Brak połączenia') { $st.LastFail = $t; if (-not $st.FailSince) { $st.FailSince = $t } }
     }
     $script:AvailStats = $stats
+    $script:AvailLines = $lines
+    $script:AvailSync = @{ Date = (Get-Date).Date; File = $cur; Len = $len }
+    $script:HistoryCache.Clear()
+}
+function Sync-AvailabilityStats {
+    # Długo otwarte okno: okno 30 dni przesuwa się co dobę, a wiersze dopisane przez inny proces (skan bez okna z Harmonogramu zadań)
+    # zmieniają długość pliku – wtedy statystyka i historia od nowa z plików. Wywoływane przed wczytaniem wyników i po skanie.
+    Write-AvailabilityPending
+    if (-not $script:AvailStats) { return }
+    $len = try { $fi = New-Object IO.FileInfo $script:AvailSync.File; if ($fi.Exists) { $fi.Length } else { -1 } } catch { -2 }
+    if ($script:AvailSync.Date -ne (Get-Date).Date -or $len -ne $script:AvailSync.Len) { Initialize-AvailabilityStats }
 }
 function Remove-OldLogs {
     $days = [int]$Config.LogRetentionDays
@@ -3281,8 +3689,9 @@ function Remove-OldLogs {
     $cutMonth = $cut.ToString('yyyyMM')
     foreach ($f in @(Get-ChildItem -LiteralPath $Config.LogDir -File -ErrorAction SilentlyContinue)) {
         try {
-            if ($f.Name -match '^ServerReview_(\d{8})\.log$' -and $Matches[1] -lt $cut.ToString('yyyyMMdd')) { Remove-Item -LiteralPath $f.FullName -Force }
-            elseif ($f.Name -match '^Availability_(\d{6})\.csv$' -and $Matches[1] -lt $cutMonth) { Remove-Item -LiteralPath $f.FullName -Force }
+            # -ErrorAction Stop: plik zablokowany albo bez uprawnień trafia do catch (domyślnie Remove-Item zgłasza błąd niekończący)
+            if ($f.Name -match '^ServerReview_(\d{8})\.log$' -and $Matches[1] -lt $cut.ToString('yyyyMMdd')) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
+            elseif ($f.Name -match '^Availability_(\d{6})\.csv$' -and $Matches[1] -lt $cutMonth) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop }
         } catch { Write-Log "Nie usunięto starego dziennika $($f.Name): $($_.Exception.Message)" 'WARN' 'Dziennik' }
     }
 }
@@ -3293,12 +3702,21 @@ function Remove-OldLogs {
 # Indeks budowany raz (jedno przejście po folderach) i uzupełniany przy zapisie – bez przeszukiwania dysku dla każdego serwera.
 $script:SnapIndex = @{}
 function Get-SnapshotKey([string]$Name) { (Get-SafeName $Name).ToLowerInvariant() }
+function Test-SnapshotDirName([string]$Name) { $Name -match '^\d{8}_\d{6}(_\d+)?$' }   # folder skanu programu (RRRRMMDD_GGMMSS albo z przyrostkiem _2, _3…)
+function Get-SnapshotDirs {
+    # Tylko foldery skanów, od najnowszego; własne foldery użytkownika (np. „archiwum”, „_kopia”) nie są migawkami ani nie podlegają porządkom.
+    # Klucz sortowania stałej długości (przyrostek dopełniony zerami) – kolejność nie zależy od ustawień regionalnych, _10 jest po _9
+    try { @([IO.Directory]::GetDirectories($Config.SnapshotDir) | Where-Object { Test-SnapshotDirName ([IO.Path]::GetFileName($_)) } | Sort-Object -Descending { $n = [IO.Path]::GetFileName($_); $n.Substring(0, 15) + '_' + $(if ($n.Length -gt 15) { $n.Substring(16).PadLeft(6, '0') } else { '000001' }) }) }
+    catch { Write-Log "Nie można odczytać folderu migawek $($Config.SnapshotDir): $($_.Exception.Message)" 'WARN' 'Migawki'; @() }
+}
 function Update-SnapshotIndex {
     $idx = @{}
     if (Test-Path -LiteralPath $Config.SnapshotDir) {
-        foreach ($dir in @([IO.Directory]::GetDirectories($Config.SnapshotDir) | Sort-Object -Descending)) {
+        foreach ($dir in (Get-SnapshotDirs)) {
             $dn = [IO.Path]::GetFileName($dir)
-            foreach ($f in [IO.Directory]::GetFiles($dir)) {
+            # folder bez uprawnień albo usunięty w trakcie (porządki skanu bez okna) nie przerywa wczytywania pozostałych
+            $files = @(); try { $files = [IO.Directory]::GetFiles($dir) } catch { Write-Log "Pominięto folder migawek $dir`: $($_.Exception.Message)" 'WARN' 'Migawki'; continue }
+            foreach ($f in $files) {
                 $fn = [IO.Path]::GetFileName($f)
                 if ($fn -notmatch '^(.+?)(\.offline)?\.json(\.gz)?$') { continue }
                 $k = $Matches[1].ToLowerInvariant()
@@ -3345,20 +3763,23 @@ function Remove-OldSnapshots {
     $removed = 0
     foreach ($k in @($script:SnapIndex.Keys)) {
         $list = $script:SnapIndex[$k]
-        # ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych (znaczniki niedostępności też się liczą do limitu)
+        # ostatnia udana migawka zostaje zawsze – długo niedostępny serwer nie traci ostatnich znanych danych (znaczniki niedostępności też się liczą do limitu);
+        # najnowsza pozycja też – to wynik właśnie zakończonego skanu (znacznik niedostępności albo nowe dane)
         $lastOn = $null; foreach ($x in $list) { if (-not $x.Offline) { $lastOn = $x; break } }
         $i = $list.Count - 1
-        while ($list.Count -gt $keep -and $i -ge 0) {
+        $stuck = 0
+        while ($list.Count - $stuck -gt $keep -and $i -ge 0) {
             $e = $list[$i]
-            if ([object]::ReferenceEquals($e, $lastOn)) { $i--; continue }
-            try { if (Test-Path -LiteralPath $e.Path) { Remove-Item -LiteralPath $e.Path -Force }; $removed++ }
-            catch { Write-Log "Nie usunięto starej migawki $($e.Path): $($_.Exception.Message)" 'WARN' 'Migawki' }
-            $list.RemoveAt($i)
+            if ($i -eq 0 -or [object]::ReferenceEquals($e, $lastOn)) { $i--; continue }
+            # z indeksu tylko po udanym usunięciu – zablokowany plik (antywirus, kopia zapasowa) zostaje w indeksie (ponowna próba przy
+            # następnych porządkach), ale nie zajmuje miejsca w limicie – inaczej zamiast niego znikałyby nowsze migawki
+            try { if (Test-Path -LiteralPath $e.Path) { Remove-Item -LiteralPath $e.Path -Force -ErrorAction Stop; $removed++ }; $list.RemoveAt($i) }
+            catch { Write-Log "Nie usunięto starej migawki $($e.Path): $($_.Exception.Message)" 'WARN' 'Migawki'; $stuck++ }
             $i--
         }
     }
     if (Test-Path -LiteralPath $Config.SnapshotDir) {
-        foreach ($dir in @([IO.Directory]::GetDirectories($Config.SnapshotDir))) {
+        foreach ($dir in (Get-SnapshotDirs)) {
             # tylko stare puste foldery – świeży może należeć do skanu, który jeszcze nic nie zapisał (np. drugiej instancji)
             try { if (([DateTime]::Now - [IO.Directory]::GetCreationTime($dir)).TotalSeconds -gt [int]$Config.ScanTimeoutSec -and -not [IO.Directory]::EnumerateFileSystemEntries($dir).GetEnumerator().MoveNext()) { [IO.Directory]::Delete($dir) } } catch { }
         }
@@ -3372,6 +3793,26 @@ function Test-WritableFolder([string]$Path) {
         [IO.File]::WriteAllText($t, 'x'); [IO.File]::Delete($t)
         $true
     } catch { $false }
+}
+function Get-DataFolderWarning {
+    # Migawki to mapa ataku na całą domenę (administratorzy, udziały, porty, słabości konfiguracji). Folder danych czytelny dla zwykłych
+    # użytkowników (Wszyscy, Użytkownicy, Użytkownicy domeny…) – tylko ostrzeżenie w dzienniku; uprawnień nie zmieniamy (skan z Harmonogramu
+    # zadań może działać na innym koncie, zespół może używać wspólnego folderu). Sprawdzany folder programu i każdy folder danych: raporty Full,
+    # dzienniki i settings.json (adres webhooka, odbiorcy) leżą obok migawek – ograniczenie samych Snapshots nie wystarcza
+    $names = @{ 'S-1-1-0' = 'Wszyscy'; 'S-1-5-11' = 'Użytkownicy uwierzytelnieni'; 'S-1-5-32-545' = 'Użytkownicy'; 'S-1-5-7' = 'Logowanie anonimowe' }
+    foreach ($p in @(@($Base, $Config.SnapshotDir, $Config.ReportDir, $Config.LogDir, $Config.CacheDir) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {
+        try {
+            $acl = [IO.Directory]::GetAccessControl($p, [System.Security.AccessControl.AccessControlSections]::Access)
+            $who = @(@(foreach ($r in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+                $sid = "$($r.IdentityReference.Value)"
+                $fr = [int]$r.FileSystemRights   # odczyt danych (1), GENERIC_ALL (0x10000000) albo GENERIC_READ (bit znaku) we wpisach dziedziczonych
+                if ("$($r.AccessControlType)" -ne 'Allow' -or -not (($fr -band 0x10000001) -or $fr -lt 0)) { continue }
+                if ($names.ContainsKey($sid)) { $names[$sid] } elseif ($sid -match '^S-1-5-21-[\d-]+-513$') { 'Użytkownicy domeny' }
+            }) | Select-Object -Unique)
+        } catch { continue }   # nieczytelne uprawnienia jednego folderu nie wstrzymują sprawdzenia pozostałych
+        if ($who.Count) { return "Folder danych $p mogą czytać: $($who -join ', '). Migawki i raporty zawierają listy administratorów, udziały, otwarte porty i słabości konfiguracji serwerów, a settings.json adres webhooka – ogranicz uprawnienia folderu $Base (z podfolderami) do administratorów (i konta zadania skanu bez okna)." }
+    }
+    ''
 }
 #endregion
 
@@ -3392,6 +3833,7 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: system i dyski'; Key = 'DiskCritPct';       Type = 'int'; Min = 1; Max = 99;     Label = 'Dysk: krytyczne poniżej [% wolnego]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastDays';     Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: ostrzeżenie, gdy spadnie poniżej progu krytycznego w ciągu [dni]' }
     @{ Group = 'Progi: system i dyski'; Key = 'DiskForecastCritDays'; Type = 'int'; Min = 1; Max = 365; Label = 'Prognoza dysku: krytyczne, gdy zapełni się w ciągu [dni]' }
+    @{ Group = 'Progi: system i dyski'; Key = 'DiskMinFreeGB';     Type = 'int'; Min = 0; Max = 1000000; Label = 'Dysk: krytyczne tylko, gdy wolnego jest też mniej niż [GB] (duże wolumeny; 0 = bez warunku)' }
     @{ Group = 'Progi: system i dyski'; Key = 'RamWarnPct';        Type = 'int'; Min = 1; Max = 100;    Label = 'RAM: ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'CommitWarnPct';     Type = 'int'; Min = 1; Max = 100;    Label = 'Pamięć wirtualna (commit): ostrzeżenie od [%]' }
     @{ Group = 'Progi: system i dyski'; Key = 'UptimeWarnDays';    Type = 'int'; Min = 1; Max = 3650;   Label = 'Uptime: ostrzeżenie powyżej [dni]' }
@@ -3408,7 +3850,7 @@ $script:SettingDefs = @(
     @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'DhcpWarnPct';       Type = 'int'; Min = 1; Max = 100;  Label = 'DHCP: zajętość zakresu – ostrzeżenie od [%]' }
     @{ Group = 'Progi: role (SQL, DHCP)'; Key = 'DhcpCritPct';       Type = 'int'; Min = 1; Max = 100;  Label = 'DHCP: zajętość zakresu – krytyczne od [%]' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'CertWarnDays';       Type = 'int'; Min = 1; Max = 3650;    Label = 'Certyfikaty: ostrzeżenie na [dni] przed wygaśnięciem' }
-    @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba]' }
+    @{ Group = 'Progi: bezpieczeństwo'; Key = 'FailedLogonWarn';    Type = 'int'; Min = 1; Max = 1000000; Label = 'Nieudane logowania: ostrzeżenie od [liczba] prób jednego konta z jednego źródła' }
     @{ Group = 'Progi: bezpieczeństwo'; Key = 'RecentSoftwareDays'; Type = 'int'; Min = 1; Max = 3650;    Label = 'Nowe oprogramowanie: z ostatnich [dni]' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveCheck';        Type = 'bool';                    Label = 'Sprawdzaj brakujące poprawki Windows (CVE) – stacja pobiera dane Microsoft i katalog CISA KEV' }
     @{ Group = 'Podatności (CVE)'; Key = 'CveMonths';       Type = 'int'; Min = 1; Max = 36;  Label = 'Dane CVE z ostatnich [miesięcy]' }
@@ -3432,8 +3874,8 @@ $script:SettingDefs = @(
     @{ Group = 'Diagnostyka i Active Directory'; Key = 'DiagTimeoutMs';  Type = 'int';  Min = 200; Max = 15000; Label = 'Diagnoza niedostępności: limit próby DNS/ping/portu [ms]' }
     @{ Group = 'Diagnostyka i Active Directory'; Key = 'DiagPorts';      Type = 'intlist';                      Label = 'Diagnoza niedostępności: sprawdzane porty TCP (jeden na linię)' }
     @{ Group = 'Diagnostyka i Active Directory'; Key = 'AdSearchBase';   Type = 'string';                       Label = '„Pobierz z AD”: jednostka organizacyjna (DN), puste = cała domena' }
-    @{ Group = 'Diagnostyka i Active Directory'; Key = 'AdInactiveDays'; Type = 'int';  Min = 1;   Max = 3650;  Label = '„Pobierz z AD”: pomijaj konta nieaktywne dłużej niż [dni]' }
-    @{ Group = 'Dane, dziennik i blokada'; Key = 'SnapshotsToKeep';   Type = 'int';  Min = 1; Max = 10000; Label = 'Ile migawek (skanów) każdego serwera przechowywać' }
+    @{ Group = 'Diagnostyka i Active Directory'; Key = 'AdInactiveDays'; Type = 'int';  Min = 14;  Max = 3650;  Label = '„Pobierz z AD”: pomijaj konta nieaktywne dłużej niż [dni] (min. 14 – AD odświeża datę logowania komputera co 9–14 dni)' }
+    @{ Group = 'Dane, dziennik i blokada'; Key = 'SnapshotsToKeep';   Type = 'int';  Min = 2; Max = 10000; Label = 'Ile migawek (skanów) każdego serwera przechowywać (min. 2 – poprzedni skan to podstawa sekcji Zmiany)' }
     @{ Group = 'Dane, dziennik i blokada'; Key = 'CompressSnapshots'; Type = 'bool';                       Label = 'Kompresuj migawki (.json.gz – ok. 10x mniej miejsca)' }
     @{ Group = 'Dane, dziennik i blokada'; Key = 'LogRetentionDays';  Type = 'int';  Min = 7; Max = 3650;  Label = 'Przechowuj dziennik operacji i dostępności [dni]' }
     @{ Group = 'Dane, dziennik i blokada'; Key = 'LockIdleMinutes';   Type = 'int';  Min = 0; Max = 240;   Label = 'Blokada programu po bezczynności [min] (0 = wyłączona; wymaga PIN-u)' }
@@ -3496,13 +3938,35 @@ function Update-IgnoreSet {
     $script:IgnoreSet = $set
 }
 function Test-IssueIgnored([string]$ServerKey, [string]$IssueKey) {
-    $script:IgnoreSet.Contains("$ServerKey|$IssueKey") -or $script:IgnoreSet.Contains("*|$IssueKey")
+    if ($script:IgnoreSet.Contains("$ServerKey|$IssueKey") -or $script:IgnoreSet.Contains("*|$IssueKey")) { return $true }
+    # reguła zapisana dawnym kluczem (wersje SSL/TLS/systemu zamieniane na '#') nadal wycisza ten problem
+    foreach ($k in @($script:LegacyIssueKeys[$IssueKey])) { if ($k -and ($script:IgnoreSet.Contains("$ServerKey|$k") -or $script:IgnoreSet.Contains("*|$k"))) { return $true } }
+    $false
 }
 function Import-UserSettings {
     $script:SettingsWarning = $null
-    if (-not (Test-Path -LiteralPath $Config.SettingsFile)) { Update-IgnoreSet; return }
+    $f = $Config.SettingsFile
+    # Brak pliku: przerwany zapis starszej wersji (usunięty plik, została kopia .tmp). Plik nieczytelny (np. ręczna edycja z błędem JSON):
+    # kopia .bad_<data> i wczytanie poprzedniej wersji (.bak) – inaczej zamknięcie programu zapisałoby wartości domyślne
+    # w miejsce wyciszeń i PIN-u, bez śladu
+    $src = $f; $why = ''
+    if (-not (Test-Path -LiteralPath $f)) {
+        if (-not (Test-Path -LiteralPath "$f.tmp")) { Update-IgnoreSet; return }
+        $src = "$f.tmp"; $why = "Brak pliku ustawień $f – wczytano kopię z przerwanego zapisu ($src)."
+    }
     try {
-        $j = [IO.File]::ReadAllText($Config.SettingsFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        $j = $null
+        try { $j = [IO.File]::ReadAllText($src, [Text.Encoding]::UTF8) | ConvertFrom-Json; if ($null -eq $j) { throw 'pusty plik' } }
+        catch {
+            $bad = "$src.bad_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            try { Copy-Item -LiteralPath $src -Destination $bad -ErrorAction Stop } catch { $bad = '' }
+            $why = "Nie udało się wczytać ustawień z $src`: $($_.Exception.Message)$(if ($bad) { " (zachowano kopię: $bad)" })."
+            if (-not (Test-Path -LiteralPath "$f.bak")) { throw $why }
+            $j = [IO.File]::ReadAllText("$f.bak", [Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($null -eq $j) { throw $why }
+            $why += " Wczytano poprzednią wersję ($f.bak) – sprawdź ustawienia i wyciszenia."
+        }
+        $script:SettingsWarning = $(if ($why) { $why })
         $h = ConvertTo-Hashtable $j
         Set-ConfigFromValues $h
         if ($h.ContainsKey('IgnoredIssues')) { $Config.IgnoredIssues = @(ConvertTo-IgnoreRules $h.IgnoredIssues) }
@@ -3522,7 +3986,7 @@ function Import-UserSettings {
             if ($script:LockCfg.Length -lt 4 -or $script:LockCfg.Length -gt 8 -or -not $script:LockCfg.Salt) { $script:LockCfg.Hash = '' }
         }
     }
-    catch { $script:SettingsWarning = "Nie udało się wczytać ustawień z $($Config.SettingsFile): $($_.Exception.Message). Użyto wartości domyślnych." }
+    catch { $script:SettingsWarning = $(if ($why) { "$why Użyto wartości domyślnych – wyciszenia problemów i PIN blokady nie działają, dopóki ich nie ustawisz." } else { "Nie udało się wczytać ustawień z $src`: $($_.Exception.Message). Użyto wartości domyślnych." }) }
     Update-IgnoreSet
 }
 function Save-UserSettings {
@@ -3533,10 +3997,13 @@ function Save-UserSettings {
     $o.Ui            = [pscustomobject]$script:UiState
     $o.Lock          = [pscustomobject]$script:LockCfg
     $json = [pscustomobject]$o | ConvertTo-Json -Depth 4
-    $tmp = "$($Config.SettingsFile).tmp"
+    $f = $Config.SettingsFile
+    $tmp = "$f.tmp"
     [IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
-    if (Test-Path -LiteralPath $Config.SettingsFile) { [IO.File]::Delete($Config.SettingsFile) }
-    [IO.File]::Move($tmp, $Config.SettingsFile)
+    # podmiana jednym krokiem (poprzednia wersja zostaje jako .bak) – przerwanie zapisu (wylogowanie, zamknięcie systemu) nie zostawia programu bez ustawień
+    if (-not (Test-Path -LiteralPath $f)) { [IO.File]::Move($tmp, $f); return }
+    try { [IO.File]::Replace($tmp, $f, "$f.bak") }
+    catch { [IO.File]::Copy($f, "$f.bak", $true); [IO.File]::Delete($f); [IO.File]::Move($tmp, $f) }   # system plików bez ReplaceFile (np. niektóre udziały)
 }
 $script:IgnoreSet = $null
 $script:ConfigDefaults = Get-ConfigSnapshot
@@ -3571,7 +4038,8 @@ function Invoke-ServerAnalysis {
         $msg   = "Brak połączenia: $cause."
         if ($cls -eq 'Timeout') { $sev = 'Ostrzeżenie'; $msg = "Skan przerwany – przekroczono limit czasu ($($C.ServerTimeoutSec) s); brak aktualnych danych." }
         elseif ($cls -eq 'Remote') { $sev = 'Ostrzeżenie'; $msg = "$cause." }
-        $vmOff = $vm -and "$($vm.Row.State)" -notlike 'Running*'
+        # RunningCritical (utracony dostęp do plików maszyny) jako przyczyna tylko wtedy, gdy gość faktycznie nie odpowiada w sieci
+        $vmOff = $vm -and ("$($vm.Row.State)" -notlike 'Running*' -or ("$($vm.Row.State)" -like '*Critical' -and (Test-NetworkDown $D)))
         if ($vmOff) {
             $vst = "$($vm.Row.State)"
             $since = "$($vm.Row.PSObject.Properties['StateSince'].Value)"
@@ -3586,10 +4054,12 @@ function Invoke-ServerAnalysis {
             $hb = "$($vm.Row.Heartbeat)"
             if ($hb -match '^(LostCommunication|NoContact|Error)') { $msg += " Maszyna działa na hoście $($vm.HostDisplay), ale system gościa nie odpowiada (heartbeat: $hb) – możliwe zawieszenie systemu albo awaria usług integracji." }
             else { $msg += " Maszyna działa na hoście $($vm.HostDisplay)$(if ($hb) { " (heartbeat: $hb)" })." }
+            if ("$($vm.Row.State)" -like '*Critical') { $msg += " Stan maszyny $($vm.Row.State) – Hyper-V nie ma dostępu do części jej plików (wolumen/CSV niedostępny lub pełny)." }
         }
         # host Hyper-V, na którym maszyna ostatnio działała, też nie odpowiada – przyczyną jest najpewniej host (jeden problem krytyczny na hoście)
+        # tylko gdy gość nie odpowiada w sieci: odmowa dostępu, Kerberos, WinRM czy zapora to odpowiedź gościa (nie jest na martwym hoście), DNS nie zależy od hosta
         $hostDown = $false
-        if (-not $vm -and $cls -notin 'Timeout', 'Remote') {
+        if (-not $vm -and (Test-NetworkDown $D)) {
             $hk = Find-ServerKey (Get-LastHvHost $D)
             if ($hk -and $hk -ne $Name -and (Test-NetworkDown $script:Data[$hk])) {
                 $hostDown = $true; $sev = 'Ostrzeżenie'
@@ -3648,7 +4118,9 @@ function Invoke-ServerAnalysis {
     $hNow = Get-Date
     foreach ($r in $D.Disks) {
         $msg = "Dysk $($r.Drive) $($r.Label): wolne $($r.FreePct)% ($($r.FreeGB) z $($r.SizeGB) GB)"
-        if ($r.FreePct -lt $C.DiskCritPct) { AddI 'Krytyczny' 'Dyski' $msg 'Disks'; SetFlag $r 'crit' }
+        # duży wolumen (ustawienie DiskMinFreeGB): mimo niskiego procentu zostaje dużo miejsca – ostrzeżenie zamiast problemu krytycznego
+        $bigOk = [int]$C.DiskMinFreeGB -gt 0 -and [double]$r.FreeGB -ge [int]$C.DiskMinFreeGB
+        if ($r.FreePct -lt $C.DiskCritPct -and -not $bigOk) { AddI 'Krytyczny' 'Dyski' $msg 'Disks'; SetFlag $r 'crit' }
         elseif ($r.FreePct -lt $C.DiskWarnPct) { AddI 'Ostrzeżenie' 'Dyski' $msg 'Disks'; SetFlag $r 'warn' }
         $full = ''; $rate = ''
         $pts = @($dHist["$($r.Drive)".ToLowerInvariant()] | Where-Object { $_ })
@@ -3672,7 +4144,8 @@ function Invoke-ServerAnalysis {
                 $dCrit = [math]::Floor(($free - [double]$r.SizeGB * $C.DiskCritPct / 100) / -$b)
                 $full = [int]$dFull; $rate = [math]::Round(-$b, 2)
                 $tm = "ubywa ok. $rate GB/dzień (trend z $([math]::Round($span)) dni), wolne $free GB"
-                if ($r.FreePct -lt $C.DiskCritPct) { }
+                # poniżej progu krytycznego jest już problem krytyczny; duży wolumen (ostrzeżenie) dostaje prognozę, gdy zapełni się w ciągu DiskForecastCritDays
+                if ($r.FreePct -lt $C.DiskCritPct -and (-not $bigOk -or $dFull -gt $C.DiskForecastCritDays)) { }
                 elseif ($dFull -le $C.DiskForecastCritDays) { AddI 'Krytyczny' 'Dyski' "Dysk $($r.Drive) $($r.Label) zapełni się za ok. $dFull dni – $tm" 'Disks'; SetFlag $r 'crit' }
                 elseif ($dCrit -le $C.DiskForecastDays) { AddI 'Ostrzeżenie' 'Dyski' "Dysk $($r.Drive) $($r.Label) spadnie poniżej $($C.DiskCritPct)% wolnego za ok. $([math]::Max(0, $dCrit)) dni, zapełni się za ok. $dFull dni – $tm" 'Disks'; SetFlag $r 'warn' }
             }
@@ -3682,19 +4155,47 @@ function Invoke-ServerAnalysis {
     }
 
     # Usługi
+    # Program lub skrypt w folderze, w którym zwykli użytkownicy mogą tworzyć pliki (Temp, Users\Public, PerfLogs) – podłożenie pliku
+    # (np. biblioteki DLL obok programu) daje uprawnienia konta usługi/zadania. AppData poza Temp pominięte (aktualizatory na RDS).
+    $wrRx = '(?i)(?:^|[\s"''=,;(])(?:[a-z]:\\(?:temp|tmp|perflogs|users\\public|windows\\temp)|%(?:temp|tmp|public)%|[a-z]:\\users\\[^\\"]+\\appdata\\local\\temp|%localappdata%\\temp)\\[^"|<>]*?\.(?:exe|dll|com|scr|cpl|ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|hta|msi|jar|py)(?=$|[\s"'',;|)])'
     foreach ($r in $D.Services) {
         if ($r.StartMode -like 'Auto*' -and $r.State -ne 'Running') {
             $ignored = $false
             foreach ($p in $C.IgnoredStoppedServices) { if ($r.Name -like $p) { $ignored = $true; break } }
-            if (-not $ignored) { AddI 'Ostrzeżenie' 'Usługi' "Usługa automatyczna zatrzymana: $($r.DisplayName) ($($r.Name))" 'Services'; SetFlag $r 'warn' }
+            # start wyzwalany zdarzeniem (Trigger Start) z kodem 0 albo 1077: usługa sama kończy pracę i wraca przy zdarzeniu – stan normalny
+            $ecTxt = "$($r.PSObject.Properties['ExitCode'].Value)"
+            if ("$($r.PSObject.Properties['Trigger'].Value)" -eq 'Tak' -and $ecTxt -in '0', '1077') { $ignored = $true }
+            $ecNote = switch -regex ($ecTxt) { '^0?$' { '' } '^1067$' { ' – proces usługi zakończył się nieoczekiwanie (kod wyjścia 1067)' } '^1066/' { " – usługa zgłosiła własny błąd (kod wyjścia $ecTxt)" } '^1077$' { ' – nie była uruchamiana od startu systemu (kod wyjścia 1077)' } default { " (kod wyjścia $ecTxt)" } }
+            if (-not $ignored) { AddI 'Ostrzeżenie' 'Usługi' "Usługa automatyczna zatrzymana: $($r.DisplayName) ($($r.Name))$ecNote" 'Services'; SetFlag $r 'warn' }
         }
-        if ($r.Unquoted -eq 'Tak') { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Niecytowana ścieżka usługi ze spacjami: $($r.Name) – $($r.Path)" 'Services'; SetFlag $r 'warn' }
+        # w C:\Program Files i C:\Windows zwykły użytkownik domyślnie nie utworzy pliku – takie ścieżki są tylko zaleceniem w Konfiguracji bezpieczeństwa
+        if ($r.Unquoted -eq 'Tak' -and "$($r.Path)" -match '^\s*c:\\(Program Files( \(x86\))?|Windows)\\') { SetFlag $r 'info' }
+        elseif ($r.Unquoted -eq 'Tak') { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Niecytowana ścieżka usługi ze spacjami: $($r.Name) – $($r.Path)" 'Services'; SetFlag $r 'warn' }
+        if ("$($r.Path)" -match $wrRx) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Usługa $($r.Name) (konto $($r.Account)) uruchamia plik z folderu, w którym zwykli użytkownicy mogą tworzyć pliki: $(Get-ShortText $r.Path 150)" 'Services'; SetFlag $r 'warn' }
     }
 
     # Zadania
     foreach ($r in $D.Tasks) {
         if ($r.Failed -eq 'Tak') { AddI 'Ostrzeżenie' 'Harmonogram' "Zadanie $($r.Path): $($r.ResultText) ($($r.Result)), ostatnio $($r.LastRun)" 'Tasks'; SetFlag $r 'warn' }
+        if ("$($r.Action)" -match $wrRx) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Zadanie $($r.Path) (konto $($r.RunAs)) uruchamia plik z folderu, w którym zwykli użytkownicy mogą tworzyć pliki: $(Get-ShortText $r.Action 150)" 'Tasks'; SetFlag $r 'warn' }
     }
+    # Konta domenowe usług i zadań („konto|usługa X”): lekka lista, która przetrwa New-SlimData (Services i Tasks to HeavyKeys) –
+    # Update-VmIndex porównuje ją z kontami uprzywilejowanymi domeny. Kopia lekka nie ma już tych sekcji, więc listy nie nadpisujemy.
+    if (-not $D.PSObject.Properties['_Slim']) {
+        $ra = @(@($D.Services | Where-Object { $_ } | ForEach-Object { "$($_.Account)|usługa $($_.Name)" }) + @($D.Tasks | Where-Object { $_ } | ForEach-Object { "$($_.RunAs)|zadanie $($_.Path)" }) | Where-Object { $_ -match '^[^|]*[\\@][^|]*\|' -and $_ -notmatch '^(\.|NT AUTHORITY|NT SERVICE|BUILTIN|IIS APPPOOL|NT VIRTUAL MACHINE)\\' } | Sort-Object -Unique)
+        $D | Add-Member -NotePropertyName _RunAs -NotePropertyValue ([string[]]$ra) -Force
+    }
+
+    # Autostart: Debugger IFEO dla programów dostępnych z ekranu logowania = znany backdoor (SYSTEM bez logowania, także przez RDP);
+    # pozostałe wpisy w rzadziej używanych miejscach – jedna informacja; polecenia z folderów zapisywalnych dla użytkowników
+    $oddAuto = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $D.Autostart) {
+        $loc = "$($r.Location)"
+        if ($loc -like 'IFEO*' -and "$($r.Name)" -in 'sethc.exe', 'utilman.exe', 'osk.exe', 'narrator.exe', 'magnify.exe', 'displayswitch.exe', 'atbroker.exe') { AddI 'Krytyczny' 'Bezpieczeństwo' "Debugger IFEO dla $($r.Name): $(Get-ShortText $r.Command 120) – uruchamia się zamiast tego programu z ekranu logowania (także RDP), z uprawnieniami SYSTEM i bez logowania" 'Autostart'; SetFlag $r 'crit' }
+        elseif ($loc -match '^(IFEO|SilentProcessExit|AppInit_DLLs|Session Manager|LSA)') { $oddAuto.Add("$loc $($r.Name): $(Get-ShortText $r.Command 60)"); SetFlag $r 'info' }
+        if ("$($r.Command)" -match $wrRx) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Autostart $($r.Name) ($loc) uruchamia plik z folderu, w którym zwykli użytkownicy mogą tworzyć pliki: $(Get-ShortText $r.Command 150)" 'Autostart'; SetFlag $r 'warn' }
+    }
+    if ($oddAuto.Count) { AddI 'Info' 'Bezpieczeństwo' "Wpisy w rzadziej używanych miejscach autostartu (IFEO, AppInit_DLLs, Session Manager, pakiety LSA) – sprawdź, czy są znane: $(Join-Short $oddAuto 3)" 'Autostart' }
 
     # Zdarzenia
     # Kernel-Power 41 i EventLog 6008 omawia sekcja Restarty (jeden problem na serwer zamiast kilku)
@@ -3708,6 +4209,18 @@ function Invoke-ServerAnalysis {
         $top   = $errRows | Sort-Object Count -Descending | Select-Object -First 1
         AddI 'Info' 'Zdarzenia' "$total błędów ($($errRows.Count) rodzajów) w System/Application z $days dni; najczęstszy: $($top.Source) ID $($top.Id) ×$($top.Count)" 'Events'
         foreach ($r in $errRows) { if ($r.Count -ge 20) { SetFlag $r 'info' } }
+    }
+    # Nieudane instalacje aktualizacji (WindowsUpdateClient 20) – przyczyna braku poprawek wprost. Bez problemu: poprawka zainstalowana
+    # później (KB na liście zainstalowanych) i definicje Defendera (wiek sygnatur ocenia Konfiguracja bezpieczeństwa)
+    foreach ($r in @($D.Events | Where-Object { "$($_.Source)" -eq 'Microsoft-Windows-WindowsUpdateClient' -and "$($_.Id)" -eq '20' })) {
+        $wuMsg = "$($r.Message)"
+        $wuKb = [regex]::Match($wuMsg, '(?i)\bKB\d{6,8}\b').Value.ToUpperInvariant()
+        $wuCode = [regex]::Match($wuMsg, '0x[0-9A-Fa-f]{8}').Value
+        $wuTitle = if ($wuCode) { $wuMsg.Substring($wuMsg.IndexOf($wuCode) + $wuCode.Length) -replace '^[\s:.]+', '' } else { '' }
+        if (-not $wuTitle) { $wuTitle = $wuMsg }
+        if (($wuKb -and $s -and ",$($s.PSObject.Properties['HotFixIds'].Value)," -like "*,$wuKb,*") -or $wuKb -in 'KB2267602', 'KB2461484', 'KB915597') { SetFlag $r 'info'; continue }
+        AddI 'Ostrzeżenie' 'Aktualizacje' "Nieudane instalacje aktualizacji ×$($r.Count) w $days dni, ostatnia $($r.Last)$(if ($wuCode) { " z błędem $wuCode" }): $(Get-ShortText $wuTitle 150)" 'Events'
+        SetFlag $r 'warn'
     }
 
     # Restarty
@@ -3728,11 +4241,26 @@ function Invoke-ServerAnalysis {
     $sec   = @($D.SecurityEvents)
     $fails = @($sec | Where-Object { $_.Id -in 4625, 4771 })
     if ($fails.Count) {
-        $ft  = ($fails | Measure-Object Count -Sum).Sum
-        $top = $fails | Sort-Object Count -Descending | Select-Object -First 1
-        $sv  = if ($ft -ge $C.FailedLogonWarn) { 'Ostrzeżenie' } else { 'Info' }
-        AddI $sv 'Bezpieczeństwo' "$ft nieudanych logowań w $days dni$(if ($ft -ge $C.MaxEvents) { " (osiągnięto limit $($C.MaxEvents) pobieranych zdarzeń – faktycznie może być więcej)" }); najwięcej: $($top.Account) z $($top.Source) ×$($top.Count)" 'SecurityEvents'
-        foreach ($r in $fails) { if ($r.Count -ge 5) { SetFlag $r 'warn' } }
+        # suma ze stałą treścią (bez nazw kont, więc wyciszenie działa w kolejnych skanach); ostrzeżenia osobno dla konta i źródła ponad próg oraz dla źródła próbującego wielu kont
+        $ft   = ($fails | Measure-Object Count -Sum).Sum
+        $fAcc = @($fails | ForEach-Object { "$($_.Account)" -replace '^.*\\', '' } | Where-Object { $_ } | Sort-Object -Unique)
+        # ucięcie wg znacznika z migawki (limit z czasu skanu, nie bieżące ustawienie); starsza migawka bez znacznika – porównanie z bieżącym limitem
+        $tm = @(@($D.PSObject.Properties['Truncated'].Value) -like 'Security 4625*')
+        $trFrom = if ($tm.Count -and "$($tm[0])" -match '\(od ([^)]+)\)') { "od $($Matches[1])" } else { 'z części okresu' }   # nawias w wyrażeniu regularnym nie może być wewnątrz $( ) w ciągu
+        $tr = if ($tm.Count) { " (osiągnięto limit pobieranych zdarzeń – pełne dane dopiero $trFrom, faktycznie może być więcej)" } elseif (-not $D.PSObject.Properties['Truncated'] -and $ft -ge $C.MaxEvents) { " (osiągnięto limit $($C.MaxEvents) pobieranych zdarzeń – faktycznie może być więcej)" } else { '' }
+        AddI 'Info' 'Bezpieczeństwo' "$ft nieudanych logowań w $days dni (różnych kont: $($fAcc.Count))$tr" 'SecurityEvents'
+        $hot = @($fails | Where-Object { [int]$_.Count -ge $C.FailedLogonWarn } | Sort-Object { [int]$_.Count } -Descending)
+        foreach ($r in @($hot | Select-Object -First 5)) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Nieudane logowania konta $($r.Account)$(if ($r.Source) { " z $($r.Source)" })$(if ("$($r.Id)" -eq '4771') { ' (Kerberos)' }): ×$($r.Count) w $days dni – stare hasło w usłudze, zadaniu albo na telefonie, albo próba odgadnięcia hasła" 'SecurityEvents' }
+        if ($hot.Count -gt 5) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Kolejne konta z co najmniej $($C.FailedLogonWarn) nieudanymi logowaniami z jednego źródła: $($hot.Count - 5) – zobacz sekcję Zdarzenia bezpieczeństwa" 'SecurityEvents' }
+        foreach ($r in $hot) { SetFlag $r 'warn' }
+        # password spray: z jednego źródła po kilka prób na wiele różnych kont – próg na konto tego nie wyłapie
+        foreach ($sg in @($fails | Group-Object { @("$($_.Source)".Trim() -split '\s+')[0] } | Where-Object { $_.Name -and $_.Name -notmatch '^(127\.|::1$)' })) {
+            $sa = @($sg.Group | ForEach-Object { "$($_.Account)" -replace '^.*\\', '' } | Where-Object { $_ } | Sort-Object -Unique)
+            if ($sa.Count -lt 10) { continue }
+            AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Możliwy atak na hasła (password spray) z $($sg.Name): nieudane logowania na różne konta (kont: $($sa.Count), prób: $(($sg.Group | Measure-Object Count -Sum).Sum)) w $days dni – jeśli to serwer pośredniczący w logowaniu (Exchange, ADFS, RDS, VPN), mogą to być pomyłki użytkowników" 'SecurityEvents'
+            foreach ($r in $sg.Group) { SetFlag $r 'warn' }
+        }
+        foreach ($r in $fails) { if ([int]$r.Count -ge 5) { SetFlag $r 'info' } }
     }
     # Nieudane logowania z adresów publicznych = usługa logowania dostępna z internetu
     # (tylko IPv4 – globalne adresy IPv6 bywają wewnętrzne; 100.64.0.0/10 to CGNAT, nie internet)
@@ -3744,12 +4272,20 @@ function Invoke-ServerAnalysis {
         AddI 'Krytyczny' 'Bezpieczeństwo' "Nieudane logowania z adresów publicznych: $pn prób z $($ips.Count) adresów (np. $(Join-Short $ips 3)) – logowanie (RDP/SMB) jest prawdopodobnie dostępne z internetu" 'SecurityEvents'
         foreach ($r in $pubFails) { SetFlag $r 'crit' }
     }
-    $n = 0
-    foreach ($r in @($sec | Where-Object { $_.Id -in 1102, 104, 4720, 4726, 4728, 4732, 4756 })) {
-        $n++; if ($n -gt 25) { break }
-        if ($r.Id -in 1102, 104) { AddI 'Krytyczny' 'Bezpieczeństwo' "$($r.Event) – wykonał: $($r.By), $($r.Time) $($r.Detail)" 'SecurityEvents'; SetFlag $r 'crit' }
-        else { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "$($r.Event): $($r.Account) $($r.Detail) (wykonał: $($r.By), $($r.Time))" 'SecurityEvents'; SetFlag $r 'warn' }
+    # Wyczyszczenie dziennika – zawsze i bez limitu: żadna liczba zmian kont i grup nie może go ukryć
+    foreach ($r in @($sec | Where-Object { $_.Id -in 1102, 104 })) { AddI 'Krytyczny' 'Bezpieczeństwo' "$($r.Event) – wykonał: $($r.By), $($r.Time) $($r.Detail)" 'SecurityEvents'; SetFlag $r 'crit' }
+    # Utworzenie/usunięcie konta i zmiany w grupach uprzywilejowanych (po SID; migawki sprzed _GroupSid – każda grupa): do 10 osobno, reszta zbiorczo.
+    # Zmiany członkostwa w zwykłych grupach – jedna informacja (każda osobno zasypywała listę, a różne treści nie dawały się wyciszyć jedną regułą)
+    $privGrpRx = '-(512|518|519|520|526|527)$|^S-1-5-32-(544|548|549|550|551|555|578|580)$'
+    $chgHot = New-Object System.Collections.Generic.List[object]; $chgPlain = New-Object System.Collections.Generic.List[object]
+    foreach ($r in @($sec | Where-Object { $_.Id -in 4720, 4726, 4728, 4732, 4756 })) {
+        $gsid = "$($r.PSObject.Properties['_GroupSid'].Value)"
+        if (($r.Id -in 4720, 4726) -or -not $gsid -or $gsid -match $privGrpRx -or "$($r.Detail)" -match 'grupa: DnsAdmins$') { $chgHot.Add($r) } else { $chgPlain.Add($r) }
     }
+    foreach ($r in @($chgHot | Select-Object -First 10)) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "$($r.Event): $($r.Account) $($r.Detail) (wykonał: $($r.By), $($r.Time))" 'SecurityEvents' }
+    if ($chgHot.Count -gt 10) { AddI 'Ostrzeżenie' 'Bezpieczeństwo' "Kolejne zmiany kont i grup uprzywilejowanych w $days dni: $($chgHot.Count - 10) – pełna lista w sekcji Zdarzenia bezpieczeństwa" 'SecurityEvents' }
+    foreach ($r in $chgHot) { SetFlag $r 'warn' }
+    if ($chgPlain.Count) { AddI 'Info' 'Bezpieczeństwo' "Zmiany członkostwa w zwykłych grupach w $days dni: $($chgPlain.Count) – lista w sekcji Zdarzenia bezpieczeństwa" 'SecurityEvents'; foreach ($r in $chgPlain) { SetFlag $r 'info' } }
     $inst = @($sec | Where-Object { $_.Id -in 4697, 7045 })
     if ($inst.Count) { AddI 'Info' 'Bezpieczeństwo' ("Zainstalowane usługi w $days dni: " + (Join-Short ($inst | ForEach-Object { $_.Detail }) 3)) 'SecurityEvents' }
     foreach ($r in @($sec | Where-Object { $_.Id -in 4697, 7045, 4698, 4740, 4722, 4724 })) { SetFlag $r 'info' }
@@ -3788,12 +4324,34 @@ function Invoke-ServerAnalysis {
     if ($pne.Count) { AddI 'Info' 'Konta' ("Włączone konta lokalne z hasłem bez wygasania: " + (Join-Short ($pne | ForEach-Object { $_.Name }) 5)) 'LocalUsers' }
 
     # Udziały, certyfikaty, foldery
-    foreach ($r in $D.Shares) { if ($r.EveryoneWrite -eq 'Tak') { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): Wszyscy mają zapis na poziomie udziału – sprawdź NTFS" 'Shares'; SetFlag $r 'info' } }
+    # Zapis dla grup obejmujących wszystkich (Wszyscy, Użytkownicy uwierzytelnieni, Użytkownicy, Użytkownicy domeny…): na poziomie udziału
+    # i w NTFS folderu głównego. Sam udział z „Wszyscy: pełna kontrola” przy zamkniętym NTFS to typowa, poprawna konfiguracja.
+    $shCreate = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $D.Shares) {
+        $ew = "$($r.EveryoneWrite)"; $ewWho = $ew -replace '^[^:]*:\s*', ''
+        if ($ew -like 'udział i NTFS: *') { AddI 'Ostrzeżenie' 'Udziały' "Udział $($r.Name) ($($r.Path)): zapis dla wszystkich na poziomie udziału i NTFS ($ewWho) – każdy użytkownik może zmieniać, usuwać i szyfrować pliki" 'Shares'; SetFlag $r 'warn' }
+        elseif ($ew -like 'udział i NTFS (tworzenie plików)*') { $shCreate.Add("$($r.Name) ($ewWho)"); SetFlag $r 'info' }
+        elseif ($ew -like 'tylko udział*') { SetFlag $r 'info' }
+        elseif ($ew -eq 'Tak') { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): Wszyscy mają zapis na poziomie udziału – sprawdź NTFS" 'Shares'; SetFlag $r 'info' }   # migawki sprzed sprawdzania NTFS
+        elseif ($ew) { AddI 'Info' 'Udziały' "Udział $($r.Name) ($($r.Path)): zapis dla wszystkich na poziomie udziału ($ewWho), nie udało się odczytać uprawnień NTFS – sprawdź NTFS" 'Shares'; SetFlag $r 'info' }
+    }
+    if ($shCreate.Count) { AddI 'Info' 'Udziały' "Udziały, w których każdy użytkownik może tworzyć nowe pliki i foldery (bez zmiany cudzych plików): $(Join-Short $shCreate 4)" 'Shares' }
+    # Po ręcznym odnowieniu stary certyfikat zostaje w magazynie obok nowego – najdłuższa ważność wg podmiotu i wystawcy
+    # (bez pustych podmiotów i zastępczych „SAN: …” z kolektora: np. certyfikaty DC z samym SAN z różnych szablonów nie są swoimi następcami)
+    $certBest = @{}
+    foreach ($r in @($D.Certificates)) { if ($r -and $r.PrivateKey -eq 'Tak' -and "$($r.Subject)" -and "$($r.Subject)" -notlike 'SAN: *') { $ck = "$($r.Subject)|$($r.Issuer)".ToLowerInvariant(); if (-not $certBest.ContainsKey($ck) -or [int]$r.DaysLeft -gt $certBest[$ck]) { $certBest[$ck] = [int]$r.DaysLeft } } }
+    $certExp = New-Object System.Collections.Generic.List[object]
     foreach ($r in $D.Certificates) {
         if ($r.PrivateKey -ne 'Tak') { continue }
-        if ($r.DaysLeft -lt 0) { AddI 'Info' 'Certyfikaty' "Wygasły certyfikat: $(Get-ShortText $r.Subject 80) ($($r.NotAfter))" 'Certificates'; SetFlag $r 'info' }
-        elseif ($r.DaysLeft -le $C.CertWarnDays) { AddI 'Ostrzeżenie' 'Certyfikaty' "Certyfikat wygasa za $($r.DaysLeft) dni: $(Get-ShortText $r.Subject 80)" 'Certificates'; SetFlag $r 'warn' }
+        $ck = "$($r.Subject)|$($r.Issuer)".ToLowerInvariant()
+        $newer = if ("$($r.Subject)" -and "$($r.Subject)" -notlike 'SAN: *' -and $certBest.ContainsKey($ck) -and $certBest[$ck] -gt $C.CertWarnDays -and [int]$r.DaysLeft -lt $certBest[$ck]) { $certBest[$ck] } else { $null }
+        # odcisk w treści: wyciszenie ostrzeżenia o starym egzemplarzu nie wycisza za rok jego następcy o tym samym podmiocie
+        $tp = "$($r.Thumbprint)"; $tp = if ($tp) { " (odcisk $($tp.Substring(0, [math]::Min(8, $tp.Length))))" } else { '' }
+        if ($r.DaysLeft -lt 0) { if ($null -ne $newer) { SetFlag $r 'muted' } else { $certExp.Add($r); SetFlag $r 'info' } }   # wygasły, ale jest ważny następca – bez problemu
+        elseif ($r.DaysLeft -le $C.CertWarnDays -and $null -ne $newer) { AddI 'Info' 'Certyfikaty' "Certyfikat wygasa za $($r.DaysLeft) dni: $(Get-ShortText $r.Subject 80)$tp – jest już nowszy certyfikat z tym samym podmiotem i wystawcą (ważny jeszcze $newer dni); sprawdź, czy usługi (IIS, RDP, ADFS) używają nowego, i usuń stary" 'Certificates'; SetFlag $r 'info' }
+        elseif ($r.DaysLeft -le $C.CertWarnDays) { AddI 'Ostrzeżenie' 'Certyfikaty' "Certyfikat wygasa za $($r.DaysLeft) dni: $(Get-ShortText $r.Subject 80)$tp" 'Certificates'; SetFlag $r 'warn' }
     }
+    if ($certExp.Count) { AddI 'Info' 'Certyfikaty' ("Wygasłe certyfikaty z kluczem prywatnym ($($certExp.Count)): " + (Join-Short ($certExp | Sort-Object { [int]$_.DaysLeft } -Descending | ForEach-Object { "$(if ("$($_.Subject)") { Get-ShortText $_.Subject 60 } else { "odcisk $($_.Thumbprint)" }) ($($_.NotAfter))" }) 3) + ' – usuń nieużywane') 'Certificates' }
     foreach ($r in $D.Folders) {
         if ($r.File -like '`[podsumowanie`]*' -and $r.Executable) { AddI 'Info' 'Foldery' "W $($r.Folder) jest $($r.Executable) plików wykonywalnych/skryptów" 'Folders' }
         elseif ($r.Executable -eq 'Tak') { SetFlag $r 'info' }
@@ -3909,9 +4467,16 @@ function Invoke-ServerAnalysis {
         if ($ti) { $list.Add($ti) }
         if ($s.IsDC -eq $true) {
             $isPdc = ("$($s.DomainRoleId)" -eq '5')
-            if ($isPdc -and "$($s.TimeSource)" -in 'NT5DS', 'NoSync', '') { AddI 'Ostrzeżenie' 'Czas' "Kontroler PDC nie ma zewnętrznego źródła czasu (W32Time Type: $(if ($s.TimeSource) { $s.TimeSource } else { 'brak' })) – z jego zegarem synchronizuje się cała domena" 'System' }
+            # PDC domeny podrzędnej poprawnie bierze czas z domeny nadrzędnej (NT5DS) – zewnętrznego NTP potrzebuje tylko PDC domeny głównej lasu
+            # (starsze migawki bez ForestRoot: jak dotąd); NoSync jest błędem na każdym PDC
+            $rootPdc = $isPdc -and "$($s.PSObject.Properties['ForestRoot'].Value)" -ne 'False'
+            if (($rootPdc -and "$($s.TimeSource)" -in 'NT5DS', 'NoSync', '') -or ($isPdc -and "$($s.TimeSource)" -eq 'NoSync')) { AddI 'Ostrzeżenie' 'Czas' "Kontroler PDC nie ma zewnętrznego źródła czasu (W32Time Type: $(if ($s.TimeSource) { $s.TimeSource } else { 'brak' })) – z jego zegarem synchronizuje się cała domena" 'System' }
             if ($s.HvTimeSync -eq $true) { AddI $(if ($isPdc) { 'Ostrzeżenie' } else { 'Info' }) 'Czas' 'Kontroler domeny w maszynie Hyper-V bierze czas z hosta (VMICTimeProvider) – dla DC zalecane jest wyłączenie tego dostawcy' 'System' }
         }
+        # Usługa czasu nie może się zsynchronizować (zdarzenia Time-Service): na PDC z jego zegarem rozjeżdża się cała domena, a porównanie ze stacją
+        # tego nie pokaże. Pojedyncze ostrzeżenia po restarcie (DNS albo DC jeszcze niedostępne) są typowe – zgłaszamy od 3 albo przy zdarzeniu 36
+        $tsn = [int]"$($s.PSObject.Properties['TimeSyncWarn'].Value)"; $ts36 = [int]"$($s.PSObject.Properties['TimeSyncNoSync'].Value)"
+        if ($tsn -ge 3 -or $ts36 -gt 0) { AddI $(if ("$($s.DomainRoleId)" -eq '5') { 'Ostrzeżenie' } else { 'Info' }) 'Czas' "Usługa czasu nie może się zsynchronizować ze źródłem: $tsn ostrzeżeń w $days dni$(if ($ts36) { ", w tym $($ts36)× brak synchronizacji od ponad doby" }) (ostatnio $($s.TimeSyncLast))$(if ("$($s.DomainRoleId)" -eq '5') { ' – PDC chodzi na własnym zegarze, a z nim cała domena; różnice czasu względem stacji tego nie pokażą' })" 'System' }
         if ("$($s.CommitUsedPct)" -ne '' -and [int]$s.CommitUsedPct -ge $C.CommitWarnPct) { AddI 'Ostrzeżenie' 'Zasoby' "Wysokie użycie pamięci wirtualnej (commit): $($s.CommitUsedPct)% z $($s.CommitLimitGB) GB – aplikacjom może zabraknąć pamięci" 'System' }
         if ("$($s.ResourceExhaustion)" -ne '' -and [int]$s.ResourceExhaustion -gt 0) { AddI 'Ostrzeżenie' 'Zasoby' "Windows zgłosił wyczerpanie pamięci wirtualnej $($s.ResourceExhaustion)× w $days dni (zdarzenie 2004)" 'System' }
         $bn = "$($s.BuildNumber)"
@@ -3921,7 +4486,7 @@ function Invoke-ServerAnalysis {
             $endDt = [datetime]::MinValue
             if ([datetime]::TryParseExact($endTxt, 'yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$endDt)) {
                 $left = [int]($endDt - (Get-Date)).TotalDays
-                if ($left -lt 0) { AddI 'Krytyczny' 'System' "$($s.OS): koniec wsparcia $endTxt – system nie dostaje poprawek bezpieczeństwa (chyba że ma wykupione ESU)" 'System' }
+                if ($left -lt 0) { AddI 'Krytyczny' 'System' "$($s.OS): koniec wsparcia $endTxt – system nie dostaje poprawek bezpieczeństwa $(if ([int]$bn -lt 9200) { '(płatne ESU dla 2008/2008 R2 też już się skończyło)' } else { '(chyba że ma wykupione ESU)' })" 'System' }
                 elseif ($left -le $C.SupportWarnDays) { AddI 'Info' 'System' "$($s.OS): koniec wsparcia $endTxt (za $left dni)" 'System' }
             }
         }
@@ -3986,8 +4551,8 @@ function Invoke-ServerAnalysis {
     # Zdrowie dysków
     foreach ($r in $D.DiskHealth) {
         if ("$($r.Id)" -eq '') {
-            if ($r.Health -eq 'Awaria') { AddI 'Krytyczny' 'Dyski' "Dysk fizyczny w stanie awarii: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'crit' }
-            elseif ($r.Health -eq 'Ostrzeżenie') { AddI 'Ostrzeżenie' 'Dyski' "Dysk fizyczny zgłasza problem: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'warn' }
+            if ($r.Health -eq 'Awaria') { AddI 'Krytyczny' 'Dyski' "$($r.Source) w stanie awarii: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'crit' }
+            elseif ($r.Health -eq 'Ostrzeżenie') { AddI 'Ostrzeżenie' 'Dyski' "$($r.Source) zgłasza problem: $($r.Name) – $($r.Detail)" 'DiskHealth'; SetFlag $r 'warn' }
             if ("$($r.WearPct)" -ne '' -and [int]$r.WearPct -ge $C.DiskWearWarnPct) { AddI 'Ostrzeżenie' 'Dyski' "Zużycie dysku $($r.Name): $($r.WearPct)%" 'DiskHealth'; SetFlag $r 'warn' }
             if ("$($r.UncorrectedErrors)" -ne '' -and [int64]$r.UncorrectedErrors -gt 0) { AddI 'Ostrzeżenie' 'Dyski' "Nieskorygowane błędy odczytu/zapisu na $($r.Name): $($r.UncorrectedErrors)" 'DiskHealth'; SetFlag $r 'warn' }
         } elseif ([int]$r.Id -in 7, 51, 55, 98) {
@@ -4056,6 +4621,23 @@ function Invoke-ServerAnalysis {
         AddI 'Ostrzeżenie' 'Sieć' ("Karta w profilu sieci Publicznym ($(Join-Short ($pubNics | ForEach-Object { $_.Adapter }) 3)), a zapora wpuszcza porty wrażliwe z dowolnego adresu: " + (Join-Short ($expo | ForEach-Object { "$($_.Ports) ($($_.Rule))" }) 4)) 'Exposure'
         foreach ($r in $expo) { SetFlag $r 'warn' }
     } else { foreach ($r in $expo) { SetFlag $r 'info' } }
+    # Konfiguracja działających kart sieciowych. Karty USB do kontrolera zarządzania (iDRAC, XCC: Remote NDIS) i karta klastra mają
+    # z założenia adresy 169.254.x.x – pomijane. 168.63.129.16 to wewnętrzny DNS Azure.
+    $nicUp = @($D.Network | Where-Object { $_ -and "$($_.Status)" -eq 'Up' -and "$($_.Description)" -notmatch 'Remote NDIS|USB|Failover Cluster' })
+    $inDom = $s -and "$($s.DomainRoleId)" -in '1', '3', '4', '5'
+    foreach ($r in $nicUp) {
+        if ("$($r.IPv4)" -match '(^|,\s*)169\.254\.') { AddI 'Ostrzeżenie' 'Sieć' "Karta $($r.Adapter) ma adres APIPA (169.254.x.x) – serwer DHCP nie odpowiada albo adres IP jest w konflikcie z innym urządzeniem" 'Network'; SetFlag $r 'warn' }
+        $pubDns = @("$($r.DNS)" -split ',\s*' | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' -and $_ -notmatch $privRx -and $_ -ne '168.63.129.16' })
+        if ($inDom -and $pubDns.Count) { AddI 'Ostrzeżenie' 'Sieć' "Karta $($r.Adapter): publiczny serwer DNS ($($pubDns -join ', ')) na serwerze w domenie – nie zna stref domeny; gdy klient DNS przełączy się na niego, serwer przestanie znajdować kontrolery domeny (logowanie, GPO, Kerberos)" 'Network'; SetFlag $r 'warn' }
+        elseif ($r.Gateway -and -not "$($r.DNS)".Trim()) { AddI 'Info' 'Sieć' "Karta $($r.Adapter) ma bramę domyślną, ale nie ma serwerów DNS" 'Network'; SetFlag $r 'info' }
+        # maszyny wirtualne pomijane (starsza emulowana karta Hyper-V zgłasza 100 Mb/s); karta bez bramy to zwykle sieć zarządzania – informacja
+        if ($s -and $s.IsVirtual -eq $false -and "$($r.Speed)" -match '^(10|100) Mbps$') {
+            $sv = if ($r.Gateway) { 'Ostrzeżenie' } else { 'Info' }
+            AddI $sv 'Sieć' "Karta $($r.Adapter) pracuje z prędkością $($r.Speed) – sprawdź kabel, port przełącznika i autonegocjację" 'Network'; SetFlag $r $(if ($r.Gateway) { 'warn' } else { 'info' })
+        }
+    }
+    $gwNics = @($nicUp | Where-Object { $_.Gateway })
+    if ($gwNics.Count -gt 1) { AddI 'Info' 'Sieć' "Brama domyślna ustawiona na $($gwNics.Count) kartach ($(Join-Short ($gwNics | ForEach-Object { $_.Adapter }) 3)) – odpowiedzi mogą wychodzić inną kartą niż przyszło zapytanie (routing asymetryczny); bramę zwykle ustawia się na jednej karcie" 'Network'; foreach ($r in $gwNics) { SetFlag $r 'info' } }
 
     # Mechanizmy trwałości
     $ign = @($C.IgnoredWmiConsumers)
@@ -4131,12 +4713,15 @@ function Invoke-ServerAnalysis {
 }
 function Get-RiskyExclusion($Row) {
     # Wykluczenie Defendera obejmujące cały dysk, katalogi systemowe/tymczasowe, interpretery skryptów albo rozszerzenia plików wykonywalnych
-    $n = ("$($Row.Name)".Trim().ToLowerInvariant() -replace '(\\\*(\.\*)?)+$', '').TrimEnd('\')   # c:\* = cały dysk, c:\windows\temp\* = katalog
+    # zmienne środowiskowe (Defender je rozwija) zamieniane na ścieżki: %SystemDrive% = cały dysk systemowy, %SystemRoot%\System32 = katalog systemowy
+    $raw = "$($Row.Name)".Trim().ToLowerInvariant()
+    $n = ($raw -replace '(\\\*(\.\*)?)+$', '').TrimEnd('\') -replace '^%systemdrive%', 'c:' -replace '^%(systemroot|windir)%', 'c:\windows' -replace '^%programfiles\(x86\)%', 'c:\program files (x86)' -replace '^%programfiles%', 'c:\program files' -replace '^%(programdata|allusersprofile)%', 'c:\programdata' -replace '^%public%', 'c:\users\public'   # c:\* = cały dysk, c:\windows\temp\* = katalog
     $t = "$($Row.Type)"
-    if ($t -like '*ścieżka*') {
+    # wykluczenie procesu z maską folderu (C:\Windows\System32\*) obejmuje pliki otwierane przez każdy proces z tego folderu
+    if ($t -like '*ścieżka*' -or ($t -like '*proces*' -and $raw -match '\\\*$')) {
         if ($n -match '^[a-z]:$') { return 'cały dysk' }
-        if ($n -match '^(%?[a-z]+%?|[a-z]:)\\(windows|windows\\temp|windows\\system32|users|users\\public|programdata|temp|perflogs|program files( \(x86\))?)$' -or $n -match '^%(temp|tmp|windir|systemroot|programdata|userprofile)%$') { return 'katalog systemowy albo tymczasowy' }
-        if ($n -match '\\appdata\\(local|roaming)(\\temp)?$') { return 'profil użytkownika' }
+        if ($n -match '^(%?[a-z]+%?|[a-z]:)\\(windows|windows\\temp|windows\\system32|windows\\syswow64|users|users\\public|programdata|temp|perflogs|program files( \(x86\))?)$' -or $n -match '^%(temp|tmp|windir|systemroot|programdata|userprofile)%$') { return 'katalog systemowy albo tymczasowy' }
+        if ($n -match '\\appdata\\(local|roaming)(\\temp)?$' -or $n -match '^%(appdata|localappdata)%(\\temp)?$') { return 'profil użytkownika' }
     }
     if ($t -like '*proces*' -and $n -match '(^|\\)(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|wmic|msiexec|certutil|bitsadmin)\.exe$') { return 'interpreter albo narzędzie systemowe' }
     if ($t -like '*rozszerzenie*' -and $n.TrimStart('.') -in 'exe', 'dll', 'ps1', 'bat', 'cmd', 'vbs', 'js', 'hta', 'scr', 'msi') { return 'rozszerzenie plików wykonywalnych' }
@@ -4396,7 +4981,7 @@ function Set-CveIssue([string]$Text, [string]$Severity = 'Info') {
 
 function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     <#
-        Pobranie/odświeżenie danych CVE w tle (pula Remote – przy starcie Local jest zajęta wczytywaniem migawek).
+        Pobranie/odświeżenie danych CVE w tle (pula Aux – przy starcie Local jest zajęta wczytywaniem migawek, a Remote – skanem).
         -Auto: tylko gdy brakuje danych dla systemu z floty albo są starsze niż CveRefreshHours; po nieudanej próbie (brak danych systemu
         albo źródło nieodświeżone) kolejna najwcześniej po 30 min.
     #>
@@ -4421,7 +5006,7 @@ function Start-CveUpdate([switch]$Force, [switch]$Auto, [switch]$Restart) {
     $prods = [object[]]@($want | ForEach-Object { @{ Name = $_; Path = (Get-CveCacheFile $_) } })
     $items = @(@{ Target = 'Dane CVE'; Opt = @{ Dir = $Config.CacheDir; Products = $prods; Months = [int]$Config.CveMonths; RefreshHours = [int]$Config.CveRefreshHours; Proxy = "$($Config.CveProxy)"; Force = [bool]$Force } })
     Write-Log "Dane CVE: $($want -join ', ')$(if ($Force) { ' – pobieranie wymuszone' })" 'INFO' 'CVE'
-    [void](Start-Operation -Kind 'Cve' -Name 'Dane CVE' -Items $items -Pool 'Remote' -TimeoutSec 1800 -State @{ Manual = -not $Auto; Want = [string[]]$want } `
+    [void](Start-Operation -Kind 'Cve' -Name 'Dane CVE' -Items $items -Pool 'Aux' -TimeoutSec 1800 -State @{ Manual = -not $Auto; Want = [string[]]$want } `
         -OnResult { param($op, $r) Receive-CveResult $op $r } -OnComplete { param($op) Complete-CveUpdate $op })
 }
 
@@ -4544,12 +5129,14 @@ function Update-VmIndex {
         $good = @($nodes | Where-Object { -not ($_.D.PSObject.Properties['_ScanNote'] -and $_.D._ScanNote) -and @($_.D.PSObject.Properties['Failed'].Value) -notcontains 'Cluster' })
         $rep = if ($good.Count) { $good[0] } else { $nodes[0] }
         $rows = @($rep.D.PSObject.Properties['Cluster'].Value | Where-Object { $_ })
+        # wyciszenia: reguła zapisana pod dowolnym węzłem klastra (reprezentant zmienia się, gdy węzeł ma limit czasu albo jest niedostępny)
+        $nk = [string[]]@(@($nodes | ForEach-Object { $_.Key }) + @($rows | Where-Object { "$($_.Type)" -eq 'Węzeł' } | ForEach-Object { Find-ServerKey "$($_.Name)" }) | Where-Object { $_ })
         foreach ($r in $rows) {
             switch ("$($r.Type)") {
-                'Węzeł'   { if ("$($r.State)" -ne 'Up') { & $addX $rep.Key $(if ("$($r.State)" -eq 'Down') { 'Krytyczny' } else { 'Ostrzeżenie' }) "Węzeł $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn } }
-                'CSV'     { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Krytyczny' "Wolumen CSV $($r.Name) klastra $cn w stanie $($r.State) – maszyny na nim mogą być wstrzymane" 'Cluster' $cn } }
-                'Rola VM' { if ("$($r.State)" -eq 'Failed') { & $addX $rep.Key 'Krytyczny' "Rola maszyny $($r.Name) w klastrze $cn w stanie Failed (właściciel: $($r.Owner))" 'Cluster' $cn } elseif ("$($r.State)" -eq 'PartialOnline') { & $addX $rep.Key 'Ostrzeżenie' "Rola maszyny $($r.Name) w klastrze $cn częściowo online" 'Cluster' $cn } }
-                'Kworum'  { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Ostrzeżenie' "Zasób kworum $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn } }
+                'Węzeł'   { if ("$($r.State)" -ne 'Up') { & $addX $rep.Key $(if ("$($r.State)" -eq 'Down') { 'Krytyczny' } else { 'Ostrzeżenie' }) "Węzeł $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn '' $nk } }
+                'CSV'     { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Krytyczny' "Wolumen CSV $($r.Name) klastra $cn w stanie $($r.State) – maszyny na nim mogą być wstrzymane" 'Cluster' $cn '' $nk } }
+                'Rola VM' { if ("$($r.State)" -eq 'Failed') { & $addX $rep.Key 'Krytyczny' "Rola maszyny $($r.Name) w klastrze $cn w stanie Failed (właściciel: $($r.Owner))" 'Cluster' $cn '' $nk } elseif ("$($r.State)" -eq 'PartialOnline') { & $addX $rep.Key 'Ostrzeżenie' "Rola maszyny $($r.Name) w klastrze $cn częściowo online" 'Cluster' $cn '' $nk } }
+                'Kworum'  { if ("$($r.State)" -ne 'Online') { & $addX $rep.Key 'Ostrzeżenie' "Zasób kworum $($r.Name) klastra $cn w stanie $($r.State)" 'Cluster' $cn '' $nk } }
             }
         }
         # N+1: czy pozostałe węzły pomieszczą maszyny po awarii największego węzła (tylko gdy przeskanowano wszystkie węzły)
@@ -4558,22 +5145,27 @@ function Update-VmIndex {
             $used = 0.0; $ramAll = 0.0; $ramMax = 0.0
             foreach ($n in $nodes) { $used += [double]$n.D.System.HvRamAssignedGB; $ram = [double]$n.D.System.RamGB; $ramAll += $ram; if ($ram -gt $ramMax) { $ramMax = $ram } }
             $avail = $ramAll - $ramMax - ($nodes.Count - 1) * [double]$Config.HvHostMinFreeGB
-            if ($used -gt $avail) { & $addX $rep.Key 'Ostrzeżenie' "Klaster $cn nie przetrwa awarii największego węzła: maszyny używają $([math]::Round($used)) GB RAM, a po awarii zostanie ok. $([math]::Round($avail)) GB (z zapasem $($Config.HvHostMinFreeGB) GB na węzeł)" 'Cluster' $cn }
+            if ($used -gt $avail) { & $addX $rep.Key 'Ostrzeżenie' "Klaster $cn nie przetrwa awarii największego węzła: maszyny używają $([math]::Round($used)) GB RAM, a po awarii zostanie ok. $([math]::Round($avail)) GB (z zapasem $($Config.HvHostMinFreeGB) GB na węzeł)" 'Cluster' $cn '' $nk }
         }
     }
-    # Wszystkie kontrolery domeny na jednym hoście = awaria hosta wyłącza logowanie w całej domenie
-    $dcByHost = @{}; $dcCount = 0
+    # Wszystkie kontrolery domeny na jednym hoście = awaria hosta wyłącza logowanie w całej domenie (osobno dla każdej domeny lasu)
+    $dcByDom = @{}
     foreach ($it in @($script:Servers)) {
         $d = $script:Data[$it.Name]
         if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['System'] -or -not $d.System -or -not $d.System.IsDC) { continue }
-        $dcCount++
+        $dk = "$($d.System.Domain)".ToLowerInvariant()
+        if (-not $dcByDom.ContainsKey($dk)) { $dcByDom[$dk] = @{ Dcs = (New-Object System.Collections.Generic.List[string]); Hosts = @{} } }
+        $x = $dcByDom[$dk]; $x.Dcs.Add($it.Name)
         $h = if ($d.System.PSObject.Properties['HvHost'] -and $d.System.HvHost) { Get-DisplayName "$($d.System.HvHost)" } else { "(fizyczny) $($it.Display)" }
-        if (-not $dcByHost.ContainsKey($h)) { $dcByHost[$h] = New-Object System.Collections.Generic.List[string] }
-        $dcByHost[$h].Add($it.Display)
+        if (-not $x.Hosts.ContainsKey($h)) { $x.Hosts[$h] = New-Object System.Collections.Generic.List[string] }
+        $x.Hosts[$h].Add($it.Display)
     }
-    if ($dcCount -ge 2 -and $dcByHost.Count -eq 1) {
-        $h = @($dcByHost.Keys)[0]
-        & $addX (@($script:Servers | Where-Object { $dcByHost[$h] -contains $_.Display })[0].Name) 'Ostrzeżenie' "Wszystkie skanowane kontrolery domeny ($($dcByHost[$h] -join ', ')) działają na jednym hoście $h – jego awaria wyłączy logowanie w domenie" 'System' ''
+    foreach ($dk in @($dcByDom.Keys | Sort-Object)) {
+        $x = $dcByDom[$dk]
+        if ($x.Dcs.Count -lt 2 -or $x.Hosts.Count -ne 1) { continue }
+        $h = @($x.Hosts.Keys)[0]
+        # nazwa domeny w treści tylko przy kilku domenach – przy jednej treść (i klucz wyciszenia) jak dotąd
+        & $addX (@($script:Servers | Where-Object { $x.Hosts[$h] -contains $_.Display })[0].Name) 'Ostrzeżenie' "Wszystkie skanowane kontrolery domeny$(if ($dcByDom.Count -gt 1) { " $dk" }) ($($x.Hosts[$h] -join ', ')) działają na jednym hoście $h – jego awaria wyłączy logowanie w domenie" 'System' '' $null ([string[]]$x.Dcs.ToArray())
     }
     # Active Directory: ocena raz na domenę – z PDC (rola 5), a gdy go nie skanowano albo sekcja się nie udała, z pierwszego alfabetycznie DC
     $doms = @{}
@@ -4584,6 +5176,23 @@ function Update-VmIndex {
         $dn = "$($d.System.Domain)".ToLowerInvariant()
         if (-not $doms.ContainsKey($dn)) { $doms[$dn] = New-Object System.Collections.Generic.List[object] }
         $doms[$dn].Add(@{ Key = $it.Name; D = $d; Pdc = ([int]$d.System.PSObject.Properties['DomainRoleId'].Value -eq 5); Stale = [bool]($d.PSObject.Properties['_ScanNote'] -and $d._ScanNote) })
+    }
+    # Konta domenowe usług i zadań serwerów (lista _RunAs z analizy): klucz „domena\konto” (NetBIOS albo DNS z UPN) → serwer → co używa konta.
+    # Bez kontrolerów domeny – hasło zapisane na DC nie daje niczego ponad dostęp do samego DC.
+    $runAs = @{}
+    if ($doms.Count) {
+        foreach ($it in @($script:Servers)) {
+            $d = $script:Data[$it.Name]
+            if (-not $d -or $d.Offline -or -not $d.PSObject.Properties['_RunAs'] -or ($d.PSObject.Properties['System'] -and $d.System -and $d.System.IsDC)) { continue }
+            foreach ($ent in @($d._RunAs)) {
+                $acc, $what = "$ent" -split '\|', 2
+                $ak = if ($acc -match '^([^\\@]+)\\([^\\@]+)$') { "$($Matches[1])\$($Matches[2])" } elseif ($acc -match '^([^\\@]+)@([^\\@]+)$') { "$($Matches[2])\$($Matches[1])" } else { '' }
+                if (-not $ak) { continue }
+                $ak = $ak.ToLowerInvariant()
+                if (-not $runAs.ContainsKey($ak)) { $runAs[$ak] = New-Object System.Collections.Specialized.OrderedDictionary }
+                if (-not $runAs[$ak].Contains($it.Display)) { $runAs[$ak][$it.Display] = "$what" }
+            }
+        }
     }
     foreach ($dn in @($doms.Keys | Sort-Object)) {
         $rep = @($doms[$dn] | Sort-Object { $_.Stale }, { -not $_.Pdc }, { $_.Key })[0]
@@ -4597,6 +5206,22 @@ function Update-VmIndex {
             }
         }
         if ($recs.Count) { & $addX $rep.Key 'Info' ("Do utwardzenia w domenie ($($recs.Count)): " + (Join-Short $recs 4)) 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys }
+        # Konto uprzywilejowane domeny jako konto usługi lub zadania: hasło leży w LSA Secrets serwera (albo token w pamięci) – administrator serwera przejmie domenę
+        $pal = @("$($rep.D.System.PSObject.Properties['PrivAccounts'].Value)" -split ',' | Where-Object { $_ })
+        if ($pal.Count -and $runAs.Count) {
+            $hit = New-Object System.Collections.Specialized.OrderedDictionary
+            foreach ($pa in $pal) {
+                foreach ($ak in @("$pa".ToLowerInvariant(), "$dn\$($pa -replace '^.*\\', '')".ToLowerInvariant())) {
+                    if (-not $runAs.ContainsKey($ak)) { continue }
+                    if (-not $hit.Contains($pa)) { $hit[$pa] = New-Object System.Collections.Specialized.OrderedDictionary }
+                    foreach ($hk in @($runAs[$ak].Keys)) { if (-not $hit[$pa].Contains($hk)) { $hit[$pa][$hk] = $runAs[$ak][$hk] } }
+                }
+            }
+            foreach ($pa in @($hit.Keys)) {
+                $srvs = @(foreach ($hk in @($hit[$pa].Keys)) { if ($hit[$pa][$hk]) { "$hk ($($hit[$pa][$hk]))" } else { $hk } })
+                & $addX $rep.Key 'Krytyczny' "Konto uprzywilejowane domeny $pa jest kontem usług lub zadań na serwerach ($($srvs.Count)): $(Join-Short $srvs 6) – hasło konta jest zapisane na tych serwerach (LSA Secrets) albo jego token działa w ich pamięci, więc administrator każdego z nich przejmie domenę; użyj gMSA albo konta bez uprawnień administracyjnych domeny" 'ADSecurity' "domena $dn" 'Active Directory' $dcKeys
+            }
+        }
     }
     # Ta sama maszyna pod dwiema nazwami (alias DNS, nazwa klastra, adres IP) – skanowana podwójnie
     $byComp = @{}
@@ -4615,7 +5240,8 @@ function Update-VmIndex {
         foreach ($it in $down) {
             $d = $script:Data[$it.Name]
             $hk = Find-ServerKey (Get-LastHvHost $d)
-            if (-not $hk -or $hk -eq $it.Name -or -not (Test-NetworkDown $script:Data[$hk]) -or (Find-VmForServer $it.Name $d)) { continue }
+            # zablokowany WinRM (Firewall) = gość odpowiada, więc nie jest na niedostępnym hoście
+            if (-not $hk -or $hk -eq $it.Name -or -not (Test-NetworkDown $d) -or -not (Test-NetworkDown $script:Data[$hk]) -or (Find-VmForServer $it.Name $d)) { continue }
             if (-not $byHost.ContainsKey($hk)) { $byHost[$hk] = New-Object System.Collections.Generic.List[string] }
             $byHost[$hk].Add($it.Display)
         }
@@ -4629,7 +5255,7 @@ function Update-VmIndex {
             $d = $script:Data[$it.Name]
             if (-not $d -or ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported)) { continue }
             $sns = @(Get-ServerSubnets $d)
-            if (-not $d.Offline -and -not $sns.Count) { $noAddr++ }   # np. pominięta sekcja Adresacja – nie wiadomo, ile serwerów podsieci działa
+            if (-not $d.Offline -and -not $sns.Count) { $noAddr++ }   # np. pominięta sekcja Adresacja – nie wiadomo, w której podsieci działają (liczone do każdej)
             foreach ($sn in $sns) { if (-not $netAll.ContainsKey($sn)) { $netAll[$sn] = 0 }; $netAll[$sn]++ }
         }
         foreach ($it in $down) {
@@ -4639,9 +5265,9 @@ function Update-VmIndex {
             }
         }
         foreach ($sn in @($netDown.Keys | Sort-Object)) {
-            if ($noAddr) { break }
+            # działające serwery bez znanego adresu mogą należeć do tej podsieci – doliczone do mianownika (ostrożnie, bez wyłączania całego sprawdzenia)
             $g = $netDown[$sn]; $tot = [int]$netAll[$sn]
-            if ($g.Count -lt 3 -or $tot -lt 1 -or $g.Count / $tot -lt 0.8) { continue }
+            if ($g.Count -lt 3 -or $tot -lt 1 -or $g.Count / ($tot + $noAddr) -lt 0.8) { continue }
             $fw = @($g | Where-Object { "$($script:Data[$_.Name].Diag.Class)" -eq 'Firewall' }).Count
             $names = Join-Short ($g | ForEach-Object { $_.Display }) 8
             $txt = if ($fw -ge $g.Count / 2) { "W podsieci $sn serwery odpowiadają, ale WinRM (TCP 5985) jest blokowany na $($g.Count) z $tot ($names) – prawdopodobnie zapora sieciowa / ACL między stacją a podsiecią albo reguła zapory z GPO" }
@@ -4673,6 +5299,8 @@ function Find-VmForServer([string]$Name, $D) {
         $cands = @($ix.ByName["$($sys.HvVmName)".ToUpperInvariant()] | Where-Object { $_ })
         if ($cands.Count -gt 1 -and $sys.HvHost) { $hs = Get-DisplayName "$($sys.HvHost)"; $p = @($cands | Where-Object { $_.HostDisplay -eq $hs }); if ($p.Count) { $cands = $p } }
     }
+    # serwer fizyczny albo na innej platformie (VMware, KVM…) nie jest gościem Hyper-V – zgodność nazwy z maszyną (np. pozostałość po migracji) jest przypadkowa
+    if (-not $cands.Count -and $sys -and -not "$($sys.PSObject.Properties['HvVmId'].Value)" -and $sys.PSObject.Properties['Hypervisor'] -and "$($sys.Hypervisor)" -ne 'Hyper-V') { return $null }
     if (-not $cands.Count) {
         $short = Get-DisplayName $Name
         $cands = @(@($ix.ByGuest[$short]) + @($ix.ByName[$short.ToUpperInvariant()]) | Where-Object { $_ })
@@ -4730,9 +5358,32 @@ function Test-LinuxGuest([string]$Name) {
 # Motyw (ciemny, spójny z AD-ManagerDiamond / Domain Ops). New-UiElement wstrzykuje go do zasobów każdego okna.
 $script:ThemeXaml = @'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:sys="clr-namespace:System;assembly=mscorlib">
   <SolidColorBrush x:Key="Muted" Color="#8791A5"/>
-  <SolidColorBrush x:Key="Faint" Color="#5E6779"/>
+  <!-- podpowiedzi i opisy: kontrast ok. 4,6–5:1 na tłach okna i kart (wcześniej #5E6779, ok. 3:1) -->
+  <SolidColorBrush x:Key="Faint" Color="#7B8496"/>
+  <!-- minimalna długość suwaka paska przewijania: Track bierze połowę tej wartości (domyślnie ok. 8 px) -->
+  <sys:Double x:Key="{x:Static SystemParameters.VerticalScrollBarButtonHeightKey}">44</sys:Double>
+  <sys:Double x:Key="{x:Static SystemParameters.HorizontalScrollBarButtonWidthKey}">44</sys:Double>
+  <!-- obwódka fokusu klawiatury (FocusVisualStyle – tylko przy nawigacji klawiaturą, bez zmiany rozmiaru kontrolki) -->
+  <Style x:Key="FocusRing">
+    <Setter Property="Control.Template">
+      <Setter.Value>
+        <ControlTemplate>
+          <Border CornerRadius="7" BorderThickness="1" BorderBrush="#4C7DF0" Margin="-1" SnapsToDevicePixels="True"/>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style x:Key="FocusRingPill">
+    <Setter Property="Control.Template">
+      <Setter.Value>
+        <ControlTemplate>
+          <Border CornerRadius="11" BorderThickness="1" BorderBrush="#4C7DF0" Margin="-1" SnapsToDevicePixels="True"/>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
 
   <Style x:Key="Card" TargetType="Border">
     <Setter Property="Background" Value="#161B22"/>
@@ -4746,6 +5397,15 @@ $script:ThemeXaml = @'
     <Style.Triggers>
       <Trigger Property="IsMouseOver" Value="True"><Setter Property="BorderBrush" Value="#2F4478"/></Trigger>
     </Style.Triggers>
+  </Style>
+  <!-- podpis kafelka: w wąskim oknie wielokropek zamiast ucięcia w pół słowa -->
+  <Style x:Key="TileLabel" TargetType="TextBlock">
+    <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+    <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+  </Style>
+  <!-- kafelek bez własnej podpowiedzi: pełny podpis w podpowiedzi -->
+  <Style x:Key="TileLabelTip" TargetType="TextBlock" BasedOn="{StaticResource TileLabel}">
+    <Setter Property="ToolTip" Value="{Binding Text, RelativeSource={RelativeSource Self}}"/>
   </Style>
   <Style x:Key="SegmentHost" TargetType="Border">
     <Setter Property="Background" Value="#161B22"/>
@@ -4764,8 +5424,22 @@ $script:ThemeXaml = @'
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="Thumb">
-          <Border CornerRadius="4" Background="#39414F"/>
+          <Border x:Name="t" CornerRadius="4" Background="#39414F"/>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="t" Property="Background" Value="#4A5465"/></Trigger>
+            <Trigger Property="IsDragging" Value="True"><Setter TargetName="t" Property="Background" Value="#566176"/></Trigger>
+          </ControlTemplate.Triggers>
         </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <!-- pusty tor nad i pod suwakiem: kliknięcie przewija o stronę -->
+  <Style x:Key="ScrollPage" TargetType="RepeatButton">
+    <Setter Property="Focusable" Value="False"/>
+    <Setter Property="IsTabStop" Value="False"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="RepeatButton"><Border Background="Transparent"/></ControlTemplate>
       </Setter.Value>
     </Setter>
   </Style>
@@ -4778,6 +5452,8 @@ $script:ThemeXaml = @'
         <ControlTemplate TargetType="ScrollBar">
           <Grid Background="Transparent">
             <Track x:Name="PART_Track" IsDirectionReversed="True">
+              <Track.DecreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageUpCommand}"/></Track.DecreaseRepeatButton>
+              <Track.IncreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageDownCommand}"/></Track.IncreaseRepeatButton>
               <Track.Thumb><Thumb Style="{StaticResource ScrollThumb}" Margin="2"/></Track.Thumb>
             </Track>
           </Grid>
@@ -4795,6 +5471,8 @@ $script:ThemeXaml = @'
             <ControlTemplate TargetType="ScrollBar">
               <Grid Background="Transparent">
                 <Track x:Name="PART_Track" IsDirectionReversed="False">
+                  <Track.DecreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageLeftCommand}"/></Track.DecreaseRepeatButton>
+                  <Track.IncreaseRepeatButton><RepeatButton Style="{StaticResource ScrollPage}" Command="{x:Static ScrollBar.PageRightCommand}"/></Track.IncreaseRepeatButton>
                   <Track.Thumb><Thumb Style="{StaticResource ScrollThumb}" Margin="2"/></Track.Thumb>
                 </Track>
               </Grid>
@@ -4886,7 +5564,7 @@ $script:ThemeXaml = @'
                   BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="7">
             <Grid Margin="{TemplateBinding Padding}">
               <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
-              <TextBlock x:Name="wm" Text="{TemplateBinding Tag}" Foreground="#5E6779" Margin="2,0,0,0"
+              <TextBlock x:Name="wm" Text="{TemplateBinding Tag}" Foreground="#6E778A" Margin="2,0,0,0"
                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}" IsHitTestVisible="False" Visibility="Collapsed"/>
             </Grid>
           </Border>
@@ -4936,7 +5614,7 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#8791A5"/>
     <Setter Property="Padding" Value="14,5"/>
     <Setter Property="Cursor" Value="Hand"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="RadioButton">
@@ -4959,7 +5637,7 @@ $script:ThemeXaml = @'
     <Setter Property="FontSize" Value="11.5"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="Margin" Value="0,0,5,5"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRingPill}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="RadioButton">
@@ -4982,7 +5660,7 @@ $script:ThemeXaml = @'
     <Setter Property="Foreground" Value="#D5DAE3"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="VerticalAlignment" Value="Center"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="CheckBox">
@@ -5017,7 +5695,7 @@ $script:ThemeXaml = @'
     <Setter Property="Margin" Value="0,1"/>
     <Setter Property="Cursor" Value="Hand"/>
     <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
     <Setter Property="Template">
       <Setter.Value>
         <ControlTemplate TargetType="ListBoxItem">
@@ -5062,6 +5740,57 @@ $script:ThemeXaml = @'
     </Setter>
   </Style>
 
+  <!-- Nagłówek kolumny tabeli: własny szablon, bo przy ustawionym tle i ramce domyślny (DataGridHeaderBorder) nie rysuje strzałki sortowania -->
+  <Style x:Key="GridHeaderGripper" TargetType="Thumb">
+    <Setter Property="Width" Value="8"/>
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="Cursor" Value="SizeWE"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Thumb"><Border Background="{TemplateBinding Background}"/></ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <Style x:Key="GridHeader" TargetType="DataGridColumnHeader">
+    <Setter Property="Background" Value="#1B212A"/>
+    <Setter Property="Foreground" Value="#8791A5"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="Padding" Value="10,8"/>
+    <Setter Property="BorderBrush" Value="#252C38"/>
+    <Setter Property="BorderThickness" Value="0,0,1,1"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="DataGridColumnHeader">
+          <Grid>
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
+              <DockPanel>
+                <Path x:Name="arrow" DockPanel.Dock="Right" Width="8" Height="5" Margin="6,0,0,0" Stretch="Fill" Fill="#8CB0FF" VerticalAlignment="Center" Visibility="Collapsed" Data="M0,5 L4,0 L8,5 Z"/>
+                <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="{TemplateBinding VerticalContentAlignment}" RecognizesAccessKey="True" SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+              </DockPanel>
+            </Border>
+            <Thumb x:Name="PART_LeftHeaderGripper" HorizontalAlignment="Left" Style="{StaticResource GridHeaderGripper}"/>
+            <Thumb x:Name="PART_RightHeaderGripper" HorizontalAlignment="Right" Style="{StaticResource GridHeaderGripper}"/>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="SortDirection" Value="Ascending"><Setter TargetName="arrow" Property="Visibility" Value="Visible"/></Trigger>
+            <Trigger Property="SortDirection" Value="Descending">
+              <Setter TargetName="arrow" Property="Visibility" Value="Visible"/>
+              <Setter TargetName="arrow" Property="Data" Value="M0,0 L8,0 L4,5 Z"/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+  <!-- tabele z sortowaniem (Invoke-GridSort); bez sortowania (np. Wyciszone problemy) – sam GridHeader -->
+  <Style x:Key="SortGridHeader" TargetType="DataGridColumnHeader" BasedOn="{StaticResource GridHeader}">
+    <Setter Property="ToolTip" Value="Kliknij, aby sortować: rosnąco → malejąco → bez sortowania. Shift+klik dodaje kolejną kolumnę."/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True"><Setter Property="Foreground" Value="#C9D0DC"/></Trigger>
+    </Style.Triggers>
+  </Style>
   <Style x:Key="DarkGrid" TargetType="DataGrid">
     <Style.Resources>
       <SolidColorBrush x:Key="{x:Static SystemColors.ControlBrushKey}" Color="#161B22"/>
@@ -5084,20 +5813,7 @@ $script:ThemeXaml = @'
     <Setter Property="EnableRowVirtualization" Value="True"/>
     <Setter Property="EnableColumnVirtualization" Value="True"/>
     <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling"/>
-    <Setter Property="ColumnHeaderStyle">
-      <Setter.Value>
-        <Style TargetType="DataGridColumnHeader">
-          <Setter Property="Background" Value="#1B212A"/>
-          <Setter Property="Foreground" Value="#8791A5"/>
-          <Setter Property="FontWeight" Value="SemiBold"/>
-          <Setter Property="FontSize" Value="12"/>
-          <Setter Property="Padding" Value="10,8"/>
-          <Setter Property="BorderBrush" Value="#252C38"/>
-          <Setter Property="BorderThickness" Value="0,0,1,1"/>
-          <Setter Property="ToolTip" Value="Kliknij, aby sortować: rosnąco → malejąco → bez sortowania. Shift+klik dodaje kolejną kolumnę."/>
-        </Style>
-      </Setter.Value>
-    </Setter>
+    <Setter Property="ColumnHeaderStyle" Value="{StaticResource SortGridHeader}"/>
     <Setter Property="CellStyle">
       <Setter.Value>
         <Style TargetType="DataGridCell">
@@ -5228,43 +5944,49 @@ $script:MainXaml = @'
     <Border Grid.Row="0" Background="#12171D" BorderBrush="#1E242E" BorderThickness="0,0,0,1" Padding="16,10">
       <Grid>
         <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-          <Border Width="36" Height="36" CornerRadius="10">
-            <Border.Background>
-              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-                <GradientStop Color="#4C7DF0" Offset="0"/>
-                <GradientStop Color="#2FB38A" Offset="1"/>
-              </LinearGradientBrush>
-            </Border.Background>
-            <TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="17" Foreground="White" HorizontalAlignment="Center"/>
-          </Border>
-          <StackPanel Margin="11,0,0,0" VerticalAlignment="Center">
-            <StackPanel Orientation="Horizontal">
-              <TextBlock Text="Przegląd serwerów" FontSize="15" FontWeight="SemiBold" Foreground="White"/>
-              <TextBlock x:Name="txtVersion" Foreground="#5E6779" FontSize="11" Margin="7,3,0,0"/>
+        <!-- Wąskie okno (1366 px albo 1920 px przy 150 %): skraca się tytuł i podtytuł (wielokropek), przełącznik widoków i przyciski z prawej zostają.
+             Grid z HorizontalAlignment=Left: kolumna * dostaje szerokość tytułu, więc przełącznik stoi tuż za nim jak dotąd. -->
+        <Grid HorizontalAlignment="Left">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <DockPanel VerticalAlignment="Center">
+            <Border DockPanel.Dock="Left" Width="36" Height="36" CornerRadius="10">
+              <Border.Background>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                  <GradientStop Color="#4C7DF0" Offset="0"/>
+                  <GradientStop Color="#2FB38A" Offset="1"/>
+                </LinearGradientBrush>
+              </Border.Background>
+              <TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="17" Foreground="White" HorizontalAlignment="Center"/>
+            </Border>
+            <StackPanel Margin="11,0,0,0" VerticalAlignment="Center">
+              <DockPanel>
+                <TextBlock DockPanel.Dock="Left" Text="Przegląd serwerów" FontSize="15" FontWeight="SemiBold" Foreground="White" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtVersion" Foreground="{StaticResource Faint}" FontSize="11" Margin="7,3,0,0" TextTrimming="CharacterEllipsis"/>
+              </DockPanel>
+              <TextBlock x:Name="txtSubtitle" Foreground="#7B8496" FontSize="11.5" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
             </StackPanel>
-            <TextBlock x:Name="txtSubtitle" Foreground="#7B8496" FontSize="11.5"/>
-          </StackPanel>
-        </StackPanel>
-        <Border Grid.Column="1" Style="{StaticResource SegmentHost}" Margin="28,0,0,0" VerticalAlignment="Center">
-          <StackPanel Orientation="Horizontal">
-            <RadioButton x:Name="rbOverview" GroupName="view" IsChecked="True" ToolTip="Wszystkie serwery (Ctrl+1)">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE80F;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Wszystkie serwery"/></StackPanel>
-            </RadioButton>
-            <RadioButton x:Name="rbVms" GroupName="view" ToolTip="Hosty i maszyny wirtualne Hyper-V ze wszystkich hostów (Ctrl+2)">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE8FD;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Hyper-V"/></StackPanel>
-            </RadioButton>
-            <RadioButton x:Name="rbServer" GroupName="view" ToolTip="Szczegóły wybranego serwera (Ctrl+3)">
-              <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Szczegóły serwera"/></StackPanel>
-            </RadioButton>
-          </StackPanel>
-        </Border>
-        <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Center">
+          </DockPanel>
+          <Border Grid.Column="1" Style="{StaticResource SegmentHost}" Margin="28,0,0,0" VerticalAlignment="Center">
+            <StackPanel Orientation="Horizontal">
+              <RadioButton x:Name="rbOverview" GroupName="view" IsChecked="True" ToolTip="Wszystkie serwery (Ctrl+1)">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE80F;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Wszystkie serwery"/></StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="rbVms" GroupName="view" ToolTip="Hosty i maszyny wirtualne Hyper-V ze wszystkich hostów (Ctrl+2)">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE8FD;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Hyper-V"/></StackPanel>
+              </RadioButton>
+              <RadioButton x:Name="rbServer" GroupName="view" ToolTip="Szczegóły wybranego serwera (Ctrl+3)">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE9D9;" FontSize="13" Margin="0,0,8,0"/><TextBlock Text="Szczegóły serwera"/></StackPanel>
+              </RadioButton>
+            </StackPanel>
+          </Border>
+        </Grid>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
           <TextBlock Text="Zdarzenia z" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="0,0,7,0"/>
           <TextBox x:Name="txtDays" Width="44" TextAlignment="Center" Padding="4,5" ToolTip="Zakres zdarzeń tylko dla bieżącego skanu (1–180 dni); domyślny – w Ustawieniach"/>
           <TextBlock Text="dni" Foreground="{StaticResource Muted}" VerticalAlignment="Center" Margin="7,0,10,0"/>
@@ -5274,7 +5996,7 @@ $script:MainXaml = @'
                 <TextBlock Style="{StaticResource Glyph}" Text="&#xE77B;" FontSize="12" Foreground="#8CB0FF" HorizontalAlignment="Center"/>
               </Border>
               <StackPanel VerticalAlignment="Center">
-                <TextBlock x:Name="txtCredUser" Foreground="#E4E8EF" FontSize="12.5"/>
+                <TextBlock x:Name="txtCredUser" Foreground="#E4E8EF" FontSize="12.5" MaxWidth="170" TextTrimming="CharacterEllipsis"/>
                 <TextBlock x:Name="txtCredMode" Foreground="#7B8496" FontSize="11"/>
               </StackPanel>
             </StackPanel>
@@ -5353,25 +6075,40 @@ $script:MainXaml = @'
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                   </Grid.ColumnDefinitions>
-                  <Ellipse Width="9" Height="9" Fill="{Binding Color}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                  <!-- serwer bez połączenia: pierścień zamiast kropki (kształt, nie tylko kolor) -->
+                  <Ellipse x:Name="dot" Width="9" Height="9" Fill="{Binding Color}" Stroke="{Binding Color}" StrokeThickness="2" VerticalAlignment="Center" Margin="0,0,10,0"/>
                   <StackPanel Grid.Column="1">
-                    <StackPanel Orientation="Horizontal">
-                      <TextBlock Text="{Binding Display}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                      <Border Background="#1E2A44" CornerRadius="5" Padding="5,0" Margin="6,1,0,0" Visibility="{Binding KindVis}" VerticalAlignment="Center">
+                    <!-- Grid zamiast poziomego StackPanel: nazwa skraca się wielokropkiem, a plakietka HV/VM zostaje tuż za nią -->
+                    <Grid HorizontalAlignment="Left">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                      <TextBlock Text="{Binding Display}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Name}"/>
+                      <Border Grid.Column="1" Background="#1E2A44" CornerRadius="5" Padding="5,0" Margin="6,1,0,0" Visibility="{Binding KindVis}" VerticalAlignment="Center">
                         <TextBlock Text="{Binding Kind}" Foreground="#8CB0FF" FontSize="10" FontWeight="SemiBold"/>
                       </Border>
-                    </StackPanel>
-                    <TextBlock Text="{Binding Sub}" Foreground="#8791A5" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                    <TextBlock Text="{Binding Sub}" Foreground="#8791A5" FontSize="11" TextTrimming="CharacterEllipsis" ToolTip="{Binding Sub}"/>
                   </StackPanel>
                   <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Border Background="#2EFF5C6C" CornerRadius="8" Padding="7,1" Margin="4,0,0,0" Visibility="{Binding CritVis}">
-                      <TextBlock Text="{Binding Crit}" Foreground="#FF7A86" FontSize="11" FontWeight="Bold"/>
+                    <Border Background="#2EFF5C6C" CornerRadius="8" Padding="6,1,7,1" Margin="4,0,0,0" Visibility="{Binding CritVis}" ToolTip="Problemy krytyczne">
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource Glyph}" Text="&#xEA39;" FontSize="9" Foreground="#FF7A86" Margin="0,0,3,0"/>
+                        <TextBlock Text="{Binding Crit}" Foreground="#FF7A86" FontSize="11" FontWeight="Bold"/>
+                      </StackPanel>
                     </Border>
-                    <Border Background="#2EFFB547" CornerRadius="8" Padding="7,1" Margin="4,0,0,0" Visibility="{Binding WarnVis}">
-                      <TextBlock Text="{Binding Warn}" Foreground="#FFC46B" FontSize="11" FontWeight="Bold"/>
+                    <Border Background="#2EFFB547" CornerRadius="8" Padding="6,1,7,1" Margin="4,0,0,0" Visibility="{Binding WarnVis}" ToolTip="Ostrzeżenia">
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Style="{StaticResource Glyph}" Text="&#xE7BA;" FontSize="9" Foreground="#FFC46B" Margin="0,0,3,0"/>
+                        <TextBlock Text="{Binding Warn}" Foreground="#FFC46B" FontSize="11" FontWeight="Bold"/>
+                      </StackPanel>
                     </Border>
                   </StackPanel>
                 </Grid>
+                <DataTemplate.Triggers>
+                  <DataTrigger Binding="{Binding Status}" Value="offline">
+                    <Setter TargetName="dot" Property="Fill" Value="Transparent"/>
+                    <Setter TargetName="dot" Property="ToolTip" Value="Bez połączenia"/>
+                  </DataTrigger>
+                </DataTemplate.Triggers>
               </DataTemplate>
             </ListBox.ItemTemplate>
           </ListBox>
@@ -5392,27 +6129,40 @@ $script:MainXaml = @'
             </Grid.RowDefinitions>
             <UniformGrid Grid.Row="0" Columns="6" Margin="0,0,0,16">
               <Border x:Name="tileTotal" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż wszystkie serwery">
-                <StackPanel><TextBlock Text="Serwery na liście" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tTotal" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Serwery na liście" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tTotal" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileOnline" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Serwery, z których zebrano dane">
-                <StackPanel><TextBlock Text="Odpowiada" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tOnline" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Odpowiada" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tOnline" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileOffline" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż serwery bez połączenia (z diagnozą przyczyny)">
-                <StackPanel><TextBlock Text="Bez połączenia" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tOffline" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Bez połączenia" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tOffline" Text="0" FontSize="28" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileCrit" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż problemy krytyczne">
-                <StackPanel><TextBlock Text="Problemy krytyczne" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tCrit" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FF7A86" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Problemy krytyczne" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tCrit" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FF7A86" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileWarn" Style="{StaticResource Tile}" Margin="0,0,10,0" ToolTip="Pokaż ostrzeżenia">
-                <StackPanel><TextBlock Text="Ostrzeżenia" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tWarn" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Ostrzeżenia" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tWarn" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border x:Name="tileHv" Style="{StaticResource Tile}" ToolTip="Hosty Hyper-V i maszyny wirtualne (działające / wszystkie)">
-                <StackPanel><TextBlock Text="Hyper-V: hosty / VM" Foreground="{StaticResource Muted}"/><TextBlock x:Name="tHv" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#8CB0FF" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Hyper-V: hosty / VM" Style="{StaticResource TileLabel}"/><TextBlock x:Name="tHv" Text="0" FontSize="28" FontWeight="SemiBold" Foreground="#8CB0FF" Margin="0,2,0,0"/></StackPanel>
               </Border>
             </UniformGrid>
 
-            <DockPanel Grid.Row="1" Margin="0,0,0,10">
-              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+            <!-- Grid zamiast DockPanel: w wąskim oknie skraca się tytuł z podpowiedzią i pole filtru (do 100 px), a przyciski zostają widoczne -->
+            <Grid Grid.Row="1" Margin="0,0,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*" MinWidth="100" MaxWidth="230"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <DockPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                <TextBlock x:Name="txtIssuesTitle" DockPanel.Dock="Left" Text="Wykryte problemy" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtIssuesCount" DockPanel.Dock="Left" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis"/>
+                <TextBlock Text="dwuklik otwiera serwer, prawy klik – wycisz" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+              </DockPanel>
+              <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <CheckBox x:Name="chkGroup" Content="Grupuj" Margin="0,0,12,0" ToolTip="Jeden wiersz na rodzaj problemu z liczbą i listą serwerów (dwuklik pokazuje pojedyncze problemy)"/>
                 <CheckBox x:Name="chkIgnored" Content="Wyciszone" Margin="0,0,12,0" ToolTip="Pokaż problemy wyciszone (prawy klik na problemie – wycisz / przywróć)"/>
                 <Border Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
                   <StackPanel Orientation="Horizontal">
@@ -5422,17 +6172,12 @@ $script:MainXaml = @'
                     <RadioButton x:Name="rbSevInfo" GroupName="sev" Content="Info" Padding="10,4"/>
                   </StackPanel>
                 </Border>
-                <TextBox x:Name="txtIssueFilter" Width="230" Tag="Filtruj problemy (Ctrl+F)"/>
-                <Button x:Name="btnIssuesCsv" Style="{StaticResource GhostButton}" Margin="6,0,0,0" Padding="9,5" ToolTip="Eksport widocznych problemów do CSV">
-                  <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
-                </Button>
               </StackPanel>
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock x:Name="txtIssuesTitle" Text="Wykryte problemy" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock x:Name="txtIssuesCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-                <TextBlock Text="dwuklik otwiera serwer, prawy klik – wycisz" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
-            </DockPanel>
+              <TextBox x:Name="txtIssueFilter" Grid.Column="2" Tag="Filtruj problemy (Ctrl+F)"/>
+              <Button x:Name="btnIssuesCsv" Grid.Column="3" Style="{StaticResource GhostButton}" Margin="6,0,0,0" Padding="9,5" ToolTip="Eksport widocznych problemów do CSV">
+                <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
+              </Button>
+            </Grid>
 
             <Border Grid.Row="2" Style="{StaticResource Card}" Padding="1">
               <DockPanel>
@@ -5473,10 +6218,10 @@ $script:MainXaml = @'
                   <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
                 </Button>
               </StackPanel>
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="Stan serwerów" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock Text="dostępność z dziennika – ostatnie 30 dni" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
+              <DockPanel VerticalAlignment="Center">
+                <TextBlock DockPanel.Dock="Left" Text="Stan serwerów" FontSize="15" FontWeight="SemiBold"/>
+                <TextBlock Text="dostępność z dziennika – ostatnie 30 dni" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis"/>
+              </DockPanel>
             </DockPanel>
             <Border Grid.Row="4" Style="{StaticResource Card}" Padding="1">
               <DataGrid x:Name="gridServers" Style="{StaticResource DarkGrid}"/>
@@ -5494,45 +6239,56 @@ $script:MainXaml = @'
             </Grid.RowDefinitions>
             <UniformGrid Grid.Row="0" Columns="6" Margin="0,0,0,16">
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="Hosty Hyper-V" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vHosts" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Hosty Hyper-V" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vHosts" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="Maszyny działające / wszystkie" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vVms" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="VM działające / wszystkie" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vVms" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#4FD1A1" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="vCPU działających maszyn" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vCpu" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="vCPU działających maszyn" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vCpu" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="RAM przydzielony [GB]" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vRam" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="RAM przydzielony [GB]" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vRam" Text="0" FontSize="26" FontWeight="SemiBold" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}" Margin="0,0,10,0">
-                <StackPanel><TextBlock Text="Stare checkpointy" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vCheckpoints" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Stare checkpointy" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vCheckpoints" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#FFC46B" Margin="0,2,0,0"/></StackPanel>
               </Border>
               <Border Style="{StaticResource Card}">
-                <StackPanel><TextBlock Text="Linux (nie skanujemy)" Foreground="{StaticResource Muted}"/><TextBlock x:Name="vLinux" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#8791A5" Margin="0,2,0,0"/></StackPanel>
+                <StackPanel><TextBlock Text="Linux (nie skanujemy)" Style="{StaticResource TileLabelTip}"/><TextBlock x:Name="vLinux" Text="0" FontSize="26" FontWeight="SemiBold" Foreground="#8791A5" Margin="0,2,0,0"/></StackPanel>
               </Border>
             </UniformGrid>
             <DockPanel Grid.Row="1" Margin="0,0,0,10">
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="Hosty i pojemność" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock Text="z ostatniego skanu każdego hosta; dwuklik otwiera host" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
+              <DockPanel VerticalAlignment="Center">
+                <TextBlock DockPanel.Dock="Left" Text="Hosty i pojemność" FontSize="15" FontWeight="SemiBold"/>
+                <TextBlock Text="z ostatniego skanu każdego hosta; dwuklik otwiera host" Foreground="{StaticResource Faint}" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}"/>
+              </DockPanel>
             </DockPanel>
             <Border Grid.Row="2" Style="{StaticResource Card}" Padding="1">
               <DataGrid x:Name="gridHosts" Style="{StaticResource DarkGrid}"/>
             </Border>
-            <DockPanel Grid.Row="3" Margin="0,16,0,10">
-              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
-                <Border Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
-                  <StackPanel Orientation="Horizontal">
-                    <RadioButton x:Name="vfAll" GroupName="vf" Content="Wszystkie" IsChecked="True" Padding="10,4"/>
-                    <RadioButton x:Name="vfRunning" GroupName="vf" Content="Działające" Padding="10,4"/>
-                    <RadioButton x:Name="vfOff" GroupName="vf" Content="Wyłączone" Padding="10,4"/>
-                    <RadioButton x:Name="vfProblems" GroupName="vf" Content="Do sprawdzenia" Padding="10,4"/>
-                    <RadioButton x:Name="vfNotListed" GroupName="vf" Content="Spoza listy" Padding="10,4"/>
-                  </StackPanel>
-                </Border>
-                <TextBox x:Name="txtVmFilter" Width="220" Tag="Filtruj maszyny"/>
+            <!-- jak nagłówek „Wykryte problemy”: w wąskim oknie skraca się tytuł i pole filtru, „Dodaj do listy” i CSV zostają widoczne -->
+            <Grid Grid.Row="3" Margin="0,16,0,10">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*" MinWidth="80" MaxWidth="220"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <DockPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                <TextBlock DockPanel.Dock="Left" Text="Maszyny wirtualne" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                <TextBlock x:Name="txtVmCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1" TextTrimming="CharacterEllipsis"/>
+              </DockPanel>
+              <Border Grid.Column="1" Style="{StaticResource SegmentHost}" Margin="0,0,10,0">
+                <StackPanel Orientation="Horizontal">
+                  <RadioButton x:Name="vfAll" GroupName="vf" Content="Wszystkie" IsChecked="True" Padding="10,4"/>
+                  <RadioButton x:Name="vfRunning" GroupName="vf" Content="Działające" Padding="10,4"/>
+                  <RadioButton x:Name="vfOff" GroupName="vf" Content="Wyłączone" Padding="10,4"/>
+                  <RadioButton x:Name="vfProblems" GroupName="vf" Content="Do sprawdzenia" Padding="10,4"/>
+                  <RadioButton x:Name="vfNotListed" GroupName="vf" Content="Spoza listy" Padding="10,4"/>
+                </StackPanel>
+              </Border>
+              <TextBox x:Name="txtVmFilter" Grid.Column="2" Tag="Filtruj maszyny"/>
+              <StackPanel Grid.Column="3" Orientation="Horizontal">
                 <Button x:Name="btnVmAdd" Style="{StaticResource GhostButton}" Margin="6,0,0,0" Padding="9,5" ToolTip="Dodaj do listy serwerów maszyny Windows spoza listy (zaznaczone albo wszystkie widoczne); Linux jest pomijany">
                   <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE710;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="Dodaj do listy"/></StackPanel>
                 </Button>
@@ -5540,11 +6296,7 @@ $script:MainXaml = @'
                   <StackPanel Orientation="Horizontal"><TextBlock Style="{StaticResource Glyph}" Text="&#xE896;" FontSize="12" Margin="0,0,6,0"/><TextBlock Text="CSV"/></StackPanel>
                 </Button>
               </StackPanel>
-              <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                <TextBlock Text="Maszyny wirtualne" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock x:Name="txtVmCount" Foreground="{StaticResource Muted}" FontSize="12" Margin="10,0,0,0" VerticalAlignment="Bottom" Padding="0,0,0,1"/>
-              </StackPanel>
-            </DockPanel>
+            </Grid>
             <Border Grid.Row="4" Style="{StaticResource Card}" Padding="1">
               <DataGrid x:Name="gridVms" Style="{StaticResource DarkGrid}"/>
             </Border>
@@ -5667,7 +6419,7 @@ $script:MainXaml = @'
         </Grid.RowDefinitions>
         <Grid Margin="18,6,10,2">
           <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-            <TextBlock Text="DZIENNIK OPERACJI" Foreground="#5E6779" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            <TextBlock Text="DZIENNIK OPERACJI" Foreground="{StaticResource Faint}" FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center"/>
             <Border Style="{StaticResource SegmentHost}" Padding="2" Margin="14,0,0,0">
               <StackPanel Orientation="Horizontal">
                 <RadioButton x:Name="lfAll" GroupName="lf" Content="Wszystko" IsChecked="True" Padding="8,1" FontSize="11.5"/>
@@ -5699,14 +6451,15 @@ $script:MainXaml = @'
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="62"/>
                   <ColumnDefinition Width="70"/>
-                  <ColumnDefinition Width="Auto" MaxWidth="230"/>
+                  <!-- stała szerokość kolumny modułu: treść wpisów zaczyna się w każdym wierszu w tym samym miejscu -->
+                  <ColumnDefinition Width="88"/>
                   <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
-                <TextBlock Text="{Binding Time}" Foreground="#5E6779" FontFamily="Consolas" VerticalAlignment="Center"/>
+                <TextBlock Text="{Binding Time}" Foreground="{StaticResource Faint}" FontFamily="Consolas" VerticalAlignment="Center"/>
                 <Border x:Name="pill" Grid.Column="1" CornerRadius="8" Padding="7,0" HorizontalAlignment="Left" Background="#1E252F" VerticalAlignment="Center">
                   <TextBlock x:Name="lvl" Text="{Binding Level}" FontSize="10.5" FontWeight="SemiBold" Foreground="#AEB6C4"/>
                 </Border>
-                <TextBlock Grid.Column="2" Text="{Binding Module}" Foreground="#8CB0FF" Margin="0,0,12,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                <TextBlock Grid.Column="2" Text="{Binding Module}" Foreground="#8CB0FF" Margin="0,0,12,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" ToolTip="{Binding Module}"/>
                 <TextBlock Grid.Column="3" Text="{Binding Message}" TextWrapping="Wrap" VerticalAlignment="Center"/>
               </Grid>
               <DataTemplate.Triggers>
@@ -5864,7 +6617,7 @@ $script:SettingsXamlText = @'
               </StackPanel>
               <StackPanel>
                 <TextBlock Text="Zakres skanu" FontSize="15" FontWeight="SemiBold"/>
-                <TextBlock Text="Odznaczone sekcje nie są zbierane ani porównywane" Foreground="#5E6779" FontSize="11.5" TextWrapping="Wrap"/>
+                <TextBlock Text="Odznaczone sekcje nie są zbierane ani porównywane" Foreground="{StaticResource Faint}" FontSize="11.5" TextWrapping="Wrap"/>
               </StackPanel>
             </DockPanel>
             <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="sSections" Margin="0,0,8,0"/></ScrollViewer>
@@ -5886,7 +6639,7 @@ $script:SettingsXamlText = @'
         <DockPanel>
           <StackPanel DockPanel.Dock="Top" Margin="0,0,0,6">
             <TextBlock Text="Parametry i progi" FontSize="15" FontWeight="SemiBold"/>
-            <TextBlock Text="Pole „Zdarzenia z … dni” w głównym oknie zmienia zakres tylko dla bieżącego skanu" Foreground="#5E6779" FontSize="11.5" TextWrapping="Wrap"/>
+            <TextBlock Text="Pole „Zdarzenia z … dni” w głównym oknie zmienia zakres tylko dla bieżącego skanu" Foreground="{StaticResource Faint}" FontSize="11.5" TextWrapping="Wrap"/>
           </StackPanel>
           <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel x:Name="sParams" Margin="0,0,10,0"/></ScrollViewer>
         </DockPanel>
@@ -5992,6 +6745,19 @@ function Get-NamedElements($Root, [string]$Xaml) {
     $h
 }
 function Get-Glyph([string]$Code) { if ($Code) { [string][char][Convert]::ToInt32($Code, 16) } else { '' } }
+# Ikony to font Segoe Fluent Icons / Segoe MDL2 Assets (Windows 10 / Server 2016 i nowsze). Bez niego (np. stacja 2012 R2 z WMF 5.1)
+# ikony są puste: przyciski z samą ikoną (dziennik) dostają krótki opis, a w dzienniku pojawia się jedno ostrzeżenie.
+$script:IconFontOk = $null
+$script:GlyphText = @{ E8C8 = 'Kopiuj'; E8E5 = 'Plik'; E838 = 'Folder'; E894 = 'Wyczyść'; E70D = 'Ukryj' }
+function Test-IconFont {
+    if ($null -eq $script:IconFontOk) {
+        $found = $true
+        try { $found = (Test-Path -LiteralPath "$env:windir\Fonts\segmdl2.ttf") -or (Test-Path -LiteralPath "$env:windir\Fonts\SegoeIcons.ttf") -or (@([System.Windows.Media.Fonts]::SystemFontFamilies | Where-Object { $_.Source -in 'Segoe MDL2 Assets', 'Segoe Fluent Icons' }).Count -gt 0) } catch { $found = $true }
+        $script:IconFontOk = [bool]$found
+        if (-not $found) { Write-Log 'Brak fontu ikon Segoe MDL2 Assets / Segoe Fluent Icons (Windows 10 / Server 2016 i nowsze) – ikony w oknach będą puste, przyciski dziennika mają opis tekstowy.' 'WARN' 'Program' }
+    }
+    $script:IconFontOk
+}
 function New-GlyphBlock([string]$Code, [double]$Size = 13, [string]$Color = '') {
     $t = New-Object System.Windows.Controls.TextBlock
     $t.Text = Get-Glyph $Code
@@ -6003,6 +6769,7 @@ function New-GlyphBlock([string]$Code, [double]$Size = 13, [string]$Color = '') 
 }
 function New-IconContent([string]$Text, [string]$Icon, [double]$IconSize = 13) {
     if (-not $Icon) { return $Text }
+    if (-not $Text -and $script:GlyphText[$Icon] -and -not (Test-IconFont)) { return $script:GlyphText[$Icon] }
     $sp = New-Object System.Windows.Controls.StackPanel
     $sp.Orientation = 'Horizontal'
     $g = New-GlyphBlock -Code $Icon -Size $IconSize
@@ -6111,7 +6878,8 @@ function Close-Dialog($Window, [bool]$Ok) {
 }
 function Show-Message([string]$Text, [string]$Title = 'Przegląd serwerów', [ValidateSet('info', 'ok', 'warn', 'crit')][string]$Tone = 'info') {
     if ($script:Headless -or -not $window) { Write-Log "$Title`: $Text" $(if ($Tone -eq 'crit') { 'ERROR' } elseif ($Tone -eq 'warn') { 'WARN' } else { 'INFO' }); return }
-    $body = '<ScrollViewer MaxHeight="420" VerticalScrollBarVisibility="Auto"><TextBlock x:Name="msgText" TextWrapping="Wrap" Foreground="#C9D0DC" LineHeight="19"/></ScrollViewer>'
+    # pole tylko do odczytu zamiast TextBlock: treść (np. błąd AD) da się zaznaczyć i skopiować (Ctrl+A, Ctrl+C)
+    $body = '<TextBox x:Name="msgText" IsReadOnly="True" TextWrapping="Wrap" MaxHeight="420" VerticalScrollBarVisibility="Auto" BorderThickness="0" Background="Transparent" Padding="0" VerticalContentAlignment="Top" Foreground="#C9D0DC" TextBlock.LineHeight="19"/>'
     $w = New-Dialog -Title $Title -Body $body -Tone $Tone -NoCancel -Width 520
     $w.FindName('msgText').Text = $Text
     [void](Invoke-Dialog $w)
@@ -6520,16 +7288,21 @@ function New-ServerItem([string]$Name, [string]$OS) {
 }
 function Add-ServerEntry([string]$Name, [string]$OS) {
     # Zwraca $true, gdy dodano. Duplikaty po nazwie krótkiej (SRV01 = srv01.firma.local) są pomijane.
-    $Name = "$Name".Trim().Trim('"', "'")   # CSV z Export-Csv ma wartości w cudzysłowach (także nagłówek "Name")
-    if (-not $Name -or $Name -in 'Name', 'ComputerName', 'DNSHostName', 'HostName', 'Server', 'Serwer') { return $false }
+    $Name = "$Name".Trim().Trim('"', "'")   # CSV z Export-Csv ma wartości w cudzysłowach
+    if (-not $Name) { return $false }   # nagłówki plików pomija Import-ServerFile – host o nazwie SERVER albo HOSTNAME da się dodać
     if (Get-ServerItem $Name) { return $false }
+    # tylko nazwa hosta / FQDN / adres IPv4 lub IPv6: nazwa trafia do mstsc, \\nazwa\C$ i konsoli PowerShell, a nazwę VM i FQDN z KVP ustawia gość
+    if ($Name.Length -gt 253 -or ($Name -notmatch '^[\p{L}\p{Nd}_][\p{L}\p{Nd}_.-]*\z' -and $Name -notmatch '^(?=.*:)[0-9A-Fa-f:.]+(%[0-9A-Za-z]+)?\z')) { Write-Log "Pominięto nieprawidłową nazwę serwera: $(Get-ShortText $Name 80)" 'WARN' 'Lista'; return $false }
     $disp = Get-DisplayName $Name
     foreach ($it in $script:Servers) { if ($it.Display -eq $disp -and -not (Test-IpAddress $Name)) { return $false } }
     $item = New-ServerItem $Name $OS
     $script:Servers.Add($item)
     $script:ServerIndex[$Name] = $item
+    # serwer z migawkami na dysku (usunięty z listy i dodany ponownie): wyniki wczytuje Save-ServerList (Start-SnapshotLoad -Added)
+    if ($script:SnapIndex.ContainsKey((Get-SnapshotKey $Name))) { $script:ReloadNames[$Name] = $true }
     $true
 }
+$script:ReloadNames = @{}
 function Remove-ServerEntries([object[]]$Items) {
     foreach ($it in @($Items)) {
         if (-not $it) { continue }
@@ -6537,27 +7310,50 @@ function Remove-ServerEntries([object[]]$Items) {
         [void]$script:ServerIndex.Remove($it.Name)
         $script:Data.Remove($it.Name)
         $script:FullCache.Remove($it.Name)
+        [void]$script:FreshScan.Remove($it.Name)   # po ponownym dodaniu wyniki z dysku nie są „starsze od skanu z tej sesji”
+        $script:ReloadNames.Remove($it.Name)
         if ($script:CurrentServer -eq $it.Name) { $script:CurrentServer = $null }
     }
 }
 function Save-ServerList {
-    # Plik spoza .txt (np. CSV z inwentaryzacji podany w -ServerListFile) nie jest nadpisywany – lista trafia do servers.txt
+    # Plik spoza .txt (np. CSV z inwentaryzacji podany w -ServerListFile) nie jest nadpisywany – lista trafia do servers_<nazwa>.txt
+    # (nie do servers.txt: to główna lista programu, nadpisanie zastąpiłoby ją listą z CSV)
     $target = $Config.ServerListFile
     if ([IO.Path]::GetExtension($target) -ne '.txt') {
-        $target = Join-Path $Base 'servers.txt'
+        $target = Join-Path $Base ('servers_{0}.txt' -f (Get-SafeName ([IO.Path]::GetFileNameWithoutExtension($Config.ServerListFile))))
         if (-not $script:ListRedirected) { Write-Log "Lista serwerów z $($Config.ServerListFile) nie jest nadpisywana – zmiany zapisuję w $target" 'WARN' 'Lista'; $script:ListRedirected = $true }
         $Config.ServerListFile = $target
     }
     try { Set-Content -LiteralPath $target -Value @($script:Servers | ForEach-Object { $_.Name }) -Encoding UTF8 -ErrorAction Stop }
     catch { Write-Log "Nie zapisano listy serwerów ($target): $($_.Exception.Message)" 'ERROR' 'Lista'; Show-Toast 'Nie zapisano listy serwerów – szczegóły w dzienniku' 'crit' }
     if ($ui) { $ui.txtServerCount.Text = "$($script:Servers.Count)" }
+    if ($script:ReloadNames.Count -and -not $script:Headless) { Start-SnapshotLoad -Added }
 }
 function Import-ServerFile([string]$Path) {
+    # Plik tekstowy: pierwsza wartość z każdej linii. CSV z nagłówkiem (np. Get-ADComputer | Export-Csv, eksport z Excela): wartość
+    # z kolumny z nazwą hosta (DNSHostName, a gdy pusta – Name itd.), nie z pierwszej kolumny (DistinguishedName)
     $n = 0
-    foreach ($l in @(Get-Content -LiteralPath $Path -ErrorAction Stop)) {
-        $l = "$l".Trim()
-        if (-not $l -or $l.StartsWith('#')) { continue }
-        if (Add-ServerEntry (($l -split '[,;\s]+')[0])) { $n++ }
+    $lines = @(Get-Content -LiteralPath $Path -ErrorAction Stop | ForEach-Object { "$_".Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })   # '#' – komentarz i linia #TYPE z Export-Csv
+    if (-not $lines.Count) { return 0 }
+    $hdr = 'DNSHostName', 'FQDN', 'ComputerName', 'HostName', 'Host', 'Name', 'Nazwa', 'Serwer', 'Server'
+    $sep = @(';', ',', "`t" | Where-Object { $lines[0].Contains($_) }) | Select-Object -First 1
+    if ($sep) {
+        $cols = @($lines[0].Split($sep) | ForEach-Object { $_.Trim().Trim('"') })
+        $use = @($hdr | Where-Object { $cols -contains $_ })
+        $rows = $null
+        if ($use.Count) { try { $rows = @($lines | ConvertFrom-Csv -Delimiter $sep) } catch { $rows = $null } }   # np. powtórzona nazwa kolumny
+        if ($null -ne $rows) {
+            foreach ($r in $rows) {
+                $v = ''; foreach ($c in $use) { $v = "$($r.$c)".Trim(); if ($v) { break } }
+                if ($v -and (Add-ServerEntry $v)) { $n++ }
+            }
+            return $n
+        }
+    }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $v = (($lines[$i] -split '[,;\s]+')[0]).Trim('"', "'")
+        if ($i -eq 0 -and ($hdr -contains $v -or $v -eq 'DistinguishedName')) { continue }   # nagłówek pliku z jedną kolumną albo nieczytelny CSV
+        if (Add-ServerEntry $v) { $n++ }
     }
     $n
 }
@@ -6614,7 +7410,7 @@ function Update-ServerItem([string]$Name) {
         $why = switch ($cls) { 'Dns' { 'brak w DNS' } 'Offline' { 'nie odpowiada' } 'WinRM' { 'WinRM nie działa' } 'Firewall' { 'zapora blokuje WinRM' } 'Auth' { 'odmowa dostępu' } 'Kerberos' { 'błąd Kerberos' } 'TrustedHosts' { 'wymaga TrustedHosts' } 'Timeout' { 'limit czasu' } 'Remote' { 'błąd zbierania danych' } default { 'brak połączenia' } }
         $vm = Find-VmForServer $Name $d
         if ($vm -and "$($vm.Row.State)" -ne 'Running') { $why = "VM $(Get-VmStateText "$($vm.Row.State)") na $($vm.HostDisplay)" }
-        elseif (-not $vm -and $cls -notin 'Timeout', 'Remote') {
+        elseif (-not $vm -and (Test-NetworkDown $d)) {
             $hk = Find-ServerKey (Get-LastHvHost $d)
             if ($hk -and $hk -ne $Name -and (Test-NetworkDown $script:Data[$hk])) { $why = "host $(Get-DisplayName $hk) nie odpowiada" }
         }
@@ -6633,14 +7429,19 @@ function Refresh-ServerList {
     if (-not $ui) { return }
     $script:Refreshing = $true
     try { $ui.lstServers.Items.Refresh() } finally { $script:Refreshing = $false }
-    $ui.txtServerCount.Text = "$($script:Servers.Count)"
+    Update-ServerCount
+}
+function Update-ServerCount {
+    # nagłówek listy: przy aktywnym filtrze (chip albo wyszukiwanie) „widoczne z wszystkich”, jak w tabelach problemów i maszyn
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:Servers)
+    $ui.txtServerCount.Text = if ($view -and $view.Filter) { "$(@($view).Count) z $($script:Servers.Count)" } else { "$($script:Servers.Count)" }
 }
 function Update-ServerFilter {
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:Servers)
     if (-not $view) { return }
     $t = $ui.txtServerFilter.Text.Trim().ToLowerInvariant()
     $mode = if ($ui.sfProblems.IsChecked) { 'problems' } elseif ($ui.sfOffline.IsChecked) { 'offline' } elseif ($ui.sfHosts.IsChecked) { 'hosts' } elseif ($ui.sfVms.IsChecked) { 'vms' } elseif ($ui.sfNew.IsChecked) { 'new' } else { '' }
-    if (-not $t -and -not $mode) { $view.Filter = $null; return }
+    if (-not $t -and -not $mode) { $view.Filter = $null; Update-ServerCount; return }
     $view.Filter = [Predicate[object]]({
         param($o)
         switch ($mode) {
@@ -6653,6 +7454,7 @@ function Update-ServerFilter {
         if ($t) { return "$($o._Search)".Contains($t) }
         $true
     }.GetNewClosure())
+    Update-ServerCount
 }
 
 function New-SlimData($D) {
@@ -6661,7 +7463,8 @@ function New-SlimData($D) {
     $fl = @{}
     foreach ($p in $D.PSObject.Properties) {
         if ($script:HeavyKeys -contains $p.Name) {
-            $rows = @($p.Value | Where-Object { $_ -and "$($_.Flag)" -and "$($_.Flag)" -ne 'muted' })
+            # pętla foreach zamiast Where-Object – kilkukrotnie szybciej na wątku okna (setki serwerów przy wczytywaniu wyników)
+            $rows = @(foreach ($r in $p.Value) { if ($r) { $f = "$($r.Flag)"; if ($f -and $f -ne 'muted') { $r } } })
             if ($rows.Count) { $fl[$p.Name] = $rows }
             $h[$p.Name] = @()
         } else { $h[$p.Name] = $p.Value }
@@ -6690,13 +7493,14 @@ function Register-ServerData([string]$Name, $D, $Prev) {
     }
     Update-ServerItem $Name
 }
-function Get-ServerFull([string]$Name) {
-    # Pełne dane serwera do widoku szczegółów i pełnego raportu: z pamięci podręcznej albo z migawki na dysku (z ponowną analizą)
+function Get-ServerFull([string]$Name, [switch]$NoCache) {
+    # Pełne dane serwera do widoku szczegółów i pełnego raportu: z pamięci podręcznej albo z migawki na dysku (z ponowną analizą).
+    # -NoCache (pełny raport): bez zmiany pamięci podręcznej – raport kilkuset serwerów nie wypycha z niej serwerów oglądanych w oknie
     $d = $script:Data[$Name]
     if (-not $d -or -not $d.PSObject.Properties['_Slim']) { return $d }
     if ($script:FullCache.Contains($Name)) {
         $c = $script:FullCache[$Name]
-        if ($c -and "$($c._File)" -eq "$($d._File)") { Set-FullCache $Name $c; return $c }
+        if ($c -and "$($c._File)" -eq "$($d._File)") { if (-not $NoCache) { Set-FullCache $Name $c }; return $c }
     }
     $full = $null
     if ($d._File -and (Test-Path -LiteralPath $d._File)) { $full = Read-Snapshot $d._File }
@@ -6710,7 +7514,7 @@ function Get-ServerFull([string]$Name) {
     $all = Invoke-ServerAnalysis -Name $Name -D $full -Prev $prev
     $full | Add-Member -NotePropertyName _AllIssues -NotePropertyValue @($all) -Force
     Split-ServerIssues $Name $full
-    Set-FullCache $Name $full
+    if (-not $NoCache) { Set-FullCache $Name $full }
     $full
 }
 #endregion
@@ -6722,7 +7526,8 @@ function Get-ServerFull([string]$Name) {
 # Sortowanie jest pamiętane osobno dla każdej tabeli i sekcji, więc przetrwa odświeżenie w trakcie skanu i zmianę serwera.
 $script:GridSort = @{}   # klucz tabeli (np. 'detail:Disks') -> lista @{ Path = właściwość; Desc = $true/$false }
 # kolumny z poziomem ważności sortujemy wg wagi, a nie alfabetycznie (rosnąco = najpierw najpoważniejsze)
-$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Krytyczna' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Ważna' = 2; 'Zalecenie' = 3; 'Info' = 3; 'Umiarkowana' = 3; 'OK' = 4; 'Niska' = 4 }
+# Status w „Stan serwerów” i w historii skanów: bez połączenia jak krytyczny, OK przed pominiętymi i nieskanowanymi
+$script:SeverityOrder = @{ 'Krytyczny' = 0; 'Krytyczne' = 0; 'Krytyczna' = 0; 'Błąd' = 1; 'Ostrzeżenie' = 2; 'Uwaga' = 2; 'Ważna' = 2; 'Zalecenie' = 3; 'Info' = 3; 'Umiarkowana' = 3; 'OK' = 4; 'Niska' = 4; 'Brak połączenia' = 0; 'Limit czasu' = 1; 'Błąd zbierania danych' = 1; 'Pominięty' = 5; 'Nie skanowano' = 5 }
 
 function Get-SortKeys($Rows, [string]$Path) {
     # Klucze sortowania całej kolumny (jedno wywołanie na kolumnę – wywołanie funkcji na każdą komórkę było za wolne):
@@ -6797,12 +7602,59 @@ function Update-GridSortGlyphs($Grid) {
     $sort = @(Get-GridSort $Grid)
     foreach ($c in @($Grid.Columns)) { $c.SortDirection = Get-SortDirection $sort $c.SortMemberPath }
 }
-function Set-GridRows($Grid, [string]$SortKey, $Rows) {
+$script:GridWidths = @{}          # klucz tabeli -> @{ właściwość = szerokość kolumny ustawiona ręcznie [px] } (kolumny są generowane od nowa)
+$script:KeepSelection = $false    # true w trakcie odtwarzania zaznaczenia – SelectionChanged nie czyści wtedy panelu szczegółów
+function Save-GridWidths($Grid) {
+    # szerokości zmienione przez użytkownika zapamiętujemy przed przebudową kolumn – $onAutoColumn nadaje je nowym kolumnom tej tabeli
+    $st = $Grid.Tag
+    if (-not ($st -is [hashtable]) -or -not $st.Key) { return }
+    $w = $script:GridWidths[$st.Key]
+    if (-not $w) { $w = @{}; $script:GridWidths[$st.Key] = $w }
+    foreach ($c in @($Grid.Columns)) {
+        $p = "$($c.SortMemberPath)"
+        if (-not $p) { continue }
+        if ($c.Width.UnitType -eq [System.Windows.Controls.DataGridLengthUnitType]::Pixel) { $w[$p] = $c.Width.Value } else { $w.Remove($p) }
+    }
+}
+function Get-RowIdPaths($Row) {
+    # właściwości identyfikujące wiersz (problem, maszyna wirtualna, serwer albo host) – do odtworzenia zaznaczenia po odświeżeniu
+    if ($null -eq $Row) { $null }
+    elseif ($Row.PSObject.Properties['IssueKey']) { 'ServerKey', 'IssueKey' }
+    elseif ($Row.PSObject.Properties['_HostKey']) { '_HostKey', 'VM' }
+    elseif ($Row.PSObject.Properties['Key']) { 'Key', 'Key' }
+    else { $null }
+}
+function Set-GridRows($Grid, [string]$SortKey, $Rows, [switch]$Keep, [switch]$NewColumns, [scriptblock]$Filter) {
     # $Rows = kolejność oryginalna; do tabeli trafia jej kopia ułożona wg zapamiętanego sortowania
     $orig  = [object[]]@($Rows)
     $items = Get-SortedRows $orig @($script:GridSort[$SortKey] | Where-Object { $_ })
+    # -Keep: odświeżenie tej samej tabeli (w trakcie skanu co ~1,5 s) – wiersze to nowe obiekty, więc zaznaczenie i przewinięcie odtwarzamy po kluczu wiersza
+    $sel = $null; $all = $false; $sv = $null; $vo = 0; $ho = 0
+    if ($Keep -and $Grid.Tag -is [hashtable] -and $Grid.Tag.Key -eq $SortKey) {
+        $old = @($Grid.SelectedItems)
+        $ip = Get-RowIdPaths $old[0]
+        if ($old.Count -and $ip) {
+            $all = $old.Count -gt 1 -and $old.Count -ge $Grid.Items.Count   # zaznaczone wszystkie widoczne (Ctrl+A)
+            $sel = New-Object 'System.Collections.Generic.HashSet[string]'
+            foreach ($r in $old) { [void]$sel.Add("$($r.($ip[0]))|$($r.($ip[1]))") }
+        }
+        try { if ($Grid.Template) { $sv = $Grid.Template.FindName('DG_ScrollViewer', $Grid) } } catch { $sv = $null }
+        if ($sv) { $vo = $sv.VerticalOffset; $ho = $sv.HorizontalOffset }
+    }
+    # -NewColumns: kolumny generowane od nowa (zestaw właściwości może się zmienić); szerokości ustawione ręcznie wracają w $onAutoColumn
+    if ($NewColumns) { Save-GridWidths $Grid; $Grid.Columns.Clear() }
     $Grid.Tag = @{ Key = $SortKey; Rows = $orig; Items = $items }   # przed ItemsSource – korzysta z niego AutoGeneratingColumn
-    $Grid.ItemsSource = $items
+    $script:KeepSelection = [bool]$sel
+    try {
+        $Grid.ItemsSource = $items
+        if ($Filter) { & $Filter }   # filtr przed odtworzeniem zaznaczenia – zaznaczamy tylko wiersze widoczne
+        if ($all) { $Grid.SelectAll() }
+        elseif ($sel) {
+            $n = 0
+            foreach ($r in @($Grid.Items)) { if ($sel.Contains("$($r.($ip[0]))|$($r.($ip[1]))")) { [void]$Grid.SelectedItems.Add($r); $n++; if ($n -ge 1000) { break } } }
+        }
+    } finally { $script:KeepSelection = $false }
+    if ($sv -and ($vo -or $ho)) { $sv.ScrollToVerticalOffset($vo); $sv.ScrollToHorizontalOffset($ho) }
     Update-GridSortGlyphs $Grid   # zmiana ItemsSource czyści strzałki kolumn zdefiniowanych w XAML
 }
 function Update-GridOrder($Grid) {
@@ -6850,7 +7702,8 @@ function Get-AvailabilityText([string]$Name) {
     if (-not $script:AvailStats) { return '' }
     $st = $script:AvailStats[$Name.ToLowerInvariant()]
     if (-not $st -or -not $st.Seen) { return '' }
-    '{0}/{1} ({2}%)' -f $st.Ok, $st.Seen, [math]::Round(100.0 * $st.Ok / $st.Seen)
+    # procent na początku – kolumna „Dostępność” sortuje się wg niego (tekst porównywany jest wg pierwszej liczby)
+    '{2}% ({0}/{1})' -f $st.Ok, $st.Seen, [math]::Round(100.0 * $st.Ok / $st.Seen)
 }
 function Get-OverviewData([bool]$ShowIgnored = $false) {
     # Problemy i wiersze tabeli „Stan serwerów” – wspólne dla widoku, raportu HTML i trybu bez okna
@@ -6860,12 +7713,14 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
     $online = 0; $offline = 0; $crit = 0; $warn = 0; $ign = 0
     foreach ($it in $script:Servers) {
         $d = $script:Data[$it.Name]
-        if (-not $d) { continue }
+        $st = if ($script:AvailStats) { $script:AvailStats[$it.Name.ToLowerInvariant()] } else { $null }
+        # CpuUsage = obciążenie CPU w % (nagłówek „CPU [%]” jak „RAM [%]”; „CPU” to w tabeli maszyn liczba vCPU)
+        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; UptimeDays = $null; CpuUsage = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null; CveMissing = $null; CveExpl = $null
+                            Crit = [int]$d._Crit; Warn = [int]$d._Warn; Availability = (Get-AvailabilityText $it.Name); LastOk = $(if ($st) { $st.LastOk } else { '' }); ScanSec = $null; Scanned = $d.ScannedAt; Flag = '' }
+        # serwer bez danych (nowy, bez migawek albo skan przerwany) też ma wiersz – tabela i raport obejmują całą listę
+        if (-not $d) { $base.Status = 'Nie skanowano'; $base.Flag = 'muted'; $sum.Add([pscustomobject]$base); continue }
         foreach ($i in @($(if ($showIgnored) { $d._Ignored } else { $d._Issues }))) { if ($i) { $all.Add($i) } }
         $crit += [int]$d._Crit; $warn += [int]$d._Warn; $ign += @($d._Ignored).Count
-        $st = if ($script:AvailStats) { $script:AvailStats[$it.Name.ToLowerInvariant()] } else { $null }
-        $base = [ordered]@{ Key = $it.Name; Server = $it.Display; Status = ''; Kind = $it.Kind; OS = ''; HvHost = $it.HvHost; UptimeDays = $null; CPU = $null; RAM = $null; MinDiskPct = $null; PatchDays = $null; CveMissing = $null; CveExpl = $null
-                            Crit = [int]$d._Crit; Warn = [int]$d._Warn; Availability = (Get-AvailabilityText $it.Name); LastOk = $(if ($st) { $st.LastOk } else { '' }); ScanSec = $null; Scanned = $d.ScannedAt; Flag = '' }
         if ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) {
             $base.Status = 'Pominięty'; $base.Flag = 'muted'; $base.OS = "$($d.Unsupported)"
         } elseif ($d.Offline) {
@@ -6878,7 +7733,7 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
             $online++
             $s = $d.System
             $base.Status = 'OK'; $base.OS = "$($s.OS)" -replace '^Microsoft ', ''
-            $base.UptimeDays = $s.UptimeDays; $base.CPU = $s.CpuLoad; $base.RAM = $s.RamUsedPct
+            $base.UptimeDays = $s.UptimeDays; $base.CpuUsage = $s.CpuLoad; $base.RAM = $s.RamUsedPct
             $base.MinDiskPct = (@($d.Disks) | Where-Object { $_ } | Measure-Object FreePct -Minimum).Minimum
             $base.PatchDays = $(if ($s.LastHotfixDays -ge 0) { $s.LastHotfixDays } else { $null })
             $cs = $d.PSObject.Properties['_CveSum'].Value
@@ -6905,16 +7760,51 @@ function Get-OverviewData([bool]$ShowIgnored = $false) {
         Online = $online; Offline = $offline; Crit = $crit; Warn = $warn; Ignored = $ign; Hosts = $hosts; VmRun = $vmRun; VmAll = $vmAll
     }
 }
+$script:Headers['ServerList'] = 'Serwery'   # zgrupowane problemy: lista serwerów (panel szczegółów, eksport CSV)
+function Group-IssueRows($Issues) {
+    # „Grupuj”: jeden wiersz na rodzaj problemu (ten sam poziom i IssueKey – liczby zastąpione '#') z liczbą i listą serwerów
+    $g = [ordered]@{}
+    foreach ($i in @($Issues)) {
+        if (-not $i) { continue }
+        $k = "$($i.Rank)|$($i.IssueKey)"
+        if (-not $g.Contains($k)) { $g[$k] = New-Object System.Collections.Generic.List[object] }
+        $g[$k].Add($i)
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($k in $g.Keys) {
+        $l = $g[$k]; $f = $l[0]
+        $seen = @{}; $same = $true
+        foreach ($x in $l) { $seen["$($x.Server)"] = 1; if ("$($x.Message)" -ne "$($f.Message)") { $same = $false } }
+        $srv = [string[]]@($seen.Keys); [Array]::Sort($srv, [StringComparer]::OrdinalIgnoreCase); $n = $srv.Count   # liczba serwerów (kilka problemów z tym kluczem na jednym serwerze to jeden serwer)
+        # różne liczby w treści (dni, procenty) – opis z klucza problemu, z '#' w miejscu liczb
+        $msg = if ($same) { "$($f.Message)" } else { ("$($f.IssueKey)" -split '\|', 3)[-1] }
+        $rows.Add([pscustomobject]@{ Severity = $f.Severity; Server = "$n × $(Join-Short $srv 3)"; Category = $f.Category; Message = $msg; ServerList = ($srv -join ', ')
+            ServerKey = $(if ($n -eq 1) { $f.ServerKey } else { '' }); Section = $f.Section; Rank = $f.Rank; SevColor = $f.SevColor; SevBg = $f.SevBg; Flag = $f.Flag; IssueKey = $f.IssueKey; Ignored = $f.Ignored
+            _Count = $n; _Items = [object[]]$l.ToArray(); _Search = ("$($srv -join ' ') $($f.Category) $msg $($f.Message)").ToLowerInvariant() })
+    }
+    Get-SortedRows ([object[]]$rows.ToArray()) @(@{ Path = 'Rank'; Desc = $false }, @{ Path = '_Count'; Desc = $true }, @{ Path = 'Message'; Desc = $false })
+}
+function Show-IssueGroup($Row) {
+    # dwuklik / menu na zgrupowanym problemie: pojedyncze problemy, filtr po najdłuższym fragmencie opisu bez liczb
+    $part = @("$($Row.Message)" -split '#' | ForEach-Object { $_.Trim() } | Sort-Object Length -Descending)[0]
+    $ui.chkGroup.IsChecked = $false
+    $ui.txtIssueFilter.Text = "$part".ToLowerInvariant()
+    Update-Overview
+}
 function Update-Overview {
     $showIgnored = [bool]$ui.chkIgnored.IsChecked
+    $grouped = [bool]$ui.chkGroup.IsChecked
     $o = Get-OverviewData $showIgnored
     $script:AllIssues = $o.Issues
-    Set-GridRows $ui.gridIssues 'issues' $script:AllIssues
-    Update-IssueFilter
-    $ui.txtIssuesTitle.Text = if ($showIgnored) { 'Wyciszone problemy' } else { 'Wykryte problemy' }
+    $rows = $script:AllIssues
+    if ($grouped) { $rows = Group-IssueRows $o.Issues }
+    # zaznaczenie i przewinięcie przetrwają odświeżenie w trakcie skanu; widok zgrupowany ma osobne sortowanie
+    Set-GridRows $ui.gridIssues $(if ($grouped) { 'issues:group' } else { 'issues' }) $rows -Keep -Filter { Update-IssueFilter }
+    $dt = Format-RowDetail $ui.gridIssues.SelectedItem
+    if ($ui.dIssueDetail.Text -ne $dt) { $ui.dIssueDetail.Text = $dt }
+    $ui.txtIssuesTitle.Text = "$(if ($showIgnored) { 'Wyciszone problemy' } else { 'Wykryte problemy' })$(if ($grouped) { ' – zgrupowane' })"
     $ui.chkIgnored.Content = if ($o.Ignored) { "Wyciszone ($($o.Ignored))" } else { 'Wyciszone' }
-    $ui.gridServers.Columns.Clear()
-    Set-GridRows $ui.gridServers 'servers' $o.Servers
+    Set-GridRows $ui.gridServers 'servers' $o.Servers -Keep -NewColumns
     $ui.tTotal.Text   = "$($script:Servers.Count)"
     $ui.tOnline.Text  = "$($o.Online)"
     $ui.tOffline.Text = "$($o.Offline)"
@@ -6939,20 +7829,37 @@ function Update-IssueFilter {
             $true
         }.GetNewClosure())
     }
-    $ui.txtIssuesCount.Text = "$(@($view).Count) z $(@($ui.gridIssues.ItemsSource).Count)"
+    $ui.txtIssuesCount.Text = "$($view.Count) z $(@($ui.gridIssues.ItemsSource).Count)"   # Count widoku (po filtrze) bez kopiowania wierszy do tablicy
 }
 #endregion
 
 #region ── Widok Hyper-V (wszystkie hosty i maszyny) ────────────────────────────
-function Get-ServerByGuest([hashtable]$ByDisplay, $Row) {
-    $g = "$($Row.PSObject.Properties['GuestFQDN'].Value)"
-    if ($g) { $it = $ByDisplay[(Get-DisplayName $g)]; if ($it) { return $it } }
-    $ByDisplay["$($Row.Name)".ToUpperInvariant()]
+function Get-ServerByGuest([hashtable]$ByDisplay, $Row, [hashtable]$ByVm, [string]$HostDisplay) {
+    # jak Find-VmForServer: najpierw identyfikator i nazwa VM z danych gościa (działa też dla wyłączonej maszyny bez KVP), potem nazwa gościa z KVP albo nazwa VM
+    if ($ByVm) {
+        $id = "$($Row.PSObject.Properties['Id'].Value)"
+        if ($id -and $ByVm.ContainsKey($id)) { return $ByVm[$id] }
+        $nk = "$HostDisplay|$("$($Row.Name)".ToUpperInvariant())"
+        if ($ByVm.ContainsKey($nk)) { return $ByVm[$nk] }
+    }
+    $g = "$($Row.PSObject.Properties['GuestFQDN'].Value)"; $it = $null
+    if ($g) { $it = $ByDisplay[(Get-DisplayName $g)] }
+    if (-not $it) { $it = $ByDisplay["$($Row.Name)".ToUpperInvariant()] }
+    # serwer fizyczny albo na innej platformie (VMware, KVM…) nie jest tą maszyną – zgodność nazwy jest przypadkowa (jak w Find-VmForServer)
+    if ($it) { $gs = Get-DataSystem $script:Data[$it.Name]; if ($gs -and -not "$($gs.PSObject.Properties['HvVmId'].Value)" -and $gs.PSObject.Properties['Hypervisor'] -and "$($gs.Hypervisor)" -ne 'Hyper-V') { return $null } }
+    $it
 }
 function Get-VmData {
     if (-not $script:VmIndex) { Update-VmIndex }
-    $byDisplay = @{}
-    foreach ($it in $script:Servers) { if (-not $byDisplay.ContainsKey($it.Display)) { $byDisplay[$it.Display] = $it } }
+    $byDisplay = @{}; $byVm = @{}
+    foreach ($it in $script:Servers) {
+        if (-not $byDisplay.ContainsKey($it.Display)) { $byDisplay[$it.Display] = $it }
+        # maszyna gościa wg jego danych (także ostatnich udanych – serwer offline): identyfikator VM, a w starszych danych host + nazwa VM
+        $gs = Get-DataSystem $script:Data[$it.Name]
+        if (-not $gs) { continue }
+        if ($gs.PSObject.Properties['HvVmId'] -and $gs.HvVmId) { if (-not $byVm.ContainsKey("$($gs.HvVmId)")) { $byVm["$($gs.HvVmId)"] = $it } }
+        elseif ($gs.PSObject.Properties['HvVmName'] -and $gs.HvVmName -and $gs.PSObject.Properties['HvHost'] -and $gs.HvHost) { $nk = "$(Get-DisplayName "$($gs.HvHost)")|$("$($gs.HvVmName)".ToUpperInvariant())"; if (-not $byVm.ContainsKey($nk)) { $byVm[$nk] = $it } }
+    }
     # Hosty
     $hosts = New-Object System.Collections.Generic.List[object]
     $oldCp = 0; $cpuSum = 0; $ramSum = 0.0; $run = 0; $tot = 0
@@ -6968,7 +7875,8 @@ function Get-VmData {
         $flag = if ($d._Crit) { 'crit' } elseif (($ratio -and $ratio -gt $Config.VcpuRatioWarn) -or ($pct -and $pct -ge $Config.HostRamWarnPct)) { 'warn' } else { '' }
         $hosts.Add([pscustomobject]@{
             Key = $it.Name; Host = $it.Display; HvCluster = $(if ($s.PSObject.Properties['HvCluster']) { "$($s.HvCluster)" } else { '' })
-            Vms = "$($s.HvVmRunning) / $($s.HvVmTotal)"; VCpuRatio = $(if ($ratio) { "$vr / $lp ($ratio : 1)" } else { '' }); RamPct = $pct
+            # współczynnik na początku i zawsze z 2 miejscami po kropce – sortowanie tekstu porównuje liczby po kolei (2.50 > 2.25, 3.00 > 2.50)
+            Vms = "$($s.HvVmRunning) / $($s.HvVmTotal)"; VCpuRatio = $(if ($ratio) { "$($ratio.ToString('0.00', [Globalization.CultureInfo]::InvariantCulture)) : 1 ($vr / $lp)" } else { '' }); RamPct = $pct
             HvRamAssignedGB = $as; RamGB = $ram; Checkpoints = $cp; Crit = [int]$d._Crit; Warn = [int]$d._Warn; Scanned = $d.ScannedAt; Flag = $flag
         })
     }
@@ -6980,7 +7888,7 @@ function Get-VmData {
         $lin = "$($r.PSObject.Properties['Linux'].Value)" -eq 'Tak'
         $rpl = "$($r.PSObject.Properties['ReplicationMode'].Value)" -match 'Replica'
         if ($lin) { $linux++ }
-        $srv = if ($rpl) { $null } else { Get-ServerByGuest $byDisplay $r }
+        $srv = if ($rpl) { $null } else { Get-ServerByGuest $byDisplay $r $byVm $e.HostDisplay }
         $gst = if ($rpl) { 'replika (Hyper-V Replica)' } elseif ($lin) { 'Linux – nie skanujemy' } elseif (-not $srv) { '' } else { switch ($srv.Status) { 'ok' { "OK$(if ($srv.Crit) { ", krytyczne: $($srv.Crit)" } elseif ($srv.Warn) { ", ostrzeżenia: $($srv.Warn)" })" } 'offline' { 'Brak połączenia' } 'skipped' { 'Pominięty' } default { 'Nieskanowany' } } }
         $flag = "$($r.Flag)"
         if (-not $flag -and $srv -and $srv.Status -eq 'offline' -and "$($r.State)" -eq 'Running') { $flag = 'warn' }
@@ -6997,11 +7905,9 @@ function Get-VmData {
 }
 function Update-VmView {
     $v = Get-VmData
-    $ui.gridHosts.Columns.Clear()
-    Set-GridRows $ui.gridHosts 'vmhosts' $v.Hosts
-    $ui.gridVms.Columns.Clear()
-    Set-GridRows $ui.gridVms 'vms' $v.Vms
-    Update-VmFilter
+    # odświeżenie w trakcie skanu zachowuje zaznaczenie, przewinięcie i ręcznie zmienione szerokości kolumn
+    Set-GridRows $ui.gridHosts 'vmhosts' $v.Hosts -Keep -NewColumns
+    Set-GridRows $ui.gridVms 'vms' $v.Vms -Keep -NewColumns -Filter { Update-VmFilter }
     $ui.vHosts.Text = "$(@($v.Hosts).Count)"
     $ui.vVms.Text = "$($v.Run) / $($v.Total)"
     $ui.vCpu.Text = "$($v.Cpu)"
@@ -7032,14 +7938,23 @@ function Update-VmFilter {
     $ui.txtVmCount.Text = "$(@($view).Count) z $(@($ui.gridVms.ItemsSource).Count)"
 }
 function Add-VmsToList {
-    # Maszyny Windows spoza listy (zaznaczone albo wszystkie widoczne) → lista serwerów; Linux pomijany
+    # Maszyny Windows spoza listy (zaznaczone albo – po wyraźnym pytaniu – wszystkie widoczne) → lista serwerów; Linux pomijany
     $sel = @($ui.gridVms.SelectedItems)
-    if (-not $sel.Count) { $sel = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridVms.ItemsSource)) }
+    $visible = -not $sel.Count
+    if ($visible) { $sel = @([System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridVms.ItemsSource)) }
     $cand = @($sel | Where-Object { $_ -and -not $_.OnList -and -not $_._Linux })
     if (-not $cand.Count) { Show-Toast 'Brak maszyn Windows spoza listy wśród wybranych.' 'info'; return }
-    $names = @($cand | ForEach-Object { if ($_.GuestFQDN) { $_.GuestFQDN } else { $_.VM } } | Sort-Object -Unique)
+    $all = @($cand | ForEach-Object { if ($_.GuestFQDN) { $_.GuestFQDN } else { $_.VM } } | Sort-Object -Unique)
+    # tylko poprawne nazwy hostów: nazwa VM z Hyper-V bywa opisem („SQL01 - produkcja”), a lista w pliku jest cięta na pierwszej spacji
+    $names = @($all | Where-Object { "$_" -match '^[A-Za-z0-9_][A-Za-z0-9_-]{0,62}(\.[A-Za-z0-9_-]{1,63})*$' })
+    $bad = @($all | Where-Object { $names -notcontains $_ })
+    if (-not $names.Count) { Show-Message "Żadna z wybranych maszyn nie ma poprawnej nazwy hosta (np. nazwa VM z opisem, a nazwa gościa nieznana – maszyna wyłączona): $($bad -join ', ')`n`nDodaj je ręcznie pod właściwą nazwą DNS." 'Dodaj maszyny do listy' 'info'; return }
+    $txt = "$(if ($visible) { 'Nie zaznaczono maszyn – dodać do listy serwerów wszystkie widoczne maszyny Windows spoza listy' } else { 'Dodać do listy serwerów zaznaczone maszyny' }) ($($names.Count))?`n`n$($names -join ', ')"
+    if ($bad.Count) { $txt += "`n`nPominięte ($($bad.Count)) – to nie jest poprawna nazwa hosta (np. nazwa VM z opisem, a nazwa gościa nieznana); dodaj je ręcznie pod nazwą DNS: $($bad -join ', ')" }
+    $dom = "$env:USERDNSDOMAIN".ToLowerInvariant()
+    $other = @(if ($dom) { $names | Where-Object { "$_".Contains('.') -and -not "$_".ToLowerInvariant().EndsWith(".$dom") } })
+    if ($other.Count) { $txt += "`n`nSpoza domeny $dom ($($other.Count)) – nazwę zgłasza system gościa, sprawdź, czy to właściwe serwery: $($other -join ', ')" }
     $unknown = @($cand | Where-Object { -not $_.GuestOS }).Count
-    $txt = "Dodać do listy serwerów maszyny ($($names.Count)): $(Join-Short $names 12)?"
     if ($unknown) { $txt += "`n`nU $unknown maszyn system gościa jest nieznany (np. maszyna wyłączona) – jeśli to Linux, zostanie rozpoznany i pominięty po skanie hosta." }
     if (-not (Confirm-Action -Text $txt -Title 'Dodaj maszyny do listy' -ConfirmText 'Dodaj' -Tone 'info')) { return }
     $n = 0
@@ -7115,10 +8030,11 @@ function Get-SectionRows($D, [string]$Key, [string]$Name = $script:CurrentServer
                 [pscustomobject]@{ Severity = $(if ($i.Ignored) { "$($i.Severity) (wyciszony)" } else { $i.Severity }); Category = $i.Category; Message = $i.Message; Flag = $(if ($i.Ignored) { 'muted' } else { $i.Flag }); _Issue = $i }
             })
         }
-        'Changes'     { @($D._Changes | Where-Object { $_ }) }
+        # pętle foreach zamiast potoków Where-Object – sekcje liczone przy każdym otwarciu serwera mają tysiące wierszy
+        'Changes'     { @(foreach ($x in $D._Changes) { if ($x) { $x } }) }
         'Diagnostics' { @(Get-DiagnosticsRows $Name $D) }
         'History'     { @(Get-AvailabilityHistory $Name) }
-        'HvHost'      { @($D._HvHost | Where-Object { $_ }) }
+        'HvHost'      { @(foreach ($x in $D._HvHost) { if ($x) { $x } }) }
         'Cve'         { @(Get-CveRows $D) }
         'System'  {
             if ($D.System) {
@@ -7134,7 +8050,7 @@ function Get-SectionRows($D, [string]$Key, [string]$Name = $script:CurrentServer
             }
         }
         default {
-            $rows = @($D.$Key | Where-Object { $null -ne $_ })
+            $rows = @(foreach ($x in $D.$Key) { if ($null -ne $x) { $x } })
             # lekka kopia danych: z dużych sekcji zostały tylko wiersze oznaczone
             if (-not $rows.Count -and $D.PSObject.Properties['_Slim'] -and $D._Flagged -and $D._Flagged.ContainsKey($Key)) { $rows = @($D._Flagged[$Key]) }
             $rows
@@ -7159,8 +8075,10 @@ function Test-SectionShown($D, [string]$Key) {
     $true
 }
 function Get-WorstFlag($Rows) {
-    $f = @($Rows | ForEach-Object { "$($_.Flag)" })
-    if ($f -contains 'crit') { 'crit' } elseif ($f -contains 'warn') { 'warn' } elseif ($f -contains 'info') { 'info' } else { '' }
+    # jedno przejście bez potoku; pierwszy 'crit' kończy szukanie
+    $w = ''
+    foreach ($r in $Rows) { switch ("$($r.Flag)") { 'crit' { return 'crit' } 'warn' { $w = 'warn' } 'info' { if (-not $w) { $w = 'info' } } } }
+    $w
 }
 
 function Show-ServerDetail([string]$Name) {
@@ -7176,8 +8094,9 @@ function Show-ServerDetail([string]$Name) {
     $ui.dName.Text = $item.Display
     if (-not $d) { $ui.dOS.Text = "$Name – jeszcze nie skanowano. Użyj przycisku Skanuj ponownie."; & $clear; return }
     if (-not $d.Offline -and $d.PSObject.Properties['_Slim']) {
-        $old = $window.Cursor; $window.Cursor = [System.Windows.Input.Cursors]::Wait
-        try { $d = Get-ServerFull $Name } finally { $window.Cursor = $old }
+        # $script:window – z taktu silnika w pętli okna modalnego $window wskazywałby (zakres dynamiczny) parametr $Window z Invoke-Dialog
+        $old = $script:window.Cursor; $script:window.Cursor = [System.Windows.Input.Cursors]::Wait
+        try { $d = Get-ServerFull $Name } finally { $script:window.Cursor = $old }
     }
     $ui.dCrit.Text = "$($d._Crit)"; $ui.dWarn.Text = "$($d._Warn)"
     $av = if ($script:AvailStats) { $script:AvailStats[$Name.ToLowerInvariant()] } else { $null }
@@ -7249,26 +8168,34 @@ function Show-Section {
     if (-not $sel) { return }
     $script:CurrentSection = $sel.Key
     $ui.dSectionTitle.Text = $sel.Header
-    $ui.dSectionCount.Text = "$($sel.Count) pozycji"
+    Save-GridWidths $ui.gridDetail   # szerokości kolumn zapamiętane dla sekcji (przed ItemsSource = $null, które usuwa kolumny)
     $ui.gridDetail.ItemsSource = $null
     $ui.gridDetail.Columns.Clear()
     $rows = @($sel.Rows)
     Set-GridRows $ui.gridDetail "detail:$($sel.Key)" $rows   # sortowanie zapamiętane dla tej sekcji (także po zmianie serwera)
-    $ui.dEmpty.Visibility = if ($rows.Count) { 'Collapsed' } else { 'Visible' }
     $ui.dRowDetail.Text = ''
-    Update-DetailFilter
+    Update-DetailFilter   # licznik pozycji i komunikat o pustej tabeli – z uwzględnieniem filtra
 }
 function Update-DetailFilter {
     if ($null -eq $ui.gridDetail.ItemsSource) { return }
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($ui.gridDetail.ItemsSource)
     if (-not $view) { return }
     $t = $ui.txtGridFilter.Text.Trim()
-    if (-not $t) { $view.Filter = $null; return }
+    if (-not $t) { $view.Filter = $null; Update-DetailCount $view ''; return }
     $view.Filter = [Predicate[object]]({
         param($o)
         foreach ($p in $o.PSObject.Properties) { if ($p.Name -notlike '_*' -and "$($p.Value)".IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
         $false
     }.GetNewClosure())
+    Update-DetailCount $view $t
+}
+function Update-DetailCount($View, [string]$Text) {
+    # filtr zostaje po zmianie sekcji i serwera – licznik „X z Y” i osobny komunikat, żeby pusta tabela nie wyglądała na pustą sekcję
+    $total = @($ui.gridDetail.ItemsSource).Count
+    $shown = if ($Text) { @($View).Count } else { $total }
+    $ui.dSectionCount.Text = if ($Text) { "$shown z $total pozycji" } else { "$total pozycji" }
+    $ui.dEmpty.Text = if ($total) { 'Brak wierszy pasujących do filtra „{0}”' -f $Text } else { 'Brak pozycji w tej sekcji' }
+    $ui.dEmpty.Visibility = if ($shown) { 'Collapsed' } else { 'Visible' }
 }
 function Select-Server([string]$Key, [string]$Section) {
     $item = Get-ServerItem $Key
@@ -7288,16 +8215,20 @@ function Select-Server([string]$Key, [string]$Section) {
 #region ── Silnik operacji w tle (skan, wczytywanie migawek, diagnostyka) ───────
 # Pule wątków jak w AD-ManagerDiamond: każdy serwer to osobne zadanie (PowerShell w puli), więc ma własny limit czasu,
 # a wynik – razem z zapisem migawki, parsowaniem JSON i diagnostyką niedostępności – przygotowuje wątek tła.
-# Wątek okna (timer) tylko odbiera gotowe obiekty, z budżetem czasu na takt, i odświeża widoki co ~1,5 s.
-#   Remote – skan i diagnostyka (do ThrottleLimit naraz), Local – wczytywanie migawek z dysku (kilka wątków).
+# Wątek okna (timer) tylko odbiera gotowe obiekty, z budżetem czasu na takt, i odświeża widoki co ~1,5 s (rzadziej, gdy odświeżenie jest kosztowne).
+#   Remote – skan (do ThrottleLimit naraz), Local – wczytywanie migawek z dysku (kilka wątków),
+#   Aux – diagnoza na żądanie i dane CVE (mała osobna pula: nie czekają w kolejce za setkami zadań skanu).
 $script:Ops       = New-Object System.Collections.ArrayList
-$script:Pools     = @{ Remote = $null; Local = $null }
+$script:Pools     = @{ Remote = $null; Local = $null; Aux = $null }
 $script:Abandoned = New-Object System.Collections.ArrayList
 $script:AbandonAfterSec = 15
 $script:OpId      = 0
 $script:InTick    = $false
 $script:UiDirty   = @{ List = $false; Overview = $false; Vms = $false; Detail = $false }
 $script:LastUiRefresh = [Diagnostics.Stopwatch]::StartNew()
+$script:UiRefreshMs = 1500     # odstęp odświeżania widoków w trakcie operacji – rośnie z kosztem odświeżenia (Invoke-UiRefresh)
+$script:CredProbe = $false     # skan z hasłem niesprawdzonym w domenie: 2 serwery naraz, aż któryś przyjmie poświadczenia (Get-EnginePool)
+$script:PendingRetry = $null   # zaplanowana ponowna próba po skanie: @{ Targets; State; Due } – start w takcie silnika (Update-Operations)
 
 function New-EnginePool([int]$Max) {
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -7308,7 +8239,10 @@ function New-EnginePool([int]$Max) {
     $pool
 }
 function Get-EnginePool([string]$Kind) {
-    $max = if ($Kind -eq 'Local') { [Math]::Max(2, [Math]::Min(6, [Environment]::ProcessorCount)) } else { [int]$Config.ThrottleLimit }
+    $max = switch ($Kind) { 'Local' { [Math]::Max(2, [Math]::Min(6, [Environment]::ProcessorCount)) } 'Aux' { [Math]::Max(2, [Math]::Min(8, [int]$Config.ThrottleLimit)) } default { [int]$Config.ThrottleLimit } }
+    if ($Kind -eq 'Remote' -and $script:CredProbe) { $max = [Math]::Min($max, 2) }   # ochrona konta (Start-Scan, Complete-CredProbe)
+    # zadanie porzucone (zawieszone wywołanie WinRM/LDAP/DNS) nadal zajmuje miejsce w puli – limit rośnie o ich liczbę (najwyżej dwukrotnie)
+    $max += [Math]::Min($max, @($script:Abandoned | Where-Object { $_.Pool -eq $Kind }).Count)
     if (-not $script:Pools[$Kind]) { $script:Pools[$Kind] = New-EnginePool $max }
     else { try { [void]$script:Pools[$Kind].SetMaxRunspaces($max) } catch { } }
     $script:Pools[$Kind]
@@ -7326,7 +8260,7 @@ function Start-Operation {
     $pl = Get-EnginePool $Pool
     $script:OpId++
     $op = @{
-        Id = $script:OpId; Kind = $Kind; Name = $Name; Items = New-Object System.Collections.ArrayList; Total = @($Items).Count; Done = 0; Failed = 0
+        Id = $script:OpId; Kind = $Kind; Name = $Name; Pool = $Pool; Items = New-Object System.Collections.ArrayList; Total = @($Items).Count; Done = 0; Failed = 0
         Cancelled = $false; CancelAt = $null; CancelReason = ''; Started = Get-Date; TimeoutSec = $TimeoutSec; TotalTimeoutSec = $TotalTimeoutSec
         OnResult = $OnResult; OnComplete = $OnComplete; State = $State
         Sync = [hashtable]::Synchronized(@{ Started = [hashtable]::Synchronized(@{}) })
@@ -7351,13 +8285,18 @@ function Stop-Operation($Op, [string]$Reason = 'Przerwano') {
     Write-Log "$($Op.Name) – przerywanie: $Reason" 'WARN' $Op.Name
     Update-StatusBar
 }
-function Stop-AllOperations([string]$Reason = 'Przerwano') { foreach ($op in @($script:Ops)) { Stop-Operation $op $Reason } }
+function Stop-AllOperations([string]$Reason = 'Przerwano') {
+    # przerwanie anuluje też zaplanowaną ponowną próbę (Complete-Scan)
+    if ($script:PendingRetry) { Write-Log "Ponowna próba dla $(@($script:PendingRetry.Targets).Count) serwerów – anulowano: $Reason" 'WARN' 'Skan'; $script:PendingRetry = $null; Update-StatusBar }
+    foreach ($op in @($script:Ops)) { Stop-Operation $op $Reason }
+}
 
 function Get-ItemResult($Op, $Item) {
-    $r = $null
-    try { $out = $Item.PS.EndInvoke($Item.Handle); if ($out -and $out.Count) { $r = $out[0] } } catch { }
+    $r = $null; $endErr = ''
+    # wyjątek z EndInvoke (np. skrypt wątku się nie kompiluje) nie ginie – najgłębsza przyczyna trafia do opisu błędu
+    try { $out = $Item.PS.EndInvoke($Item.Handle); if ($out -and $out.Count) { $r = $out[0] } } catch { $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }; $endErr = "$($ex.Message)" }
     if (-not $r) {
-        $msg = if ($Item.TimedOut) { "Przekroczono limit czasu jednego serwera ($($Op.TimeoutSec) s)" } elseif ($Op.Cancelled) { $Op.CancelReason }
+        $msg = if ($Item.TimedOut) { "Przekroczono limit czasu jednego serwera ($($Op.TimeoutSec) s)" } elseif ($Op.Cancelled) { $Op.CancelReason } elseif ($endErr) { $endErr }
                elseif ($Item.PS.Streams.Error.Count) { "$($Item.PS.Streams.Error[0].Exception.Message)" } else { 'Zadanie nie zwróciło wyniku.' }
         $id = if ($Item.TimedOut) { 'SrTimeout' } elseif ($Op.Cancelled) { 'SrCancelled' } else { 'SrNoResult' }
         $st = $Op.Sync.Started[$Item.Target]
@@ -7383,7 +8322,10 @@ function Update-Operations {
     $script:InTick = $true
     $budget = [Diagnostics.Stopwatch]::StartNew()
     try {
-        foreach ($a in @($script:Abandoned)) { if ($a.Handle.IsCompleted) { try { [void]$a.PS.EndInvoke($a.Handle) } catch { }; try { $a.PS.Dispose() } catch { }; $script:Abandoned.Remove($a) } }
+        foreach ($a in @($script:Abandoned)) { if ($a.Handle.IsCompleted) { try { [void]$a.PS.EndInvoke($a.Handle) } catch { }; try { $a.PS.Dispose() } catch { }; $script:Abandoned.Remove($a); if ($script:Pools[$a.Pool]) { [void](Get-EnginePool $a.Pool) } } }
+        $pr = $script:PendingRetry
+        # trwający skan – ponowna próba po nim; serwery usunięte z listy w czasie oczekiwania są pomijane (czas UTC: zmiana czasu nie wydłuża oczekiwania)
+        if ($pr -and [DateTime]::UtcNow -ge $pr.Due -and -not (Get-Operation 'Scan')) { $script:PendingRetry = $null; $tg = @($pr.Targets | Where-Object { Get-ServerItem $_ }); if ($tg.Count) { Start-Scan $tg $pr.State } else { Invoke-PendingReanalysis } }
         foreach ($op in @($script:Ops)) {
             if (-not $op.Cancelled -and $op.TotalTimeoutSec -gt 0 -and ((Get-Date) - $op.Started).TotalSeconds -gt $op.TotalTimeoutSec) { Stop-Operation $op "Przekroczono limit czasu całego skanu ($($op.TotalTimeoutSec) s)" }
             $abandon = $op.Cancelled -and $op.CancelAt -and ((Get-Date) - $op.CancelAt).TotalSeconds -ge $script:AbandonAfterSec
@@ -7392,8 +8334,9 @@ function Update-Operations {
                 if ($budget.ElapsedMilliseconds -gt 300) { break }   # reszta wyników w kolejnym takcie – okno ma reagować
                 if ($it.Handle.IsCompleted) { Complete-OperationItem $op $it (Get-ItemResult $op $it); continue }
                 if ($abandon -or ($it.Stopping -and ((Get-Date) - $it.StopAt).TotalSeconds -ge $script:AbandonAfterSec)) {
-                    [void]$script:Abandoned.Add(@{ PS = $it.PS; Handle = $it.Handle })
                     $st = $op.Sync.Started[$it.Target]
+                    # zadanie, które ruszyło, dalej zajmuje miejsce w puli – limit puli rośnie o nie (Get-EnginePool), żeby kolejka nie stała
+                    [void]$script:Abandoned.Add(@{ PS = $it.PS; Handle = $it.Handle; Pool = $(if ($st) { $op.Pool } else { '' }) }); if ($st) { [void](Get-EnginePool $op.Pool) }
                     $r = [pscustomobject]@{ Mode = $op.Kind; Name = $it.Target; Ok = $false; Data = $null; Prev = $null; Last = $null
                                             Error = $(if ($it.TimedOut) { "Przekroczono limit czasu jednego serwera ($($op.TimeoutSec) s); zadanie nie odpowiedziało na przerwanie" } else { "$($op.CancelReason) (zadanie porzucone)" })
                                             ErrorId = $(if ($it.TimedOut) { 'SrTimeout' } else { 'SrCancelled' }); ErrorCode = ''; Diag = $null; SnapFile = ''; SnapError = ''; LatestFile = ''; PrevFile = ''; ScannedAt = ''; ReceivedUtc = $null
@@ -7422,11 +8365,11 @@ function Update-Operations {
     catch { Write-Log "Błąd silnika operacji: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program' }
     finally {
         $script:InTick = $false
-        if ($script:Ops.Count -eq 0 -and $script:EngineTimer -and -not $script:Abandoned.Count) { $script:EngineTimer.Stop() }
+        if ($script:Ops.Count -eq 0 -and $script:EngineTimer -and -not $script:Abandoned.Count -and -not $script:PendingRetry) { $script:EngineTimer.Stop() }
     }
     if (-not $script:Headless) {
         Update-StatusBar
-        if ($script:LastUiRefresh.ElapsedMilliseconds -ge 1500 -or $script:Ops.Count -eq 0) { Invoke-UiRefresh }
+        if ($script:LastUiRefresh.ElapsedMilliseconds -ge $script:UiRefreshMs -or $script:Ops.Count -eq 0) { Invoke-UiRefresh }
         # Okna z wynikami – dopiero po zwolnieniu taktu (okno modalne nie wstrzymuje odbioru wyników pozostałych serwerów)
         # DispatcherTimer wznawia się dopiero po powrocie z Tick – bez ponownego uzbrojenia okno modalne (i blokada PIN-em
         # czekająca na odblokowanie) zatrzymałoby odbiór wyników i limity czasu serwerów
@@ -7445,14 +8388,17 @@ function Request-UiRefresh([switch]$All, [switch]$List, [switch]$Detail) {
 }
 function Invoke-UiRefresh {
     # Odświeżenie widoków, które się zmieniły – tylko widocznych (pozostałe przy przełączeniu widoku)
+    # Następne w trakcie operacji najwcześniej po 3× czasie tego odświeżenia, liczonym od jego końca (Update-Operations): przy dużej
+    # flocie przebudowa tabel nie zajmuje całego wątku okna – kliknięcia i odbiór wyników mają czas między odświeżeniami
     if ($script:Headless -or -not $ui) { return }
-    $script:LastUiRefresh.Restart()
+    $refreshSw = [Diagnostics.Stopwatch]::StartNew()
     try {
         if ($script:UiDirty.List) { Refresh-ServerList; $script:UiDirty.List = $false }
         if ($script:UiDirty.Overview -and $ui.viewOverview.Visibility -eq 'Visible') { Update-Overview; $script:UiDirty.Overview = $false }
         if ($script:UiDirty.Vms -and $ui.viewVms.Visibility -eq 'Visible') { Update-VmView; $script:UiDirty.Vms = $false }
         if ($script:UiDirty.Detail -and $ui.viewServer.Visibility -eq 'Visible') { Show-ServerDetail $script:CurrentServer; $script:UiDirty.Detail = $false }
     } catch { Write-Log "Błąd odświeżania widoku: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program' }
+    finally { $script:UiRefreshMs = [Math]::Min(15000, [Math]::Max(1500, 3 * $refreshSw.ElapsedMilliseconds)); $script:LastUiRefresh.Restart() }
 }
 $script:IdleStatus = ''   # komunikat paska stanu przywracany, gdy nie ma już żadnej operacji (Update-StatusBar)
 function Update-StatusBar {
@@ -7461,8 +8407,8 @@ function Update-StatusBar {
     if (-not $ops.Count) {
         $ui.statusDot.Fill = Brush '#5EE3AE'
         $ui.prg.Visibility = 'Collapsed'
-        $ui.btnCancelOps.Visibility = 'Collapsed'
-        if ($script:IdleStatus) { $ui.txtStatus.Text = $script:IdleStatus }   # ostatni komunikat sprzed operacji albo podsumowanie skanu/wczytania
+        $ui.btnCancelOps.Visibility = if ($script:PendingRetry) { 'Visible' } else { 'Collapsed' }   # „Przerwij” anuluje zaplanowaną ponowną próbę
+        if ($script:IdleStatus) { $ui.txtStatus.Text = $script:IdleStatus + $(if ($script:PendingRetry) { "   •   start ponownej próby za $([int][Math]::Max(0, [Math]::Ceiling(($script:PendingRetry.Due - [DateTime]::UtcNow).TotalSeconds))) s" }) }   # ostatni komunikat sprzed operacji albo podsumowanie skanu/wczytania
         Set-ScanUi $false
         return
     }
@@ -7472,7 +8418,7 @@ function Update-StatusBar {
         $el = [int]((Get-Date) - $op.Started).TotalSeconds
         $running = $op.Sync.Started.Count - $op.Done   # Count bez wyliczania kluczy – wątki tła dopisują je w tym czasie
         $t = '{0}: {1} z {2}' -f $op.Name, $op.Done, $op.Total
-        if ($op.Kind -eq 'Scan') { $t += ", w toku $([Math]::Max(0, $running))" }
+        if ($op.Kind -eq 'Scan') { $t += ", w toku $([Math]::Max(0, $running))"; $slow = Update-ScanItems $op; if ($slow) { $t += ", najdłużej: $slow" } }
         if ($op.Failed) { $t += ", bez danych: $($op.Failed)" }
         if ($op.Cancelled) { $t += ' – przerywanie…' }
         "$t, $el s"
@@ -7483,6 +8429,21 @@ function Update-StatusBar {
     $ui.prg.Value = if ($total) { [double]$done / $total * 100 } else { 0 }
     $ui.btnCancelOps.Visibility = 'Visible'
     Set-ScanUi ([bool](Get-Operation 'Scan'))
+}
+function Update-ScanItems($Op) {
+    # Pozycje listy serwerów w trakcie skanu: zadania, które już ruszyły, pokazują „skanowanie… N s” (czas z Sync.Started – odczyt
+    # indeksem, bez wyliczania kluczy dopisywanych przez wątki tła); zwraca najdłużej skanowany serwer (od 30 s) do paska stanu
+    $now = [DateTime]::UtcNow; $top = $null; $topSec = 29
+    foreach ($x in $Op.Items) {
+        if ($x.Finished) { continue }
+        $t0 = $Op.Sync.Started[$x.Target]
+        if (-not $t0) { continue }
+        $sec = [int]($now - $t0).TotalSeconds
+        $li = Get-ServerItem $x.Target
+        if ($li) { $li.Color = '#4C7DF0'; $li.Sub = "skanowanie… $sec s"; $script:UiDirty.List = $true }
+        if ($sec -gt $topSec) { $topSec = $sec; $top = $x.Target }
+    }
+    if ($top) { "$(Get-DisplayName $top) $topSec s" }
 }
 function Set-ScanUi([bool]$On) {
     if (-not $ui) { return }
@@ -7507,7 +8468,8 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
     $days = 0
     if ($RetryOf) { $days = $RetryOf.Days }
     elseif ($ui -and $ui.txtDays) {
-        if (-not [int]::TryParse($ui.txtDays.Text, [ref]$days) -or $days -lt 1 -or $days -gt 180) { $days = $Config.EventDays; $ui.txtDays.Text = "$days" }
+        # poza zakresem 1–180: powyżej 180 – 180, inaczej liczba dni z ustawień; z komunikatem, nie po cichu
+        if (-not [int]::TryParse($ui.txtDays.Text, [ref]$days) -or $days -lt 1 -or $days -gt 180) { $was = "$($ui.txtDays.Text)".Trim(); $days = $(if ($days -gt 180) { 180 } else { [int]$Config.EventDays }); $ui.txtDays.Text = "$days"; Show-Toast "Zakres zdarzeń musi wynosić od 1 do 180 dni (wpisano: $(if ($was) { $was } else { 'puste pole' })) – użyto $days." 'warn' 6 }
     } else { $days = $Config.EventDays }
     # Linux (rozpoznany na hoście Hyper-V) nie jest skanowany
     $linux = @($Targets | Where-Object { Test-LinuxGuest $_ })
@@ -7515,6 +8477,8 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
     if ($linux.Count) { Write-Log "Pominięto maszyny z Linuksem: $(Join-Short ($linux | ForEach-Object { Get-DisplayName $_ }) 10)" 'INFO' 'Skan' }
     $Targets = @($Targets | Where-Object { $linux -notcontains $_ })
     if (-not $Targets.Count) { Request-UiRefresh -List; return }
+    # nowy skan zastępuje zaplanowaną ponowną próbę dla serwerów, które obejmuje (pozostałe – po nim, Update-Operations)
+    if (-not $RetryOf -and $script:PendingRetry) { $script:PendingRetry.Targets = @($script:PendingRetry.Targets | Where-Object { $Targets -notcontains $_ }); if (-not $script:PendingRetry.Targets.Count) { $script:PendingRetry = $null } }
 
     # folder skanu: znacznik czasu (kolejność migawek = kolejność nazw); dwa skany w tej samej sekundzie dostają przyrostek _2, _3…
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
@@ -7534,10 +8498,14 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
             Preflight = [bool]$Config.Preflight
         } }
         $it = Get-ServerItem $t
-        if ($it) { $it.Color = '#4C7DF0'; $it.Sub = $(if ($RetryOf) { 'ponowna próba…' } else { 'w kolejce do skanu…' }) }
+        if ($it) { $it.Color = '#56688F'; $it.Sub = $(if ($RetryOf) { 'ponowna próba…' } else { 'w kolejce do skanu…' }) }   # szaroniebieski – w kolejce; niebieski – w toku (Update-ScanItems)
     }
-    $state = @{ SnapDir = $snapDir; Ok = 0; Offline = 0; Timeout = 0; Cancelled = 0; AuthFails = 0; Days = $days; Targets = $Targets; RetryOf = $RetryOf }
+    $state = @{ SnapDir = $snapDir; Ok = 0; Offline = 0; Timeout = 0; Cancelled = 0; Errors = 0; AuthFails = 0; FailAt = @{}; Days = $days; Targets = $Targets; RetryOf = $RetryOf }
     $who = if ($script:Cred) { $script:Cred.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
+    # Ochrona konta: hasło niesprawdzone w domenie (Test-Credential bez dostępu do kontrolera) – najpierw 2 serwery naraz, a nie ThrottleLimit
+    # nieudanych logowań jednocześnie; pełna równoległość po pierwszym serwerze, który przyjmie poświadczenia (Complete-CredProbe)
+    $script:CredProbe = [bool]($script:Cred -and $script:CredVerified -ne $true)
+    if ($script:CredProbe) { Write-Log "Hasło konta $who nie zostało sprawdzone w domenie – skan zaczyna od 2 serwerów naraz, aż któryś przyjmie poświadczenia (ochrona przed zablokowaniem konta)" 'INFO' 'Skan' }
     if ($RetryOf) { Write-Log ("Ponowna próba dla {0} serwerów z błędem, który może być chwilowy: {1}" -f $Targets.Count, (Join-Short ($Targets | ForEach-Object { Get-DisplayName $_ }) 10)) 'INFO' 'Skan' }
     else { Write-Log ("Skan – start: {0} serwerów (równolegle {1}, limit {2} s na serwer, zdarzenia z {3} dni{4}), konto {5}" -f $Targets.Count, $Config.ThrottleLimit, $Config.ServerTimeoutSec, $days, $(if ($skipList.Count) { ", pominięte sekcje: $($skipList.Count)" } else { '' }), $who) 'INFO' 'Skan' }
     [void](Start-Operation -Kind 'Scan' -Name $(if ($RetryOf) { 'Ponowna próba' } else { 'Skan' }) -Items @($items) -Pool 'Remote' -TimeoutSec ([int]$Config.ServerTimeoutSec) -TotalTimeoutSec ([int]$Config.ScanTimeoutSec) -State $state `
@@ -7545,6 +8513,13 @@ function Start-Scan([string[]]$Targets, $RetryOf) {
     Request-UiRefresh -List
 }
 function Get-NowText { Get-Date -Format 'yyyy-MM-dd HH:mm' }
+function Complete-CredProbe {
+    # serwer przyjął poświadczenia niesprawdzone wcześniej w domenie (Start-Scan) – dalej pełna równoległość skanu
+    if (-not $script:CredProbe) { return }
+    $script:CredProbe = $false; $script:CredVerified = $true
+    [void](Get-EnginePool 'Remote')
+    Write-Log "Serwer przyjął poświadczenia konta $($script:Cred.UserName) – skan dalej z pełną równoległością ($($Config.ThrottleLimit))" 'INFO' 'Skan'
+}
 function Receive-ScanResult($Op, $R) {
     $name = $R.Name
     $st = $Op.State
@@ -7565,12 +8540,21 @@ function Receive-ScanResult($Op, $R) {
         if (@($d.PSObject.Properties['Truncated'].Value).Count) { Write-Log "[$(Get-DisplayName $name)] Osiągnięto limit pobieranych zdarzeń: $(@($d.Truncated) -join '; ') – zwiększ limit w Ustawieniach" 'WARN' 'Skan' }
         Add-AvailabilityRecord $name 'OK' $d.DurationSec $dd._Crit $dd._Warn '' ''
         $st.AuthFails = 0
+        Complete-CredProbe
     }
     elseif ($R.ErrorId -eq 'SrCancelled') {
         # Przerwany skan nie zmienia danych serwera (to nie jest niedostępność)
         $st.Cancelled++
         Update-ServerItem $name
         if (-not $prevData) { $it = Get-ServerItem $name; if ($it) { $it.Color = '#4A5263'; $it.Sub = 'skan przerwany' } }
+    }
+    elseif ($R.ErrorId -eq 'SrNoResult' -or (-not "$($R.ErrorId)" -and -not $R.Diag)) {
+        # Błąd programu w wątku tła (zadanie bez wyniku albo wyjątek poza obsługą błędów połączenia) – to nie jest niedostępność serwera:
+        # dane, dziennik dostępności i ponowna próba bez zmian, przyczyna w dzienniku
+        $st.Errors++
+        Write-Log "[$(Get-DisplayName $name)] Błąd programu podczas skanu (to nie jest brak połączenia): $($R.Error)" 'ERROR' 'Program'
+        Update-ServerItem $name
+        if (-not $prevData) { $it = Get-ServerItem $name; if ($it) { $it.Color = '#4A5263'; $it.Sub = 'błąd programu – szczegóły w dzienniku' } }
     }
     elseif ($R.ErrorId -eq 'SrTimeout') {
         $st.Timeout++
@@ -7594,6 +8578,7 @@ function Receive-ScanResult($Op, $R) {
     }
     else {
         $st.Offline++
+        $st.FailAt[$name] = [DateTime]::UtcNow   # chwila porażki (UTC) – ponowna próba najwcześniej RetryDelaySec później (Complete-Scan)
         $last = $R.Last
         if (-not $last -and $prevData -and $prevData.PSObject.Properties['_Last']) { $last = $prevData._Last }
         $d = [pscustomobject]@{ Offline = $true; Error = $R.Error; ErrorId = $R.ErrorId; ErrorCode = $R.ErrorCode; Diag = $R.Diag; _Last = $last; ScannedAt = (Get-NowText); _File = "$($R.SnapFile)"; DurationSec = $R.DurationSec }
@@ -7604,6 +8589,7 @@ function Receive-ScanResult($Op, $R) {
         $cause = if ($R.Diag) { "$($R.Diag.Cause)" } else { Get-ShortText $R.Error 200 }
         Write-Log ("[{0}] Brak połączenia – {1}{2}{3}" -f (Get-DisplayName $name), $cause, $(if ($R.Diag -and $R.Diag.Ports) { " (porty: $($R.Diag.Ports))" }), $(if ($R.Diag -and $R.Diag.Notes) { "; $($R.Diag.Notes)" })) $(if ($cls -eq 'Remote') { 'WARN' } else { 'ERROR' }) 'Skan'
         if (-not $st.RetryOf) { Add-AvailabilityRecord $name $(if ($cls -eq 'Remote') { 'Błąd zbierania danych' } else { 'Brak połączenia' }) $R.DurationSec 0 0 $cls $cause }
+        if ($cls -eq 'Remote') { Complete-CredProbe }   # serwer odpowiedział po zalogowaniu (brak danych to nie odmowa poświadczeń)
         # Ochrona konta: kilka odmów logowania z rzędu bez żadnego sukcesu = złe hasło – przerwij, zanim konto zostanie zablokowane w domenie
         if ($cls -eq 'Auth' -and $script:Cred) {
             $st.AuthFails++
@@ -7630,50 +8616,71 @@ function Test-TransientFailure($D) {
     $cls = if ($D.PSObject.Properties['Diag'] -and $D.Diag) { "$($D.Diag.Class)" } else { '' }
     $cls -in '', 'Offline', 'WinRM', 'Network', 'Unknown', 'Limit'
 }
+function Test-FailingBefore([string]$Name, [datetime]$Since) {
+    # serwer bez połączenia już przed podaną chwilą (statystyka dostępności: FailSince, z dokładnością do minuty) – np. wyłączony od tygodni
+    $av = if ($script:AvailStats) { $script:AvailStats[$Name.ToLowerInvariant()] } else { $null }
+    [bool]($av -and $av.FailSince -and [string]::CompareOrdinal("$($av.FailSince)", $Since.ToString('yyyy-MM-dd HH:mm')) -lt 0)
+}
+$script:RetryDelaySec = 60   # ponowna próba najwcześniej tyle sekund po porażce serwera (restart, opóźniony start WinRM)
 function Complete-Scan($Op) {
     $st = $Op.State
     $el = [int]((Get-Date) - $Op.Started).TotalSeconds
     try { if ((Test-Path -LiteralPath $st.SnapDir) -and -not (Get-ChildItem -LiteralPath $st.SnapDir -Force)) { Remove-Item -LiteralPath $st.SnapDir -Force } } catch { }
     Remove-OldSnapshots
+    Sync-AvailabilityStats   # zaległe wpisy dziennika dostępności, nowa doba, wpisy skanu bez okna
     Update-VmIndex
     Update-OfflineAnalysis
     Update-StationClock
     foreach ($t in @($st.Targets)) { Update-ServerItem $t }
-    $retry = @()
+    $retry = @(); $wait = 0
     if ($st.RetryOf) {
         # wynik ponownej próby: serwery, które teraz odpowiedziały, przechodzą do udanych w liczniku skanu głównego
         $p = $st.RetryOf
-        $p.Ok += $st.Ok; $p.Timeout += $st.Timeout; $p.Offline = [Math]::Max(0, $p.Offline - $st.Ok - $st.Timeout)
+        $p.Ok += $st.Ok; $p.Timeout += $st.Timeout; $p.Errors += $st.Errors; $p.Offline = [Math]::Max(0, $p.Offline - $st.Ok - $st.Timeout - $st.Errors)
         $script:LastScanState = $p
-        $msg = "Ponowna próba zakończona w $el s: odpowiedziało $($st.Ok) z $($st.Targets.Count)$(if ($st.Offline) { ", nadal bez połączenia $($st.Offline)" })"
+        $msg = "Ponowna próba zakończona w $el s: odpowiedziało $($st.Ok) z $($st.Targets.Count)$(if ($st.Offline) { ", nadal bez połączenia $($st.Offline)" })$(if ($st.Errors) { ", błąd programu $($st.Errors)" })"
     } else {
         $script:LastScanState = $st
         if (-not $Op.Cancelled) { Update-StationNetwork $st }
-        if ($Config.RetryFailed -and -not $Op.Cancelled -and -not $script:StationNetIssue) { $retry = @($st.Targets | Where-Object { $script:FreshScan.Contains($_) -and (Test-TransientFailure $script:Data[$_]) }) }
-        $msg = "Skan zakończony w $el s: $($st.Ok) OK, bez połączenia $($st.Offline)$(if ($st.Timeout) { ", limit czasu $($st.Timeout)" })$(if ($st.Cancelled) { ", przerwane $($st.Cancelled)" })$(if ($retry.Count) { "; ponowna próba: $($retry.Count)" })"
+        # błąd chwilowy, ale nie serwery bez połączenia już przed tym skanem (wyłączone od dawna – druga runda testu portu i diagnozy nic nie da)
+        if ($Config.RetryFailed -and -not $Op.Cancelled -and -not $script:StationNetIssue) { $retry = @($st.Targets | Where-Object { $script:FreshScan.Contains($_) -and (Test-TransientFailure $script:Data[$_]) -and -not (Test-FailingBefore $_ $Op.Started) }) }
+        if ($retry.Count) {
+            # start najwcześniej RetryDelaySec po porażce serwera (restartujący się serwer nie dostaje ponowienia po kilku sekundach) – w takcie silnika
+            $due = [DateTime]::UtcNow
+            foreach ($t in $retry) { $f = $st.FailAt[$t]; if ($f -and $f.AddSeconds($script:RetryDelaySec) -gt $due) { $due = $f.AddSeconds($script:RetryDelaySec) } }
+            # skan części serwerów w czasie oczekiwania na ponowną próbę po wcześniejszym skanie: dopisanie do niej (bez gubienia jej serwerów)
+            if ($script:PendingRetry) { $script:PendingRetry.Targets = @(@($script:PendingRetry.Targets) + @($retry | Where-Object { $script:PendingRetry.Targets -notcontains $_ })); if ($due -gt $script:PendingRetry.Due) { $script:PendingRetry.Due = $due } }
+            else { $script:PendingRetry = @{ Targets = $retry; State = $st; Due = $due } }
+            $wait = [int][Math]::Ceiling(($script:PendingRetry.Due - [DateTime]::UtcNow).TotalSeconds)
+        }
+        $msg = "Skan zakończony w $el s: $($st.Ok) OK, bez połączenia $($st.Offline)$(if ($st.Timeout) { ", limit czasu $($st.Timeout)" })$(if ($st.Cancelled) { ", przerwane $($st.Cancelled)" })$(if ($st.Errors) { ", błąd programu $($st.Errors)" })$(if ($retry.Count) { "; ponowna próba: $($retry.Count)" })"
     }
-    Write-Log $msg $(if ($st.Offline -or $st.Timeout -or $Op.Cancelled) { 'WARN' } else { 'OK' }) 'Skan'
+    Write-Log "$msg$(if ($wait -gt 0) { " (za $wait s)" })" $(if ($st.Offline -or $st.Timeout -or $st.Errors -or $Op.Cancelled) { 'WARN' } else { 'OK' }) 'Skan'
     if (-not $script:Headless) {
         $ui.txtStatus.Text = $msg; $script:IdleStatus = $msg
         $ui.txtLastScan.Text = "Ostatni skan: $(Get-NowText)"
-        Show-Toast $msg $(if ($Op.Cancelled) { 'warn' } elseif ($st.Offline) { 'warn' } else { 'ok' }) 6
+        Show-Toast $msg $(if ($Op.Cancelled) { 'warn' } elseif ($st.Offline -or $st.Errors) { 'warn' } else { 'ok' }) 6
         Request-UiRefresh -All
     }
-    if ($retry.Count) { Start-Scan $retry $st }
     Start-CveUpdate -Auto   # nowy system w flocie albo stare dane CVE
     Invoke-PendingReanalysis
 }
 function Invoke-PendingReanalysis {
-    # ustawienia zmienione w trakcie skanu/wczytywania – ponowna analiza po zakończeniu operacji
-    if ($script:ReanalyzePending -and -not (Get-Operation 'Scan') -and -not (Get-Operation 'Load')) { $script:ReanalyzePending = $false; Start-SnapshotLoad -Reanalyze }
+    # ustawienia zmienione w trakcie skanu/wczytywania – ponowna analiza po zakończeniu operacji (także po zaplanowanej ponownej próbie)
+    if ($script:ReanalyzePending -and -not (Get-Operation 'Scan') -and -not (Get-Operation 'Load') -and -not $script:PendingRetry) { $script:ReanalyzePending = $false; Start-SnapshotLoad -Reanalyze }
+    elseif ($script:ReloadNames.Count) { Start-SnapshotLoad -Added }   # serwery dodane ponownie w trakcie wczytywania
 }
 $script:ReanalyzePending = $false
 
 # ── Wczytywanie wyników z dysku (start programu, ponowna analiza po zmianie ustawień) ──
-function Start-SnapshotLoad([switch]$Reanalyze) {
+function Start-SnapshotLoad([switch]$Reanalyze, [switch]$Added) {
+    # -Added: tylko serwery dodane ponownie do listy, z migawkami na dysku (Add-ServerEntry) – dane pozostałych zostają w pamięci
     if (Get-Operation 'Load') { return }
-    Update-SnapshotIndex
+    $only = @($script:ReloadNames.Keys)
+    $script:ReloadNames.Clear()
+    if ($Added) { if (-not $only.Count) { return } } else { $only = @(); Update-SnapshotIndex; Sync-AvailabilityStats }
     $items = foreach ($it in @($script:Servers)) {
+        if ($only.Count -and $only -notcontains $it.Name) { continue }
         $files = @(Get-SnapshotEntries $it.Name | ForEach-Object { @{ Path = $_.Path; Offline = $_.Offline } })
         if (-not $files.Count) { continue }
         if ($files.Count -gt 6) { $files = $files[0..5] }
@@ -7687,21 +8694,32 @@ function Start-SnapshotLoad([switch]$Reanalyze) {
     if (-not $items.Count) { return }
     if ($Reanalyze) { $script:FreshScan.Clear() }
     if (-not $script:Headless) { $ui.txtStatus.Text = "Wczytywanie wyników z dysku: 0 z $($items.Count)…" }
-    [void](Start-Operation -Kind 'Load' -Name $(if ($Reanalyze) { 'Ponowna analiza' } else { 'Wczytywanie wyników' }) -Items $items -Pool 'Local' -State @{ Last = $null; Bad = 0; Reanalyze = [bool]$Reanalyze } `
+    [void](Start-Operation -Kind 'Load' -Name $(if ($Reanalyze) { 'Ponowna analiza' } elseif ($Added) { 'Wczytywanie wyników dodanych serwerów' } else { 'Wczytywanie wyników' }) -Items $items -Pool 'Local' -State @{ Last = $null; Bad = 0; Cancelled = 0; Reanalyze = [bool]$Reanalyze; Added = [bool]$Added } `
         -OnResult { param($op, $r) Receive-LoadResult $op $r } -OnComplete { param($op) Complete-Load $op })
 }
 function Receive-LoadResult($Op, $R) {
     $name = $R.Name
+    if ($R.ErrorId -eq 'SrCancelled') { $Op.State.Cancelled++; return }   # przerwane wczytywanie to nie nieczytelna migawka (Complete-Load)
     if ($R.Error) { Write-Log "[$(Get-DisplayName $name)] $($R.Error)" 'WARN' 'Migawki' }
     if (-not $R.Ok -or -not $R.Data) { $Op.State.Bad++; return }
     if ($script:FreshScan.Contains($name)) { return }   # w tej sesji jest już nowszy wynik skanu
-    $d = $R.Data
-    $d | Add-Member -NotePropertyName ScannedAt -NotePropertyValue $R.ScannedAt -Force
-    $d | Add-Member -NotePropertyName _File -NotePropertyValue "$($R.LatestFile)" -Force
-    $d | Add-Member -NotePropertyName _PrevFile -NotePropertyValue "$($R.PrevFile)" -Force
-    if ($d.Offline) { $d | Add-Member -NotePropertyName _Last -NotePropertyValue $R.Last -Force }
-    Register-ServerData $name $d $R.Prev
-    if (-not $Op.State.Last -or [string]::CompareOrdinal($R.ScannedAt, $Op.State.Last) -gt 0) { $Op.State.Last = $R.ScannedAt }
+    if (-not (Get-ServerItem $name)) { return }   # usunięty z listy w trakcie wczytywania – bez osieroconych danych (kafelki Hyper-V, raport)
+    $old = $script:Data[$name]
+    if ($Op.State.Reanalyze -and $old -and -not ($old.PSObject.Properties['_File'] -and $old._File)) {
+        # ponowna analiza: dane tylko z tej sesji, bez pliku (limit czasu bez wcześniejszych danych, Linux, nieudany zapis migawki) –
+        # zostają (starsza migawka z dysku udawałaby aktualny wynik), analizowane od nowa z nowymi progami
+        Register-ServerData $name $old $null
+    } else {
+        $d = $R.Data
+        $d | Add-Member -NotePropertyName ScannedAt -NotePropertyValue $R.ScannedAt -Force
+        $d | Add-Member -NotePropertyName _File -NotePropertyValue "$($R.LatestFile)" -Force
+        $d | Add-Member -NotePropertyName _PrevFile -NotePropertyValue "$($R.PrevFile)" -Force
+        if ($d.Offline) { $d | Add-Member -NotePropertyName _Last -NotePropertyValue $R.Last -Force }
+        # ponowna analiza tej samej migawki: stan z tej sesji, którego nie ma w pliku (ostrzeżenie o limicie czasu, ręczna diagnoza)
+        if ($Op.State.Reanalyze -and $old -and "$($old._File)" -eq "$($R.LatestFile)") { foreach ($k in @('_ScanNote', '_ManualDiag') + @(if ($d.Offline) { 'Diag' })) { if ($old.PSObject.Properties[$k]) { $d | Add-Member -NotePropertyName $k -NotePropertyValue $old.$k -Force } } }
+        Register-ServerData $name $d $R.Prev
+        if (-not $Op.State.Last -or [string]::CompareOrdinal($R.ScannedAt, $Op.State.Last) -gt 0) { $Op.State.Last = $R.ScannedAt }
+    }
     $script:UiDirty.List = $true; $script:UiDirty.Overview = $true; $script:UiDirty.Vms = $true
     if ($name -eq $script:CurrentServer) { $script:UiDirty.Detail = $true }
 }
@@ -7711,12 +8729,14 @@ function Complete-Load($Op) {
     Update-StationClock
     $el = [math]::Round(((Get-Date) - $Op.Started).TotalSeconds, 1)
     $off = @($script:Data.Values | Where-Object { $_ -and $_.Offline }).Count
-    Write-Log ("{0}: {1} serwerów w {2} s{3}{4}" -f $Op.Name, ($Op.Done - $Op.State.Bad), $el, $(if ($off) { ", bez połączenia przy ostatniej próbie: $off" }), $(if ($Op.State.Bad) { ", nieczytelne: $($Op.State.Bad)" })) 'INFO' 'Migawki'
+    $n = $Op.Done - $Op.State.Bad - $Op.State.Cancelled
+    Write-Log ("{0}: {1} serwerów w {2} s{3}{4}{5}" -f $Op.Name, $n, $el, $(if ($off) { ", bez połączenia przy ostatniej próbie: $off" }), $(if ($Op.State.Bad) { ", nieczytelne: $($Op.State.Bad)" }), $(if ($Op.Cancelled) { " – przerwano ($($Op.CancelReason)), nie wczytano: $($Op.State.Cancelled)" })) $(if ($Op.Cancelled) { 'WARN' } else { 'INFO' }) 'Migawki'
     if (-not $script:Headless) {
-        if ($Op.State.Last) { $ui.txtLastScan.Text = "Wyniki z ostatniego skanu: $($Op.State.Last)" }
-        $ui.txtStatus.Text = "Wczytano wyniki $($Op.Done - $Op.State.Bad) serwerów"; $script:IdleStatus = $ui.txtStatus.Text
+        if ($Op.State.Last -and -not $Op.State.Added) { $ui.txtLastScan.Text = "Wyniki z ostatniego skanu: $($Op.State.Last)" }
+        $ui.txtStatus.Text = if ($Op.Cancelled) { "$($Op.Name) – przerwano: wczytano wyniki $n z $($Op.Total) serwerów" } else { "Wczytano wyniki $n serwerów" }; $script:IdleStatus = $ui.txtStatus.Text
         Request-UiRefresh -All
     }
+    if ($Op.Cancelled) { return }   # przerwane (przycisk Przerwij, zamykanie) – bez automatycznego pobierania CVE i ponownej analizy
     Start-CveUpdate -Auto   # dane CVE dla systemów z floty (pierwsze pobranie albo odświeżenie)
     Invoke-PendingReanalysis
 }
@@ -7730,12 +8750,16 @@ function Start-Diagnostics([string[]]$Targets) {
         @{ Target = $t; Opt = @{ ErrorText = $(if ($d -and $d.Offline) { "$($d.Error)" } else { '' }); ErrorId = $(if ($d -and $d.Offline) { "$($d.ErrorId)" } else { '' }); ErrorCode = ''; DiagPorts = [int[]]@($Config.DiagPorts); DiagTimeoutMs = [int]$Config.DiagTimeoutMs } }
     }
     Write-Log "Diagnostyka połączenia: $(Join-Short ($Targets | ForEach-Object { Get-DisplayName $_ }) 8)" 'INFO' 'Diagnoza'
-    [void](Start-Operation -Kind 'Diag' -Name 'Diagnoza' -Items @($items) -Pool 'Remote' -TimeoutSec 120 -State @{ Single = ($Targets.Count -eq 1) } `
+    [void](Start-Operation -Kind 'Diag' -Name 'Diagnoza' -Items @($items) -Pool 'Aux' -TimeoutSec 120 -State @{ Single = ($Targets.Count -eq 1) } `
         -OnResult { param($op, $r) Receive-DiagResult $op $r } -OnComplete { param($op) Request-UiRefresh -All })
 }
 function Receive-DiagResult($Op, $R) {
     $name = $R.Name
-    if (-not $R.Ok -or -not $R.Diag) { Write-Log "[$(Get-DisplayName $name)] Diagnoza nie powiodła się: $($R.Error)" 'ERROR' 'Diagnoza'; return }
+    if (-not $R.Ok -or -not $R.Diag) {
+        Write-Log "[$(Get-DisplayName $name)] Diagnoza nie powiodła się: $($R.Error)" 'ERROR' 'Diagnoza'
+        if ($Op.State.Single -and $R.ErrorId -ne 'SrCancelled') { Show-Toast "Diagnoza $(Get-DisplayName $name) nie powiodła się: $(Get-ShortText $R.Error 120)" 'warn' 6 }   # nie tylko wpis w dzienniku
+        return
+    }
     $dg = $R.Diag
     $d = $script:Data[$name]
     if ($d) {
@@ -7762,6 +8786,8 @@ $script:PendingDialogs = New-Object System.Collections.ArrayList
 # i wiersze wymagające uwagi – mały plik także przy kilkuset serwerach. Pełny: wszystkie sekcje każdego serwera (wczytywane
 # kolejno z migawek, do 500 wierszy na sekcję). Zapis strumieniowy – bez budowania całego dokumentu w pamięci.
 function HtmlEnc($s) { [System.Net.WebUtility]::HtmlEncode("$s") }
+# Flag wiersza bywa wartością z JSON serwera (kolektor, wiersze Hyper-V) – do atrybutu class trafiają tylko znane klasy
+function HtmlFlag($f) { if ("$f" -cin 'crit', 'warn', 'info', 'muted') { "$f" } else { '' } }
 function Write-HtmlTable([System.IO.TextWriter]$W, $Rows, [int]$Cap = 0) {
     $Rows = @($Rows | Where-Object { $null -ne $_ })
     if (-not $Rows.Count) { $W.Write('<p class="muted">Brak pozycji</p>'); return }
@@ -7773,7 +8799,7 @@ function Write-HtmlTable([System.IO.TextWriter]$W, $Rows, [int]$Cap = 0) {
     foreach ($r in $Rows) {
         if ($Cap -gt 0 -and $n -ge $Cap) { break }
         $n++
-        $W.Write('<tr class="'); $W.Write("$($r.Flag)"); $W.Write('">')
+        $W.Write('<tr class="'); $W.Write((HtmlFlag $r.Flag)); $W.Write('">')
         foreach ($c in $cols) { $W.Write('<td>'); $W.Write([System.Net.WebUtility]::HtmlEncode("$($r.$c)")); $W.Write('</td>') }
         $W.Write('</tr>')
     }
@@ -7787,7 +8813,7 @@ function Write-HtmlIssues([System.IO.TextWriter]$W, $Issues, [switch]$WithServer
     if ($WithServer) { $W.Write('<th>Serwer</th>') }
     $W.Write('<th>Kategoria</th><th>Opis</th></tr></thead><tbody>')
     foreach ($i in $Issues) {
-        $W.Write("<tr><td><span class=""pill p-$($i.Flag)"">$(HtmlEnc $i.Severity)</span></td>")
+        $W.Write("<tr><td><span class=""pill p-$(HtmlFlag $i.Flag)"">$(HtmlEnc $i.Severity)</span></td>")
         if ($WithServer) { $W.Write("<td>$(HtmlEnc $i.Server)</td>") }
         $W.Write("<td>$(HtmlEnc $i.Category)</td><td>$(HtmlEnc $i.Message)</td></tr>")
     }
@@ -7828,7 +8854,7 @@ button{font:inherit;background:var(--panel);color:var(--text);border:1px solid v
         $now = Get-Date -Format 'yyyy-MM-dd HH:mm'
         $w.Write("<!DOCTYPE html><html lang=""pl""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width,initial-scale=1""><title>Przegląd serwerów $now</title><style>$css</style></head><body>")
         $w.Write("<h1>Przegląd serwerów</h1><div class=""muted"">Wygenerowano $now przez $(HtmlEnc "$env:USERDOMAIN\$env:USERNAME"), domena $(HtmlEnc $env:USERDNSDOMAIN) – raport $(if ($Mode -eq 'Full') { 'pełny' } else { 'podsumowanie' }), wersja programu $script:AppVersion</div>")
-        $tiles = @(@('Serwery', $script:Data.Count, ''), @('Odpowiada', $o.Online, 'var(--ok)'), @('Bez połączenia', $o.Offline, 'var(--crit)'), @('Krytyczne', $o.Crit, 'var(--crit)'), @('Ostrzeżenia', $o.Warn, 'var(--warn)'), @('Hyper-V: hosty / VM', "$($o.Hosts) / $($o.VmRun)", 'var(--info)'))
+        $tiles = @(@('Serwery', $script:Servers.Count, ''), @('Odpowiada', $o.Online, 'var(--ok)'), @('Bez połączenia', $o.Offline, 'var(--crit)'), @('Krytyczne', $o.Crit, 'var(--crit)'), @('Ostrzeżenia', $o.Warn, 'var(--warn)'), @('Hyper-V: hosty / VM', "$($o.Hosts) / $($o.VmRun)", 'var(--info)'))
         $w.Write('<div class="tiles">')
         foreach ($t in $tiles) { $w.Write("<div class=""tile""><span class=""muted"">$($t[0])</span><b style=""color:$($t[2])"">$($t[1])</b></div>") }
         $w.Write('</div><h2>Wykryte problemy</h2>')
@@ -7862,9 +8888,9 @@ button{font:inherit;background:var(--panel);color:var(--text);border:1px solid v
         foreach ($it in $script:Servers) {
             $d = $script:Data[$it.Name]
             if (-not $d) { continue }
-            if ($Mode -eq 'Full' -and -not $d.Offline) { $d = Get-ServerFull $it.Name }
+            if ($Mode -eq 'Full' -and -not $d.Offline) { $d = Get-ServerFull $it.Name -NoCache }
             $os = if ($d.Offline) { 'brak połączenia' } elseif ($d.PSObject.Properties['Unsupported'] -and $d.Unsupported) { "$($d.Unsupported)" } else { "$($d.System.OS)" }
-            $w.Write("<details><summary><span class=""dot"" style=""background:$($it.Color)""></span>$(HtmlEnc $it.Display) <span class=""muted"">$(HtmlEnc $os)</span>")
+            $w.Write("<details><summary><span class=""dot"" style=""background:$(HtmlEnc $it.Color)""></span>$(HtmlEnc $it.Display) <span class=""muted"">$(HtmlEnc $os)</span>")
             if ($d._Crit) { $w.Write(" <span class=""pill p-crit"">$($d._Crit)</span>") }
             if ($d._Warn) { $w.Write(" <span class=""pill p-warn"">$($d._Warn)</span>") }
             $w.Write('</summary><div>')
@@ -8079,11 +9105,14 @@ function Show-SettingsDialog {
     if ($script:UnlockState.Locked) { Wait-Unlocked }
     Register-IdleActivity -Window $dlg
     $dlg.Owner = $window
+    # jak okno główne: nie większe niż obszar roboczy (1366x768, 150 %), żeby „Zapisz” nie chowało się pod paskiem zadań; obie kolumny się przewijają
+    $wa = [System.Windows.SystemParameters]::WorkArea
+    $dlg.Width = [Math]::Min($dlg.Width, $wa.Width); $dlg.Height = [Math]::Min($dlg.Height, $wa.Height); $dlg.MinWidth = [Math]::Min($dlg.MinWidth, $wa.Width); $dlg.MinHeight = [Math]::Min($dlg.MinHeight, $wa.Height)
     [void]$dlg.ShowDialog()
     if ($script:SetDlg -and $script:SetDlg.Saved) {
         $ui.txtDays.Text = "$($Config.EventDays)"
         Update-SettingsButton
-        foreach ($k in 'Remote', 'Local') { if ($script:Pools[$k]) { [void](Get-EnginePool $k) } }   # nowy limit równoległości
+        foreach ($k in @($script:Pools.Keys)) { if ($script:Pools[$k]) { [void](Get-EnginePool $k) } }   # nowy limit równoległości
         if ($script:SetDlg.Changed) {
             # nowe progi i reguły: ponowna analiza zapisanych wyników (w tle, z migawek) – po trwającym skanie, jeśli trwa
             if ((Get-Operation 'Scan') -or (Get-Operation 'Load')) {
@@ -8115,7 +9144,8 @@ function Add-IgnoreRule($Issue, [switch]$AllServers) {
 function Remove-IgnoreRule($Issue) {
     if (-not $Issue) { return }
     $before = @($Config.IgnoredIssues).Count
-    $Config.IgnoredIssues = @($Config.IgnoredIssues | Where-Object { $_ -and -not ($_.Key -eq $Issue.IssueKey -and ($_.Server -eq '*' -or $_.Server -eq $Issue.ServerKey)) })
+    $keys = Get-IssueKeyVariants $Issue.IssueKey   # także reguła zapisana dawnym formatem klucza
+    $Config.IgnoredIssues = @($Config.IgnoredIssues | Where-Object { $_ -and -not ($keys -contains $_.Key -and ($_.Server -eq '*' -or $_.Server -eq $Issue.ServerKey)) })
     if (@($Config.IgnoredIssues).Count -eq $before) { return }
     Save-UserSettings
     Update-IgnoreRules
@@ -8130,21 +9160,27 @@ function Update-IgnoreRules {
     Request-UiRefresh -All
 }
 function Update-IgnoredGrid {
-    $rows = @($Config.IgnoredIssues | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Server = $(if ($_.Server -eq '*') { '* (wszystkie)' } else { Get-DisplayName $_.Server }); Text = $_.Text; Added = $_.Added; By = $_.By; _Rule = $_ } })
+    # Ile serwerów reguła ukrywa teraz (wyciszone problemy wczytanych wyników): zbyt szeroka reguła „*” albo martwa (0) od razu widoczna
+    $hits = @{}
+    $muted = New-Object System.Collections.Generic.List[object]
+    foreach ($k in @($script:Data.Keys)) { $d = $script:Data[$k]; if ($d -and $d.PSObject.Properties['_Ignored']) { foreach ($i in @($d._Ignored)) { if ($i) { $muted.Add(@{ S = $k; K = $i.IssueKey }) } } } }
+    foreach ($si in @((Get-StationClockIssue), $script:StationNetIssue, $script:CveIssue)) { if ($si -and (Test-IssueIgnored '(stacja)' $si.IssueKey)) { $muted.Add(@{ S = '(stacja)'; K = $si.IssueKey }) } }
+    foreach ($m in $muted) { foreach ($v in (Get-IssueKeyVariants $m.K)) { foreach ($rk in "*|$v", "$($m.S)|$v") { if (-not $hits.ContainsKey($rk)) { $hits[$rk] = @{} }; $hits[$rk][$m.S] = $true } } }
+    $rows = @($Config.IgnoredIssues | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ Server = $(if ($_.Server -eq '*') { '* (wszystkie)' } else { Get-DisplayName $_.Server }); Text = $_.Text; Hits = [int]$(if ($hits.ContainsKey("$($_.Server)|$($_.Key)")) { $hits["$($_.Server)|$($_.Key)"].Count }); Added = $_.Added; By = $_.By; _Rule = $_ } })
     $script:IgDlg.Grid.ItemsSource = $rows
-    $script:IgDlg.Info.Text = "Reguł: $($rows.Count). Zaznacz reguły i kliknij «Usuń zaznaczone», aby problemy znów były zgłaszane."
+    $script:IgDlg.Info.Text = "Reguł: $($rows.Count). «Ukrywa teraz» – na ilu serwerach reguła wycisza problem w bieżących wynikach (0 = nic nie ukrywa: problem zniknął albo zmieniła się jego treść). Zaznacz reguły i kliknij «Usuń zaznaczone», aby problemy znów były zgłaszane."
 }
 function Show-IgnoredIssuesDialog {
     $body = @'
 <Grid Height="380">
   <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-  <Border Style="{StaticResource Card}" Padding="1"><DataGrid x:Name="igGrid" Style="{StaticResource DarkGrid}"/></Border>
+  <Border Style="{StaticResource Card}" Padding="1"><DataGrid x:Name="igGrid" Style="{StaticResource DarkGrid}" ColumnHeaderStyle="{StaticResource GridHeader}"/></Border>
   <TextBlock x:Name="igInfo" Grid.Row="1" Foreground="#7B8496" FontSize="12" TextWrapping="Wrap" Margin="2,8,0,0"/>
 </Grid>
 '@
     $w = New-Dialog -Title 'Wyciszone problemy' -Subtitle 'Wyciszony problem nie liczy się do kafelków i list. Reguła „*” działa na wszystkich serwerach.' -Body $body -Icon 'E7BA' -OkText 'Zamknij' -NoCancel -Width 900
     $grid = $w.FindName('igGrid')
-    $grid.Add_AutoGeneratingColumn({ param($s, $e) if ($e.PropertyName -like '_*') { $e.Cancel = $true; return }; $e.Column.Header = switch ($e.PropertyName) { 'Server' { 'Serwer' } 'Text' { 'Problem (przykład)' } 'Added' { 'Dodano' } 'By' { 'Kto' } default { $e.PropertyName } } })
+    $grid.Add_AutoGeneratingColumn({ param($s, $e) if ($e.PropertyName -like '_*') { $e.Cancel = $true; return }; $e.Column.Header = switch ($e.PropertyName) { 'Server' { 'Serwer' } 'Text' { 'Problem (przykład)' } 'Hits' { 'Ukrywa teraz' } 'Added' { 'Dodano' } 'By' { 'Kto' } default { $e.PropertyName } } })
     # (bez GetNewClosure – domknięcie nie widzi zmiennych i funkcji skryptu; stan okna w $script:IgDlg)
     $script:IgDlg = @{ Grid = $grid; Info = $w.FindName('igInfo') }
     Update-IgnoredGrid
@@ -8179,7 +9215,7 @@ function Enter-InstanceMutex([string]$Kind) {
     $m.Dispose()
     $null
 }
-function Wait-Operations { while ($script:Ops.Count -or $script:Abandoned.Count) { Update-Operations; if (-not $script:Ops.Count) { break }; Start-Sleep -Milliseconds 300 } }
+function Wait-Operations { while ($script:Ops.Count -or $script:Abandoned.Count -or $script:PendingRetry) { Update-Operations; if (-not $script:Ops.Count -and -not $script:PendingRetry) { break }; Start-Sleep -Milliseconds 300 } }
 # ── Powiadomienia po skanie bez okna: e-mail (SMTP) i webhook ──
 # Stan ostatniego powiadomienia (klucze problemów) w Cache\notify_state.json – „nowe” = nieobecne w poprzednim powiadomieniu
 function Get-NotifyFile { Join-Path $Config.CacheDir 'notify_state.json' }
@@ -8200,11 +9236,14 @@ function Send-Notification([string]$Subject, [string]$Body, [string]$Attachment 
     if ($Config.WebhookUrl) {
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            # treść pochodzi z serwerów (np. nazwa konta i stacji z nieudanych logowań wybiera atakujący): link [opis](adres) rozbity spacją,
+            # dla Slacka/Mattermost także znaczniki <…> (<!channel>, <adres|opis>) jako tekst i wzmianki @channel/@here/@all bez powiadomienia
+            $noLink = '\]\('
             $payload = if ($Config.WebhookTeams) {
                 $blocks = @(@{ type = 'TextBlock'; text = $Subject; weight = 'Bolder'; size = 'Medium'; wrap = $true }) +
-                          @($Body -split "`r?`n" | Where-Object { $_ } | Select-Object -First 60 | ForEach-Object { @{ type = 'TextBlock'; text = $_; wrap = $true; spacing = 'None' } })
+                          @($Body -split "`r?`n" | Where-Object { $_ } | Select-Object -First 60 | ForEach-Object { @{ type = 'TextBlock'; text = ($_ -replace $noLink, '] ('); wrap = $true; spacing = 'None' } })
                 @{ type = 'message'; attachments = @(@{ contentType = 'application/vnd.microsoft.card.adaptive'; content = @{ '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'; type = 'AdaptiveCard'; version = '1.4'; body = $blocks } }) }
-            } else { @{ text = "*$Subject*`n$Body" } }
+            } else { @{ text = ("*$Subject*`n$Body" -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace $noLink, '] (' -replace '(?<!\w)@(?=(?:channel|here|all|everyone)\b)', '@ ') } }
             $p = @{ Uri = $Config.WebhookUrl; Method = 'Post'; ContentType = 'application/json; charset=utf-8'; Body = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress)); UseBasicParsing = $true; TimeoutSec = 60; ErrorAction = 'Stop' }
             if ($Config.CveProxy) { $p.Proxy = $Config.CveProxy; $p.ProxyUseDefaultCredentials = $true }
             else { try { [Net.WebRequest]::DefaultWebProxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials } catch { } }
@@ -8223,11 +9262,15 @@ function Send-ScanNotification([string]$ReportPath) {
         $d = $script:Data[$k]
         foreach ($i in @($d.PSObject.Properties['_Issues'].Value)) { if ($i -and $i.Rank -le $maxRank) { $cur["$k|$($i.IssueKey)"] = $i } }
     }
+    # problemy domeny, klastra i hostów (Update-VmIndex, bez wyciszonych) – klucz z nazwą domeny/klastra, nie z serwera reprezentującego (zmiana DC lub węzła nie wysyła ich ponownie)
+    foreach ($i in @($script:ClusterIssues)) { if ($i -and $i.Rank -le $maxRank) { $cur["$($i.Server)|$($i.IssueKey)"] = $i } }
     $old = @{}
     $f = Get-NotifyFile
     if (Test-Path -LiteralPath $f) { try { foreach ($x in @((Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json).Keys)) { $old["$x"] = $true } } catch { } }
-    $send = @(foreach ($key in $cur.Keys) { if (-not $Config.NotifyOnlyNew -or -not $old.ContainsKey($key)) { $cur[$key] } })
-    $gone = @($old.Keys | Where-Object { -not $cur.Contains($_) }).Count
+    # stan zapisany przed zmianą formatu klucza (np. wersje Windows/SSL zamieniane dawniej na '#') – problem nie jest wysyłany ponownie jako nowy
+    $seenOld = @{}
+    $send = @(foreach ($key in $cur.Keys) { $i = $cur[$key]; $sk = $key.Substring(0, $key.IndexOf('|')); $hit = @(Get-IssueKeyVariants $i.IssueKey | ForEach-Object { "$sk|$_" } | Where-Object { $old.ContainsKey($_) }); foreach ($h in $hit) { $seenOld[$h] = 1 }; if (-not $Config.NotifyOnlyNew -or -not $hit.Count) { $i } })
+    $gone = @($old.Keys | Where-Object { -not $cur.Contains($_) -and -not $seenOld.ContainsKey($_) }).Count
     if ($send.Count) {
         $crit = @($send | Where-Object { $_.Rank -eq 0 }).Count
         $srv  = @($send | ForEach-Object { $_.ServerKey } | Select-Object -Unique).Count
@@ -8236,7 +9279,7 @@ function Send-ScanNotification([string]$ReportPath) {
         $lines = @($send | Sort-Object Rank, Server | Select-Object -First 100 | ForEach-Object { "[$($_.Severity)] $($_.Server) – $($_.Category): $($_.Message)" })
         $body = ($lines -join "`r`n")
         if ($send.Count -gt 100) { $body += "`r`n… i $($send.Count - 100) więcej" }
-        $tot = @($script:Data.Values | ForEach-Object { [int]$_.PSObject.Properties['_Crit'].Value } | Measure-Object -Sum).Sum
+        $tot = @($script:Data.Values | ForEach-Object { [int]$_.PSObject.Properties['_Crit'].Value } | Measure-Object -Sum).Sum + @($script:ClusterIssues | Where-Object { $_ -and $_.Rank -eq 0 }).Count
         $body += "`r`n`r`nWszystkich serwerów: $($script:Data.Count), aktywnych problemów krytycznych: $tot$(if ($Config.NotifyOnlyNew -and $gone) { ", rozwiązanych od poprzedniego powiadomienia: $gone" })."
         if ($ReportPath) { $body += "`r`nRaport: $ReportPath" }
         $errs = @(Send-Notification $subject $body $(if ($Config.SmtpAttachReport) { $ReportPath } else { '' }))
@@ -8261,6 +9304,7 @@ function Invoke-HeadlessScan {
     try {
         Write-Log ("Przegląd serwerów {0} – skan bez okna (PowerShell {1}, {2}\{3}, raport: {4})" -f $script:AppVersion, $PSVersionTable.PSVersion, $env:USERDOMAIN, $env:USERNAME, $(if ($NoReport) { 'brak' } else { $ReportMode })) 'INFO' 'Program'
         if ($script:BaseFallback) { Write-Log $script:BaseFallback 'WARN' 'Program' }
+        $dw = Get-DataFolderWarning; if ($dw) { Write-Log $dw 'WARN' 'Program' }
         if ($script:SettingsWarning) { Write-Log $script:SettingsWarning 'WARN' 'Ustawienia' }
         if (-not (Test-Path -LiteralPath $Config.ServerListFile)) { Write-Log "Brak listy serwerów: $($Config.ServerListFile)" 'ERROR' 'Lista'; return 2 }
         [void](Import-ServerFile $Config.ServerListFile)
@@ -8278,7 +9322,7 @@ function Invoke-HeadlessScan {
         if (-not $NoReport) { try { $rep = "$(@(Export-HtmlReport -Mode $ReportMode -NoOpen)[-1])" } catch { Write-Log "Nie utworzono raportu: $($_.Exception.Message)" 'ERROR' 'Raport' } }
         try { Send-ScanNotification $rep } catch { Write-Log "Błąd powiadomień: $($_.Exception.Message)" 'ERROR' 'Powiadomienia' }
         Remove-OldLogs
-        if ($st.Offline -or $st.Timeout -or $st.Cancelled) { return 1 }   # Cancelled: limit czasu całego skanu
+        if ($st.Offline -or $st.Timeout -or $st.Cancelled -or $st.Errors) { return 1 }   # Cancelled: limit czasu całego skanu; Errors: błąd programu w wątku skanu
         return 0
     } catch { Write-Log "Błąd skanu bez okna: $($_.Exception.Message) [linia $($_.InvocationInfo.ScriptLineNumber)]" 'ERROR' 'Program'; return 2 }
     finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
@@ -8344,16 +9388,28 @@ function Set-OtherCredential {
     $ok = Test-Credential $c
     if ($ok -eq $false) { Write-Log "Odrzucono poświadczenia $($c.UserName) – błędne hasło lub konto zablokowane." 'ERROR' 'Konto'; Show-Message "Domena odrzuciła poświadczenia konta $($c.UserName) (błędne hasło, konto zablokowane lub wyłączone). Konto nie zostało zmienione." 'Konto' 'crit'; return }
     $script:Cred = $c
+    $script:CredVerified = ($ok -eq $true)   # niesprawdzone w domenie: skan zaczyna od 2 serwerów naraz (Start-Scan, ochrona przed blokadą konta)
     Write-Log "Konto do połączeń: $($c.UserName)$(if ($null -eq $ok) { ' (nie sprawdzono w domenie)' } else { ' (sprawdzone w domenie)' })" 'INFO' 'Konto'
     Update-CredLabel
     Show-Toast "Konto: $($c.UserName)" 'ok'
 }
 
+function Get-LogMaxHeight {
+    # Najwyższy dziennik, przy którym pasek stanu (postęp, „Przerwij”) zostaje w oknie: wysokość okna minus pasek górny,
+    # minimum widoku głównego, rozdzielacz (5 px) i pasek stanu; 0 – układ jeszcze nie policzony
+    $g = $ui.rootGrid
+    if (-not $g -or $g.ActualHeight -le 0) { return 0 }
+    $rows = $g.RowDefinitions
+    [Math]::Max(90, $g.ActualHeight - $rows[0].ActualHeight - $rows[1].MinHeight - 5 - $rows[4].ActualHeight)
+}
 function Set-LogVisible([bool]$Visible) {
     if (-not $Visible -and $script:UiState.LogVisible -and $ui.logRow.ActualHeight -gt 60) { $script:UiState.LogHeight = [int]$ui.logRow.ActualHeight }
     $script:UiState.LogVisible = $Visible
     if ($Visible) {
-        $ui.logRow.Height = New-Object System.Windows.GridLength ([double][Math]::Max(90, [int]$script:UiState.LogHeight))
+        # zapamiętana wysokość (np. z większego monitora) nie może wypchnąć paska stanu poza okno
+        $h = [double][Math]::Max(90, [int]$script:UiState.LogHeight); $max = Get-LogMaxHeight
+        if ($max -gt 0) { $h = [Math]::Min($h, $max) }
+        $ui.logRow.Height = New-Object System.Windows.GridLength $h
         $ui.logPanel.Visibility = 'Visible'; $ui.logSplitter.Visibility = 'Visible'
         $script:LogUnread = 0; Update-LogBadge
         if ($script:LogItems.Count) { $ui.logList.ScrollIntoView($script:LogItems[$script:LogItems.Count - 1]) }
@@ -8362,6 +9418,8 @@ function Set-LogVisible([bool]$Visible) {
         $ui.logPanel.Visibility = 'Collapsed'; $ui.logSplitter.Visibility = 'Collapsed'
     }
 }
+# zmniejszenie okna przy otwartym dzienniku: dziennik się skraca, pasek stanu zostaje w oknie
+$ui.rootGrid.Add_SizeChanged({ if ($script:UiState.LogVisible) { $m = Get-LogMaxHeight; if ($m -gt 0 -and $ui.logRow.ActualHeight -gt $m) { $ui.logRow.Height = New-Object System.Windows.GridLength ([double]$m) } } })
 function Update-LogFilter {
     $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:LogItems)
     $t = $ui.txtLogFilter.Text.Trim().ToLowerInvariant()
@@ -8399,6 +9457,9 @@ $onAutoColumn = {
     if ($e.PropertyName -in 'Flag', 'Key', 'Rows' -or $e.PropertyName -like '_*') { $e.Cancel = $true; return }
     $e.Column.Header = Get-Header $e.PropertyName
     $e.Column.MaxWidth = 900
+    # szerokość zmieniona ręcznie przed odświeżeniem tabeli (Save-GridWidths)
+    $gw = if ($src.Tag -is [hashtable]) { $script:GridWidths[$src.Tag.Key] } else { $null }
+    if ($gw -and $gw.ContainsKey($e.PropertyName)) { $e.Column.Width = New-Object System.Windows.Controls.DataGridLength ([double]$gw[$e.PropertyName]) }
     # właściwości obiektów PowerShell mają typ object, dla którego DataGrid wyłącza sortowanie – sortuje Invoke-GridSort
     $e.Column.CanUserSort = $true
     $e.Column.SortDirection = Get-SortDirection @(Get-GridSort $src) $e.Column.SortMemberPath
@@ -8429,6 +9490,7 @@ $ui.txtGridFilter.Add_TextChanged({ Request-Filter 'detail' { Update-DetailFilte
 $ui.txtServerFilter.Add_TextChanged({ Request-Filter 'servers' { Update-ServerFilter } })
 foreach ($rb in 'sfAll', 'sfProblems', 'sfOffline', 'sfHosts', 'sfVms', 'sfNew') { $ui[$rb].Add_Checked({ Update-ServerFilter }) }
 $ui.chkIgnored.Add_Click({ Invoke-UiAction 'Widok' { Update-Overview } })
+$ui.chkGroup.Add_Click({ Invoke-UiAction 'Widok' { Update-Overview } })
 foreach ($rb in 'vfAll', 'vfRunning', 'vfOff', 'vfProblems', 'vfNotListed') { $ui[$rb].Add_Checked({ Update-VmFilter }) }
 $ui.txtVmFilter.Add_TextChanged({ Request-Filter 'vms' { Update-VmFilter } })
 foreach ($rb in 'lfAll', 'lfWarn', 'lfErr') { $ui[$rb].Add_Checked({ Update-LogFilter }) }
@@ -8461,7 +9523,7 @@ function Format-RowDetail($Row) {
     $lines -join [Environment]::NewLine
 }
 $ui.gridDetail.Add_SelectionChanged({ $ui.dRowDetail.Text = Format-RowDetail $ui.gridDetail.SelectedItem })
-$ui.gridIssues.Add_SelectionChanged({ $ui.dIssueDetail.Text = Format-RowDetail $ui.gridIssues.SelectedItem })
+$ui.gridIssues.Add_SelectionChanged({ if (-not $script:KeepSelection) { $ui.dIssueDetail.Text = Format-RowDetail $ui.gridIssues.SelectedItem } })   # odświeżenie w trakcie skanu nie czyści panelu
 
 function Remove-SelectedServers {
     $sel = @($ui.lstServers.SelectedItems)
@@ -8476,6 +9538,28 @@ function Remove-SelectedServers {
 }
 $ui.lstServers.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Delete') { Invoke-UiAction 'Lista' { Remove-SelectedServers } } })
 
+# Akcje serwera w menu kontekstowym (lista serwerów, „Stan serwerów”, tabele Hyper-V). Nazwy z chwili otwarcia menu –
+# odświeżenie tabeli w trakcie skanu nie zmienia celu wybranej akcji.
+function Add-ServerMenuItems($Menu, [string[]]$Names) {
+    $script:MenuServers = [string[]]@($Names)
+    $cnt = $script:MenuServers.Count
+    $busy = [bool](Get-Operation 'Scan')
+    [void]$Menu.Items.Add((New-MenuItem $(if ($cnt -gt 1) { "Skanuj zaznaczone ($cnt)" } else { 'Skanuj ten serwer' }) 'E768' { Start-Scan @($script:MenuServers) } -Enabled (-not $busy)))
+    [void]$Menu.Items.Add((New-MenuItem $(if ($cnt -gt 1) { "Diagnozuj połączenie ($cnt)" } else { 'Diagnozuj połączenie' }) 'E9D9' { Start-Diagnostics @($script:MenuServers) }))
+    [void]$Menu.Items.Add((New-MenuItem 'Kopiuj nazwy' 'E8C8' { [System.Windows.Clipboard]::SetText(($script:MenuServers -join [Environment]::NewLine)); Show-Toast "Skopiowano nazw: $($script:MenuServers.Count)" 'ok' }))
+    if ($cnt -ne 1) { return }
+    [void]$Menu.Items.Add((New-MenuSeparator))
+    [void]$Menu.Items.Add((New-MenuItem 'Połącz przez RDP' 'E7F4' { Start-Process mstsc.exe -ArgumentList "/v:$($script:MenuServers[0])" }))
+    # nazwa w zmiennej środowiskowej nowej konsoli, nie w tekście -Command – żaden znak nazwy nie zostanie wykonany jako kod
+    [void]$Menu.Items.Add((New-MenuItem 'PowerShell (Enter-PSSession)' 'E756' { $env:SERVERREVIEW_PSHOST = $script:MenuServers[0]; try { Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', 'Enter-PSSession -ComputerName $env:SERVERREVIEW_PSHOST' } finally { $env:SERVERREVIEW_PSHOST = $null } }))
+    [void]$Menu.Items.Add((New-MenuItem 'Zarządzanie komputerem' 'E770' { Start-Process compmgmt.msc -ArgumentList "/computer:\\$($script:MenuServers[0])" }))
+    [void]$Menu.Items.Add((New-MenuItem 'Podgląd zdarzeń' 'E81C' { Start-Process eventvwr.exe -ArgumentList $script:MenuServers[0] }))
+    [void]$Menu.Items.Add((New-MenuItem 'Usługi' 'E713' { Start-Process services.msc -ArgumentList "/computer:\\$($script:MenuServers[0])" }))
+    [void]$Menu.Items.Add((New-MenuItem 'Otwórz udział C$' 'E838' { Start-Process explorer.exe -ArgumentList "\\$($script:MenuServers[0])\C$" }))
+    $it = Get-ServerItem $script:MenuServers[0]
+    if ($it -and $it.Kind -eq 'HV') { [void]$Menu.Items.Add((New-MenuItem 'Pokaż maszyny tego hosta' 'E8FD' { $h = (Get-ServerItem $script:MenuServers[0]).Display; Show-View 'Vms'; $ui.vfAll.IsChecked = $true; $ui.txtVmFilter.Text = $h.ToLowerInvariant() })) }
+    if ($it -and $it.HvHost) { [void]$Menu.Items.Add((New-MenuItem "Przejdź do hosta $($it.HvHost)" 'E8FD' { $h = (Get-ServerItem $script:MenuServers[0]).HvHost; $hk = @($script:Servers | Where-Object { $_.Display -eq $h })[0]; if ($hk) { Select-Server $hk.Name 'HyperV' } else { Show-Toast "Host $h nie jest na liście serwerów." 'info' } })) }
+}
 # Menu kontekstowe listy serwerów (budowane przy otwarciu – zależy od zaznaczenia)
 $ui.lstServers.ContextMenu = New-Object System.Windows.Controls.ContextMenu
 $ui.lstServers.Add_ContextMenuOpening({
@@ -8484,25 +9568,9 @@ $ui.lstServers.Add_ContextMenuOpening({
     $m.Items.Clear()
     $names = @(Get-SelectedServerNames)
     if (-not $names.Count) { $e.Handled = $true; return }
-    $one = $names[0]
-    $busy = [bool](Get-Operation 'Scan')
-    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Skanuj zaznaczone ($($names.Count))" } else { 'Skanuj ten serwer' }) 'E768' { Start-Scan @(Get-SelectedServerNames) } -Enabled (-not $busy)))
-    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Diagnozuj połączenie ($($names.Count))" } else { 'Diagnozuj połączenie' }) 'E9D9' { Start-Diagnostics @(Get-SelectedServerNames) }))
-    [void]$m.Items.Add((New-MenuItem 'Kopiuj nazwy' 'E8C8' { $t = (@(Get-SelectedServerNames) -join [Environment]::NewLine); [System.Windows.Clipboard]::SetText($t); Show-Toast "Skopiowano nazw: $(@(Get-SelectedServerNames).Count)" 'ok' }))
+    Add-ServerMenuItems $m $names
     [void]$m.Items.Add((New-MenuSeparator))
-    if ($names.Count -eq 1) {
-        [void]$m.Items.Add((New-MenuItem 'Połącz przez RDP' 'E7F4' { Start-Process mstsc.exe -ArgumentList "/v:$(@(Get-SelectedServerNames)[0])" }))
-        [void]$m.Items.Add((New-MenuItem 'PowerShell (Enter-PSSession)' 'E756' { $n = @(Get-SelectedServerNames)[0]; Start-Process powershell.exe -ArgumentList '-NoExit', '-Command', "Enter-PSSession -ComputerName '$n'" }))
-        [void]$m.Items.Add((New-MenuItem 'Zarządzanie komputerem' 'E770' { Start-Process compmgmt.msc -ArgumentList "/computer:\\$(@(Get-SelectedServerNames)[0])" }))
-        [void]$m.Items.Add((New-MenuItem 'Podgląd zdarzeń' 'E81C' { Start-Process eventvwr.exe -ArgumentList @(Get-SelectedServerNames)[0] }))
-        [void]$m.Items.Add((New-MenuItem 'Usługi' 'E713' { Start-Process services.msc -ArgumentList "/computer:\\$(@(Get-SelectedServerNames)[0])" }))
-        [void]$m.Items.Add((New-MenuItem 'Otwórz udział C$' 'E838' { Start-Process explorer.exe -ArgumentList "\\$(@(Get-SelectedServerNames)[0])\C$" }))
-        $it = Get-ServerItem $one
-        if ($it -and $it.Kind -eq 'HV') { [void]$m.Items.Add((New-MenuItem 'Pokaż maszyny tego hosta' 'E8FD' { $h = (Get-ServerItem @(Get-SelectedServerNames)[0]).Display; Show-View 'Vms'; $ui.vfAll.IsChecked = $true; $ui.txtVmFilter.Text = $h.ToLowerInvariant() })) }
-        if ($it -and $it.HvHost) { [void]$m.Items.Add((New-MenuItem "Przejdź do hosta $($it.HvHost)" 'E8FD' { $h = (Get-ServerItem @(Get-SelectedServerNames)[0]).HvHost; $hk = @($script:Servers | Where-Object { $_.Display -eq $h })[0]; if ($hk) { Select-Server $hk.Name 'HyperV' } else { Show-Toast "Host $h nie jest na liście serwerów." 'info' } })) }
-        [void]$m.Items.Add((New-MenuSeparator))
-    }
-    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Usuń z listy ($($names.Count))" } else { 'Usuń z listy' }) 'E74D' { Remove-SelectedServers } -Danger -Enabled (-not $busy)))
+    [void]$m.Items.Add((New-MenuItem $(if ($names.Count -gt 1) { "Usuń z listy ($($names.Count))" } else { 'Usuń z listy' }) 'E74D' { Remove-SelectedServers } -Danger -Enabled (-not [bool](Get-Operation 'Scan'))))
 })
 
 # Menu problemów (przegląd i sekcja Problemy w szczegółach): wyciszanie
@@ -8519,7 +9587,16 @@ $script:IssueMenuOpening = {
     $m.Items.Clear()
     $i = Get-ContextIssue $s
     if (-not $i) { $e.Handled = $true; return }
+    if ($i.PSObject.Properties['_Items'] -and $i._Count -eq 1) { $i = $i._Items[0] }   # grupa z jednego serwera = zwykły problem
     $script:MenuIssue = $i
+    if ($i.PSObject.Properties['_Items']) {
+        # zgrupowany problem z wielu serwerów: wyciszenie całej grupy albo przejście do pojedynczych problemów
+        if (-not $i.Ignored) { [void]$m.Items.Add((New-MenuItem "Wycisz na wszystkich serwerach ($($i._Count))" 'E74F' { Add-IgnoreRule $script:MenuIssue -AllServers })) }
+        [void]$m.Items.Add((New-MenuItem "Pokaż pojedyncze problemy ($($i._Count))" 'E8FD' { Show-IssueGroup $script:MenuIssue }))
+        [void]$m.Items.Add((New-MenuSeparator))
+        [void]$m.Items.Add((New-MenuItem 'Kopiuj treść i listę serwerów' 'E8C8' { [System.Windows.Clipboard]::SetText("$($script:MenuIssue.Message)$([Environment]::NewLine)Serwery: $($script:MenuIssue.ServerList)"); Show-Toast 'Skopiowano.' 'ok' 2 }))
+        return
+    }
     if ($i.Ignored) {
         [void]$m.Items.Add((New-MenuItem 'Przywróć (usuń wyciszenie)' 'E767' { Remove-IgnoreRule $script:MenuIssue }))
     } else {
@@ -8530,7 +9607,21 @@ $script:IssueMenuOpening = {
     [void]$m.Items.Add((New-MenuItem 'Kopiuj treść' 'E8C8' { [System.Windows.Clipboard]::SetText("$($script:MenuIssue.Server): $($script:MenuIssue.Message)"); Show-Toast 'Skopiowano.' 'ok' 2 }))
     if ($s -eq $ui.gridIssues -and $i.ServerKey -and (Get-ServerItem $i.ServerKey)) { [void]$m.Items.Add((New-MenuItem 'Otwórz serwer' 'E9D9' { Select-Server $script:MenuIssue.ServerKey $script:MenuIssue.Section })) }
 }
-foreach ($g in 'gridIssues', 'gridDetail') { $ui[$g].ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui[$g].Add_ContextMenuOpening($script:IssueMenuOpening) }
+# Wiersze sekcji, które nie są problemem (usługi, oprogramowanie…): kopiowanie wiersza albo wartości komórki zamiast braku menu
+$script:DetailMenuOpening = {
+    param($s, $e)
+    if (Get-ContextIssue $s) { & $script:IssueMenuOpening $s $e; return }
+    $m = $s.ContextMenu
+    $m.Items.Clear()
+    $r = $s.SelectedItem
+    if (-not $r) { $e.Handled = $true; return }
+    $script:MenuRow = $r
+    [void]$m.Items.Add((New-MenuItem 'Kopiuj wiersz' 'E8C8' { [System.Windows.Clipboard]::SetText((Format-RowDetail $script:MenuRow)); Show-Toast 'Skopiowano.' 'ok' 2 }))
+    $p = "$($s.CurrentCell.Column.SortMemberPath)"   # kolumna komórki z fokusem (kliknięta prawym przyciskiem)
+    if ($p -and $r.PSObject.Properties[$p] -and "$($r.$p)") { $script:MenuCell = "$($r.$p)"; [void]$m.Items.Add((New-MenuItem "Kopiuj wartość: $((Get-Header $p) -replace '_', '__')" 'E8C8' { [System.Windows.Clipboard]::SetText($script:MenuCell); Show-Toast 'Skopiowano.' 'ok' 2 })) }
+}
+$ui.gridIssues.ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui.gridIssues.Add_ContextMenuOpening($script:IssueMenuOpening)
+$ui.gridDetail.ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui.gridDetail.Add_ContextMenuOpening($script:DetailMenuOpening)
 
 $addHandler = {
     $names = @($ui.txtAdd.Text -split '[,;\s]+' | Where-Object { $_ })
@@ -8550,8 +9641,9 @@ $ui.btnAD.Add_Click({
         $old = $window.Cursor; $window.Cursor = [System.Windows.Input.Cursors]::Wait
         try { $found = @(Get-ServersFromAD) } catch { Show-Message "Nie udało się odpytać AD: $($_.Exception.Message)" 'Pobierz z AD' 'crit'; return } finally { $window.Cursor = $old }
         if (-not $found.Count) { Show-Message "Nie znaleziono aktywnych kont serwerów Windows w AD$(if ($Config.AdSearchBase) { " (OU: $($Config.AdSearchBase))" })." 'Pobierz z AD' 'info'; return }
-        # $dn przed wewnętrznym Where-Object – tam $_ to już pozycja listy, nie wynik z AD
-        $new = @($found | Where-Object { $dn = Get-DisplayName $_.Name; -not (Get-ServerItem $_.Name) -and -not @($script:Servers | Where-Object { $_.Display -eq $dn }).Count })
+        # nazwy krótkie z listy w zbiorze – bez przeszukiwania całej listy dla każdego konta z AD (tysiące kont × setki serwerów w wątku okna)
+        $have = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase); foreach ($it in $script:Servers) { [void]$have.Add($it.Display) }
+        $new = @($found | Where-Object { -not (Get-ServerItem $_.Name) -and -not $have.Contains((Get-DisplayName $_.Name)) })
         if (-not $new.Count) { Show-Toast "W AD jest $($found.Count) aktywnych serwerów – wszystkie są już na liście." 'info'; return }
         if (Confirm-Action -Text "W AD jest $($found.Count) aktywnych serwerów Windows (logowanie w ostatnich $($Config.AdInactiveDays) dniach$(if ($Config.AdSearchBase) { ", OU: $($Config.AdSearchBase)" })), z czego $($new.Count) nie ma jeszcze na liście:`n$(Join-Short ($new | ForEach-Object { Get-DisplayName $_.Name }) 20)`n`nDodać brakujące?" -Title 'Pobierz z AD' -ConfirmText 'Dodaj' -Tone 'info') {
             foreach ($f in ($new | Sort-Object Name)) { [void](Add-ServerEntry $f.Name $f.OS) }
@@ -8602,7 +9694,7 @@ $ui.btnScan.Add_Click({
     if ($op) { Stop-Operation $op 'Skan przerwany przez użytkownika'; return }
     Invoke-UiAction 'Skan' { Start-Scan @($script:Servers | ForEach-Object { $_.Name }) }
 })
-$ui.btnCancelOps.Add_Click({ Stop-AllOperations 'Przerwano przez użytkownika' })
+$ui.btnCancelOps.Add_Click({ Stop-AllOperations 'Przerwano przez użytkownika'; Invoke-PendingReanalysis })   # po anulowaniu samej ponownej próby żadna operacja nie wywoła odłożonej analizy (trwający skan/wczytywanie – po nich)
 $ui.btnRescan.Add_Click({ if ($script:CurrentServer) { Invoke-UiAction 'Skan' { Start-Scan @($script:CurrentServer) } } })
 $ui.btnDiag.Add_Click({ if ($script:CurrentServer) { Invoke-UiAction 'Diagnoza' { Start-Diagnostics @($script:CurrentServer) } } })
 $ui.btnSettings.Add_Click({ Invoke-UiAction 'Ustawienia' { Show-SettingsDialog } })
@@ -8613,7 +9705,7 @@ $ui.btnIssuesCsv.Add_Click({ Invoke-UiAction 'Eksport' { Export-GridCsv $ui.grid
 $ui.btnServersCsv.Add_Click({ Invoke-UiAction 'Eksport' { Export-GridCsv $ui.gridServers 'Stan_serwerow' } })
 $ui.btnVmCsv.Add_Click({ Invoke-UiAction 'Eksport' { Export-GridCsv $ui.gridVms 'Maszyny_wirtualne' } })
 
-$ui.gridIssues.Add_MouseDoubleClick({ param($s, $e) $i = Get-ClickedRowItem $e; if ($i -and $i.ServerKey -and (Get-ServerItem $i.ServerKey)) { Invoke-UiAction 'Widok' { Select-Server $i.ServerKey $i.Section } } })
+$ui.gridIssues.Add_MouseDoubleClick({ param($s, $e) $i = Get-ClickedRowItem $e; if ($i -and $i.ServerKey -and (Get-ServerItem $i.ServerKey)) { Invoke-UiAction 'Widok' { Select-Server $i.ServerKey $i.Section } } elseif ($i -and $i.PSObject.Properties['_Items'] -and $i._Count -gt 1) { Invoke-UiAction 'Widok' { Show-IssueGroup $i } } })
 $ui.gridServers.Add_MouseDoubleClick({ param($s, $e) $r = Get-ClickedRowItem $e; if ($r) { Invoke-UiAction 'Widok' { Select-Server $r.Key 'Issues' } } })
 $ui.gridHosts.Add_MouseDoubleClick({ param($s, $e) $r = Get-ClickedRowItem $e; if ($r) { Invoke-UiAction 'Widok' { Select-Server $r.Key 'HvHost' } } })
 $ui.gridVms.Add_MouseDoubleClick({
@@ -8622,6 +9714,36 @@ $ui.gridVms.Add_MouseDoubleClick({
     if (-not $r) { return }
     Invoke-UiAction 'Widok' { if ($r._ServerKey) { Select-Server $r._ServerKey 'Issues' } else { Select-Server $r._HostKey 'HyperV' } }
 })
+# Enter w tabeli otwiera serwer z wiersza jak dwuklik (domyślnie DataGrid przechodzi Enterem do następnego wiersza)
+function Open-GridRow($Grid, $Row) {
+    if (-not $Row) { return }
+    if ($Grid -eq $ui.gridIssues) { if ($Row.ServerKey -and (Get-ServerItem $Row.ServerKey)) { Select-Server $Row.ServerKey $Row.Section } elseif ($Row.PSObject.Properties['_Items'] -and $Row._Count -gt 1) { Show-IssueGroup $Row } }   # jak dwuklik
+    elseif ($Grid -eq $ui.gridServers) { Select-Server $Row.Key 'Issues' }
+    elseif ($Grid -eq $ui.gridHosts) { Select-Server $Row.Key 'HvHost' }
+    elseif ($Row._ServerKey) { Select-Server $Row._ServerKey 'Issues' } else { Select-Server $Row._HostKey 'HyperV' }
+}
+# wiersz komórki z fokusem (źródło zdarzenia klawisza), a gdy fokus jest na samej tabeli – zaznaczony
+foreach ($g in 'gridIssues', 'gridServers', 'gridHosts', 'gridVms') { $ui[$g].Add_PreviewKeyDown({ param($s, $e) if ($e.Key -eq 'Return' -and [System.Windows.Input.Keyboard]::Modifiers -eq 'None') { $r = Get-ClickedRowItem $e; if (-not $r) { $r = $s.SelectedItem }; if ($r) { $e.Handled = $true; Invoke-UiAction 'Widok' { Open-GridRow $s $r } } } }) }
+# Menu tabel „Stan serwerów”, hostów i maszyn Hyper-V: akcje serwera jak na liście (maszyna – tylko gdy jest na liście)
+$onGridServerMenu = {
+    param($s, $e)
+    $m = $s.ContextMenu
+    $m.Items.Clear()
+    $rows = @($s.SelectedItems)
+    $isVm = $s -eq $ui.gridVms
+    $names = @($rows | ForEach-Object { if ($isVm) { $_._ServerKey } else { $_.Key } } | Where-Object { $_ -and (Get-ServerItem $_) } | Select-Object -Unique)
+    if ($rows.Count -eq 1 -and $names.Count) { $script:MenuGrid = $s; $script:MenuRow = $rows[0]; [void]$m.Items.Add((New-MenuItem 'Otwórz serwer' 'E8A7' { Open-GridRow $script:MenuGrid $script:MenuRow })); [void]$m.Items.Add((New-MenuSeparator)) }
+    if ($names.Count) { Add-ServerMenuItems $m $names }
+    if ($isVm) {
+        $out = @($rows | Where-Object { -not $_.OnList -and -not $_._Linux }).Count
+        $hk = if (-not $names.Count -and $rows.Count -eq 1 -and $rows[0]._HostKey -and (Get-ServerItem $rows[0]._HostKey)) { $rows[0]._HostKey } else { '' }
+        if (($out -or $hk) -and $m.Items.Count) { [void]$m.Items.Add((New-MenuSeparator)) }
+        if ($out) { [void]$m.Items.Add((New-MenuItem "Dodaj do listy serwerów ($out)" 'E710' { Add-VmsToList })) }
+        if ($hk) { $script:MenuHost = $hk; [void]$m.Items.Add((New-MenuItem "Przejdź do hosta $($rows[0].Host)" 'E8FD' { Select-Server $script:MenuHost 'HyperV' })) }
+    }
+    if (-not $m.Items.Count) { $e.Handled = $true }
+}
+foreach ($g in 'gridServers', 'gridHosts', 'gridVms') { $ui[$g].ContextMenu = New-Object System.Windows.Controls.ContextMenu; $ui[$g].Add_ContextMenuOpening($onGridServerMenu) }
 
 # Dziennik
 $ui.btnLogToggle.Add_Click({ Set-LogVisible (-not $script:UiState.LogVisible) })
@@ -8677,6 +9799,7 @@ $window.Add_Closing({
         $script:UiState.WindowMaximized = ($s.WindowState -eq 'Maximized')
         if ($s.WindowState -eq 'Normal') { $script:UiState.WindowWidth = [int]$s.ActualWidth; $script:UiState.WindowHeight = [int]$s.ActualHeight }
         if ($script:UiState.LogVisible) { $script:UiState.LogHeight = [int]$ui.logRow.ActualHeight }
+        Write-AvailabilityPending   # ostatnia próba dopisania zaległych wpisów dziennika dostępności
         try { Save-UserSettings } catch { }
         Write-Log 'Zamknięto program.' 'INFO' 'Program'
     } catch { }
@@ -8697,12 +9820,15 @@ $window.Add_Loaded({
         else { $ui.txtStatus.Text = "Wczytano $($script:Servers.Count) serwerów z $($Config.ServerListFile)" }
         Write-Log ("Lista serwerów: {0} ({1})" -f $script:Servers.Count, $Config.ServerListFile) 'INFO' 'Lista'
         if ($script:BaseFallback) { Write-Log $script:BaseFallback 'WARN' 'Program' }
+        $dw = Get-DataFolderWarning; if ($dw) { Write-Log $dw 'WARN' 'Program' }
         if ($script:SettingsWarning) { Write-Log $script:SettingsWarning 'WARN' 'Ustawienia' }
         if (-not $script:NativeOk) { Write-Log "Bez kodu natywnego (ciemny pasek tytułu, szybkie sortowanie): $script:NativeError" 'INFO' 'Program' }
         if ($script:LogFailed) { Write-Log "Nie można zapisywać dziennika w $($Config.LogDir)" 'WARN' 'Program' }
+        Start-IdleLock   # przed wczytywaniem – błąd wczytywania nie może wyłączyć blokady po bezczynności
         Start-SnapshotLoad
         Start-CveUpdate -Auto   # dane CVE z pamięci podręcznej (i odświeżenie, gdy stare) – równolegle z wczytywaniem migawek
-        Start-IdleLock
+        # ustawienia nieczytelne (np. błąd po ręcznej edycji): nie tylko wpis w dzienniku – wyciszenia i PIN mogły zniknąć
+        if ($script:SettingsWarning) { Show-Message $script:SettingsWarning 'Ustawienia' 'warn' }
     }
 })
 Register-IdleActivity -Window $window
@@ -8723,7 +9849,7 @@ finally {
     $deadline = (Get-Date).AddSeconds(5)
     foreach ($op in @($script:Ops)) { foreach ($it in $op.Items) { if (-not $it.Finished) { try { [void]$it.PS.BeginStop($null, $null) } catch { } } } }
     foreach ($op in @($script:Ops)) { foreach ($it in $op.Items) { $left = [int][Math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds); try { [void]$it.Handle.AsyncWaitHandle.WaitOne($left) } catch { } } }
-    foreach ($k in 'Remote', 'Local') { $p = $script:Pools[$k]; if ($p) { try { $p.BeginClose($null, $null) | Out-Null } catch { } } }
+    foreach ($k in @($script:Pools.Keys)) { $p = $script:Pools[$k]; if ($p) { try { $p.BeginClose($null, $null) | Out-Null } catch { } } }
     if ($script:InstanceMutex) { try { $script:InstanceMutex.ReleaseMutex() } catch { }; $script:InstanceMutex.Dispose() }
 }
 #endregion
