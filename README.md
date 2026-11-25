@@ -1,6 +1,6 @@
 # ServerReview – Przegląd serwerów
 
-Narzędzie z interfejsem graficznym (WPF) do zbiorczego audytu serwerów Windows w domenie. Łączy się równolegle przez WinRM ze wszystkimi serwerami z listy, zbiera stan systemu, konfigurację bezpieczeństwa i dane Hyper-V, wskazuje problemy i pokazuje, co zmieniło się od poprzedniego skanu. Gdy serwer nie odpowiada, program sam diagnozuje przyczynę i zapisuje ją w dzienniku dostępności.
+Narzędzie z interfejsem graficznym (WPF) do zbiorczego audytu serwerów Windows w domenie. Łączy się równolegle przez WinRM ze wszystkimi serwerami z listy, zbiera stan systemu, sprzęt, konfigurację bezpieczeństwa i dane Hyper-V, wskazuje problemy i pokazuje, co zmieniło się od poprzedniego skanu. Gdy serwer nie odpowiada, program sam diagnozuje przyczynę i zapisuje ją w dzienniku dostępności.
 
 Program jest przygotowany na większe środowiska: kilkaset serwerów, w tym kilkanaście–kilkadziesiąt hostów Hyper-V z maszynami wirtualnymi. Skanuje tylko Windows. Maszyny z Linuksem rozpoznaje na hostach Hyper-V i pomija.
 
@@ -15,6 +15,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 - [Interfejs](#interfejs)
 - [Niedostępne serwery](#niedostępne-serwery)
 - [Hyper-V i klastry](#hyper-v-i-klastry)
+- [Sprzęt i inwentaryzacja](#sprzęt-i-inwentaryzacja)
 - [Kopie zapasowe](#kopie-zapasowe)
 - [Role aplikacyjne: SQL Server, IIS, DHCP, DNS](#role-aplikacyjne-sql-server-iis-dhcp-dns)
 - [Bezpieczeństwo: utwardzenie, Active Directory](#bezpieczeństwo-utwardzenie-active-directory)
@@ -36,6 +37,7 @@ Cały program to jeden plik `ServerReview.ps1`. Nie wymaga instalacji ani dodatk
 | Obszar | Zbierane dane |
 |---|---|
 | **System** | uptime, oczekujący restart, data ostatniej aktualizacji, obciążenie CPU (pomiar chwilowy), użycie RAM i pamięci wirtualnej, zainstalowane role, serwer WSUS, antywirus, źródło czasu i różnica zegara względem stacji, koniec wsparcia systemu, aktywacja Windows (stan, kanał licencji, serwer KMS), host Hyper-V, na którym działa maszyna |
+| **Sprzęt** | producent, model, numer seryjny, obudowa, płyta główna, BIOS/UEFI i tryb rozruchu, TPM, procesory (gniazda, rdzenie, wątki), moduły pamięci (typ, prędkość, wolne gniazda), kontrolery dysków, dyski (typ, magistrala, pojemność, numer seryjny, firmware, zużycie, temperatura), karty sieciowe, edycja i wersja systemu; w maszynie wirtualnej zasoby widziane przez gościa i przydział na hoście Hyper-V – [szczegóły](#sprzęt-i-inwentaryzacja) |
 | **Stabilność** | błędy i zdarzenia krytyczne z dzienników System, Application i Hyper-V, historia restartów i przestojów (kiedy serwer się wyłączył, kiedy wstał, kto i dlaczego go zrestartował), awarie BSOD i pliki zrzutów pamięci, kopie zapasowe (Windows Server Backup, Veeam), zajętość dysków (także punkty montowania i wolumeny CSV), zdrowie dysków fizycznych, pul i dysków wirtualnych Storage Spaces / S2D, błędy dyskowe, rozmiar dzienników i okres, który obejmują |
 | **Bezpieczeństwo** | konfiguracja i utwardzenie (ok. 50 ustawień: SMB, NTLM/LM, LSA, RDP, WinRM, Point and Print, WSUS, AD CS, dostęp anonimowy, SChannel, Secure Boot, Credential Guard, Defender, zapora i inne – szczegóły w [osobnym rozdziale](#bezpieczeństwo-utwardzenie-active-directory)), zdarzenia bezpieczeństwa (nieudane logowania i password spray, blokady, zmiany kont i grup, czyszczenie dzienników, nowe usługi i zadania), polityka audytu, reguły zapory wpuszczające wrażliwe porty, subskrypcje WMI i wykluczenia Defendera, grupy uprzywilejowane (z rozpoznaniem grup „wszyscy” po SID), konta lokalne, certyfikaty (magazyn osobisty i WebHosting IIS), udziały (uprawnienia udziału i NTFS), autostart (także IFEO, SilentProcessExit, AppInit_DLLs, Session Manager, pakiety LSA, cele skrótów .lnk) |
 | **Podatności (CVE)** | brakujące poprawki Windows: CVE, dla których Microsoft wydał poprawkę nowszą niż zainstalowana, z wyróżnieniem krytycznych i aktywnie wykorzystywanych (Microsoft, CISA KEV) – wylicza stacja z danych pobranych z internetu, [szczegóły](#podatności-cve) |
@@ -149,7 +151,7 @@ Okno mieści się także na mniejszym ekranie (np. laptop 1366 px albo 1920 px p
 
 Zbiorczy widok wszystkich hostów i maszyn wirtualnych z przeskanowanych hostów:
 
-- **Hosty:** klaster, maszyny działające / wszystkie, vCPU na procesor logiczny (`vCPU : CPU`, np. `2.50 : 1 (40 / 16)`, sortowane według współczynnika), RAM przydzielony maszynom, stare checkpointy, liczba problemów.
+- **Hosty:** klaster, maszyny działające / wszystkie, vCPU na procesor logiczny (`vCPU : CPU`, np. `2.50 : 1 (40 / 16)`, sortowane według współczynnika), RAM przydzielony maszynom, stare checkpointy, liczba problemów i sprzęt hosta (np. `Dell PowerEdge R750 · 2×Xeon Gold 6338 (64 rdz.) · 512 GB`).
 - **Maszyny:** host, stan, heartbeat, uptime, vCPU, pamięć (także dynamiczna), generacja i wersja konfiguracji, replikacja, checkpointy, dyski, system gościa, nazwa i adres IP gościa, czy maszyna jest na liście serwerów i jaki jest wynik jej skanu.
 - **Filtry:** wszystkie, działające, wyłączone, do sprawdzenia, spoza listy, plus pole tekstowe.
 - **Dodaj do listy** dodaje zaznaczone maszyny Windows spoza listy, a bez zaznaczenia wyraźnie pyta o dodanie wszystkich widocznych. Dodaje tylko poprawne nazwy hostów (pomija np. nazwy VM ze spacjami), a w potwierdzeniu pokazuje pełną listę, pominięte nazwy i nazwy spoza domeny stacji. Maszyny z Linuksem i repliki Hyper-V Replica są pomijane i wyszarzone.
@@ -234,6 +236,25 @@ Niedostępność jest zapamiętywana: po ponownym uruchomieniu programu serwer n
 - **Maszyny.** Błąd odczytu pojedynczej maszyny (np. przeniesionej w trakcie skanu) jest zgłaszany w błędach skanu i nie kasuje dysków, checkpointów ani kart sieciowych pozostałych maszyn.
 - **Kontrolery domeny.** Ostrzeżenie, gdy wszystkie skanowane kontrolery domeny działają na jednym hoście (w lesie wielodomenowym – osobno dla każdej domeny).
 - **Duplikaty.** Ta sama maszyna dodana pod dwiema nazwami (alias DNS, adres IP, nazwa klastra) jest wykrywana.
+- **Przydział zasobów gościa.** Sekcja **Sprzęt i konfiguracja** serwera, który jest maszyną z przeskanowanego hosta, pokazuje jej vCPU, pamięć i dyski wirtualne według hosta ([szczegóły](#sprzęt-i-inwentaryzacja)).
+
+## Sprzęt i inwentaryzacja
+
+Sekcja **Sprzęt i konfiguracja** (w szczegółach serwera zaraz po **System**) to obraz fizycznej konfiguracji serwera w kolumnach: grupa, pozycja, wartość (dane stałe) i „Bieżące” (wartości zmienne):
+
+- **Komputer:** platforma (serwer fizyczny, host Hyper-V albo maszyna wirtualna z nazwą platformy), producent, model, numer produktu (SKU), numer seryjny (Dell: Service Tag), typ obudowy (rack, blade, tower…), płyta główna, wersja i data BIOS/UEFI, tryb rozruchu (UEFI/BIOS, Secure Boot) i TPM;
+- **Procesor:** podsumowanie (gniazda, rdzenie fizyczne, wątki, wielowątkowość) i wiersz na każde gniazdo – model, rdzenie i wątki, maksymalne taktowanie; w „Bieżące” taktowanie i obciążenie;
+- **Pamięć:** razem (GB, zajęte gniazda, maksymalna pojemność płyty), konfiguracja modułów (np. `16 × 32 GB DDR4 3200 MT/s (wolne gniazda: 16)`) i wiersz na każdy moduł – gniazdo, pojemność, typ, prędkość, producent, numer części i numer seryjny; w „Bieżące” użycie RAM;
+- **Kontrolery dysków:** kontrolery RAID, HBA, NVMe i SATA AHCI z producentem i sterownikiem (bez kontrolerów programowych – Storage Spaces, inicjator iSCSI – i kontrolera USB Attached SCSI, który jest tylko przy podłączonym dysku USB; rozpoznawanych także po sterowniku, niezależnie od języka systemu);
+- **Dyski:** podsumowanie (np. `2 × SSD 960 GB SAS; 4 × HDD 4 TB SAS`) i wiersz na każdy dysk – model, nośnik (SSD/HDD/SCM), magistrala (NVMe, SAS, SATA, RAID…), pojemność, numer seryjny i firmware; w „Bieżące” stan, zużycie SSD, temperatura i godziny pracy. Lista dysków jest wspólna z sekcją **Zdrowie dysków** (jeden odczyt, ten sam filtr S2D). Pojemność dysku fizycznego jest w jednostkach dziesiętnych, jak na etykiecie (960 GB, 1.92 TB), a dysku maszyny wirtualnej – w binarnych, jak w konfiguracji maszyny (127 GB). Dyski USB (także podłączone przez UAS), nośniki wymienne i zamontowane pliki VHD są pomijane. Za sprzętowym kontrolerem RAID Windows widzi wolumen logiczny kontrolera, a nie pojedyncze dyski – ich stan pokazuje narzędzie producenta (iDRAC, iLO, OpenManage). Bez modułu Storage dyski są odczytywane z WMI;
+- **Karty sieciowe:** karty fizyczne z modelem i adresem MAC; w „Bieżące” stan i prędkość łącza;
+- **System:** edycja (z oznaczeniem Server Core), wersja (np. 21H2, 1809), kompilacja (z numerem poprawki w „Bieżące”), data instalacji, aktywacja i język systemu.
+
+**Maszyna wirtualna** pokazuje to, co widzi system gościa: platformę wirtualizacji (host w „Bieżące”), vCPU, pamięć i dyski wirtualne; model procesora i adres MAC zależą od hosta, więc są w „Bieżące”. Dla gościa Hyper-V, którego host jest na liście i ma dane, za grupą Komputer jest grupa **Przydział na hoście Hyper-V**: host (i klaster), nazwa i stan maszyny, generacja i wersja konfiguracji, vCPU, RAM (statyczna albo dynamiczna z zakresem min–maks, przydzielona, zapotrzebowanie), łączny rozmiar dysków (suma znanych rozmiarów maksymalnych; dysk na udziale SMB albo plik nieczytelny dla hosta to „rozmiar nieznany”) i wiersz na każdy dysk wirtualny (ścieżka, typ, rozmiar maksymalny i obecny). Dane pochodzą z ostatniego skanu hosta w pamięci programu, bez wczytywania migawek. Gdy hosta nie ma na liście, brak jego danych, w skanie hosta sekcja **Hyper-V: maszyny** była pominięta albo niezebrana lub dane hostów są jeszcze uzupełniane (wczytywanie wyników, skan w toku), wiersz podaje przyczynę. Dla VMware i innych platform wiersz informuje, że przydział jest widziany z systemu gościa.
+
+**Zmiany sprzętu.** Sekcja jest porównywana z poprzednim skanem tylko według kolumny „Wartość”: wymiana dysku albo modułu pamięci, inny procesor, aktualizacja BIOS czy nowa karta sieciowa pojawia się w **Zmiany od poprzedniego skanu** jako informacja. Stan i zużycie dysku, temperatura, stan łącza i numer poprawki systemu nie są zmianą (stan dysku ocenia sekcja **Zdrowie dysków**), a podsumowania dysków i modułów nie są porównywane osobno (jedna wymiana to jedna zmiana). Dysk z numerem seryjnym jest rozpoznawany po opisie z numerem, bez numeru dysku – numery dysków zmieniają się po restarcie. Błąd jednej grupy (np. pamięci) trafia do błędów skanu, a sekcja nie jest wtedy porównywana; tak samo, gdy listy dysków nie dało się odczytać z modułu Storage (dyski z WMI) albo na węźle S2D nie udało się wybrać dysków tego węzła.
+
+**Inwentaryzacja sprzętu.** **Raport → Inwentaryzacja sprzętu (CSV)** zapisuje jeden wiersz na każdy serwer z listy: serwer, rodzaj (fizyczny, maszyna Hyper-V, VMware, inna platforma, brak danych), producent, model, numer seryjny, procesor, gniazda, rdzenie, wątki, RAM, moduły RAM, dyski, kontroler, system, kompilacja, host Hyper-V, przydzielone vCPU i RAM oraz datę danych. Serwer bez połączenia ma ostatnie znane dane (z ostatniej udanej migawki), a nieskanowany – „brak danych”. Plik (domyślnie w folderze `Reports`) ma separator `;` i kodowanie UTF-8 z BOM, a wartości z serwerów są chronione przed wstrzyknięciem formuł. Inwentaryzacja powstaje od razu z danych w pamięci, bez wczytywania migawek.
 
 ## Kopie zapasowe
 
@@ -422,11 +443,12 @@ Każdy skan zapisuje migawkę danych serwera (skompresowany JSON). Kolejny skan 
 - autostart;
 - oprogramowanie;
 - subskrypcje WMI i wykluczenia AV;
-- reguły zapory.
+- reguły zapory;
+- sprzęt: dyski, moduły pamięci, procesory, BIOS, karty sieciowe (bez wartości zmiennych, [szczegóły](#sprzęt-i-inwentaryzacja)).
 
-Nowe pozycje są zgłaszane jako ostrzeżenia, a w przypadku oprogramowania jako informacja.
+Nowe pozycje są zgłaszane jako ostrzeżenia, a w przypadku oprogramowania i sprzętu jako informacja.
 
-**Sekcja pominięta w poprzednim skanie.** Jeśli sekcję odznaczono na jeden lub kilka skanów (albo jej zebranie się nie udało), po ponownym włączeniu program porównuje ją z ostatnim skanem, w którym była zebrana – zmiany z okresu, gdy była pominięta, nie giną. Takie zmiany są podpisane „od skanu z <data>”. Sekcja pominięta albo niezebrana w bieżącym skanie nie jest porównywana (inaczej cała jej zawartość wyglądałaby na „usuniętą”).
+**Sekcja pominięta w poprzednim skanie.** Jeśli sekcję odznaczono na jeden lub kilka skanów (albo jej zebranie się nie udało), po ponownym włączeniu program porównuje ją z ostatnim skanem, w którym była zebrana – zmiany z okresu, gdy była pominięta, nie giną. Takie zmiany są podpisane „od skanu z <data>”. Sekcja pominięta albo niezebrana w bieżącym skanie nie jest porównywana (inaczej cała jej zawartość wyglądałaby na „usuniętą”). Sekcji, której nie ma w poprzedniej migawce (np. **Sprzęt i konfiguracja** w pierwszym skanie po aktualizacji programu), też nie – jej zawartość nie pojawia się jako „nowa”.
 
 Pierwszy skan po aktualizacji programu do nowej wersji kolektora nie jest porównywany: w sekcji **Zmiany od poprzedniego skanu** zamiast listy zmian jest wpis „Poprzedni skan wykonała inna wersja programu – zmiany będą pokazywane od następnego skanu”. Tak będzie też przy pierwszym skanie po aktualizacji do tej wersji.
 
@@ -443,7 +465,7 @@ Menu **Raport** ma dwie wersje raportu:
 - **Podsumowanie** – kafelki (kafelek „Serwery” liczy wszystkie serwery z listy, także jeszcze nieskanowane), wszystkie aktywne problemy, stan wszystkich serwerów z listy (bez danych – „Nie skanowano”), niedostępne serwery z przyczyną, hosty i maszyny Hyper-V wymagające uwagi oraz, dla każdego serwera, tylko wiersze oznaczone jako problem. Nadaje się do przesłania dalej.
 - **Pełny** – dodatkowo wszystkie sekcje każdego serwera, wczytywane kolejno z migawek (do 500 wierszy na sekcję). Przy ponad 60 serwerach program pyta o potwierdzenie, bo plik może mieć kilkadziesiąt MB.
 
-Menu ma też pozycję **Otwórz folder raportów**. Raport zapisuje się w folderze `Reports` jako `Przeglad_serwerow_RRRRMMDD_GGMM.html` (wersja pełna z dopiskiem `_pelny`) i otwiera w przeglądarce. Wygląd dopasowuje się do jasnego lub ciemnego motywu systemu, a raport nadaje się do druku. Raport powstaje strumieniowo, bez wczytywania wszystkich danych do pamięci naraz.
+Menu ma też pozycje **Inwentaryzacja sprzętu (CSV)** ([szczegóły](#sprzęt-i-inwentaryzacja)) i **Otwórz folder raportów**. Raport zapisuje się w folderze `Reports` jako `Przeglad_serwerow_RRRRMMDD_GGMM.html` (wersja pełna z dopiskiem `_pelny`) i otwiera w przeglądarce. Wygląd dopasowuje się do jasnego lub ciemnego motywu systemu, a raport nadaje się do druku. Raport powstaje strumieniowo, bez wczytywania wszystkich danych do pamięci naraz.
 
 ## Dziennik operacji i dziennik dostępności
 
@@ -613,6 +635,7 @@ settings.json.bak                                 poprzednia wersja ustawień
 Snapshots\RRRRMMDD_GGMMSS\<serwer>.json.gz        migawki skanów (skompresowane)
 Snapshots\RRRRMMDD_GGMMSS\<serwer>.offline.json   nieudana próba: błąd i wynik diagnozy
 Reports\Przeglad_serwerow_RRRRMMDD_GGMM.html      raporty HTML
+Reports\Inwentaryzacja_sprzetu_RRRRMMDD_GGMM.csv  inwentaryzacja sprzętu (domyślny folder zapisu)
 Logs\ServerReview_RRRRMMDD.log                    dziennik operacji
 Logs\Availability_RRRRMM.csv                      dziennik dostępności
 Cache\cve_*.json.gz                               dane CVE pobrane przez stację (Microsoft, CISA KEV)
